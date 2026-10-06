@@ -1,0 +1,385 @@
+# Go's test helpers (mockserver_test.go, platform_test.go and the error
+# checkers of error_test.go), translated.
+
+import "context"
+import "os"
+import "strings"
+import "time"
+
+# Go's someTimeout: long; only checks that setting deadlines doesn't break.
+def some_timeout -> time.Duration { time.second * 3600 }
+
+def after(d: time.Duration) -> time.Time { time.now.add(d) }
+
+def ms(n: Int) -> time.Duration { time.millisecond * n }
+
+def sleep_ms(n: Int) { time.sleep(time.millisecond * n) }
+
+# Go's testUnixAddr: a socket path in a fresh temp directory.
+def test_unix_addr -> Str { os.mkdir_temp("", "").unwrap + "/sock" }
+
+# Go's testableNetwork.
+def testable_network?(network: Str) -> Bool {
+  net = network
+  i = index_byte(network, 58)
+  net = network[0...i] if i >= 0
+  if net == "ip" || net == "ip4" || net == "ip6" {
+    return false if os.getuid != 0
+  }
+  if net == "unixpacket" {
+    return false unless linux?
+  }
+  return false if (net == "tcp4" || net == "udp4" || net == "ip4") && !supports_ipv4?
+  return false if (net == "tcp6" || net == "udp6" || net == "ip6") && !supports_ipv6?
+  true
+}
+
+# Go's testableAddress.
+def testable_address?(network: Str, address: Str) -> Bool {
+  i = index_byte(network, 58)
+  net = i >= 0 ? network[0...i] : network
+  if net == "unix" || net == "unixgram" || net == "unixpacket" {
+    return false if address.size > 0 && address[0] == 64 && !linux?
+  }
+  true
+}
+
+# Go's newLocalListener.
+def new_local_listener(network: Str, lc: ListenConfig = ListenConfig.new) -> Listener {
+  if network == "tcp" || network == "tcp4" {
+    return lc.listen(context.background, "tcp4", "127.0.0.1:0").unwrap if supports_ipv4?
+  }
+  if network == "tcp" || network == "tcp6" {
+    return lc.listen(context.background, "tcp6", "[::1]:0").unwrap if supports_ipv6?
+  }
+  if network == "unix" || network == "unixpacket" {
+    return lc.listen(context.background, network, test_unix_addr).unwrap
+  }
+  panic("#{network} is not supported")
+}
+
+# Go's newLocalPacketListener.
+def new_local_packet_listener(network: Str, lc: ListenConfig = ListenConfig.new) -> PacketConn {
+  if network == "udp" || network == "udp4" {
+    return lc.listen_packet(context.background, "udp4", "127.0.0.1:0").unwrap if supports_ipv4?
+  }
+  if network == "udp" || network == "udp6" {
+    return lc.listen_packet(context.background, "udp6", "[::1]:0").unwrap if supports_ipv6?
+  }
+  if network == "unixgram" {
+    return lc.listen_packet(context.background, network, test_unix_addr).unwrap
+  }
+  panic("#{network} is not supported")
+}
+
+# Go's newDualStackListener: a tcp4 and a tcp6 listener on the same port.
+def new_dual_stack_listener -> [Listener]? {
+  for _i in 0...64 {
+    port = 0
+    lns: [Listener] = []
+    for args in [("tcp4", ipv4(127, 0, 0, 1)), ("tcp6", ipv6_loopback)] {
+      nw, ip = args
+      r = listen_tcp(nw, TCPAddr.new(ip: ip, port: port))
+      next if r.err?
+      ln = r.unwrap
+      port = ln.port
+      lns << ln
+    }
+    return lns if lns.size == 2
+    for ln in lns {
+      l = ln
+      l.close!
+    }
+  }
+  none
+}
+
+# isValid of an OpError, and the kinds of nested errors Go's parse*Error
+# accept: none when the error has the expected shape, else why not.
+def op_error_shape(e: Error) -> Str? {
+  case e {
+    NetError.ConnRefused(at) => return op_valid(at)
+    NetError.AddrInUse(at) => return op_valid(at)
+    NetError.Timeout(at) => return op_valid(at)
+    NetError.Closed(at) => return op_valid(at)
+    NetError.BadAddr(at) => return op_valid(at)
+    NetError.Lookup(at) => return op_valid(at)
+    NetError.Other(at) => return op_valid(at)
+    _ => return "unexpected type on 1st nested level: #{e.message}"
+  }
+}
+
+def op_valid(f: NetFailure) -> Str? {
+  return "OpError.Op is empty: #{f.op}" if f.op == ""
+  return "OpError.Net is empty" if f.network == ""
+  return "OpError.Err is empty" if f.syscall == "" && f.code == 0 && f.err == "" && !f.dns.present?
+  none
+}
+
+def inner_of(e: Error) -> Str {
+  case e {
+    NetError.ConnRefused(at) => return at.err
+    NetError.AddrInUse(at) => return at.err
+    NetError.Timeout => return "i/o timeout"
+    NetError.Closed => return "use of closed network connection"
+    NetError.BadAddr(at) => return at.err
+    NetError.Lookup(at) => return at.err
+    NetError.Other(at) => return at.err
+    _ => return ""
+  }
+}
+
+def syscall_cause?(e: Error) -> Bool {
+  case e {
+    NetError.ConnRefused(at) => return at.code != 0
+    NetError.AddrInUse(at) => return at.code != 0
+    NetError.Other(at) => return at.code != 0 || at.syscall != ""
+    NetError.Lookup => return true
+    _ => return false
+  }
+}
+
+# Go's parseDialError.
+def parse_dial_error(e: Error) -> Str? {
+  if w = op_error_shape(e) {
+    return w
+  }
+  return none if syscall_cause?(e)
+  case e {
+    NetError.BadAddr => return none
+    NetError.Timeout => return none
+    NetError.Closed => return none
+    NetError.Lookup => return none
+    _ => nil
+  }
+  s = inner_of(e)
+  ok = s.start_with?("unknown network") || s.start_with?("invalid ") || s == ERR_CANCELED || s == ERR_MISSING_ADDRESS || s == ERR_NO_SUITABLE_ADDRESS || s.start_with?("address ") || s.start_with?("lookup ")
+  ok ? none : "unexpected type on 2nd nested level: #{s}"
+}
+
+# Go's parseReadError.
+def parse_read_error(e: Error) -> Str? {
+  if w = op_error_shape(e) {
+    return w
+  }
+  return none if syscall_cause?(e)
+  case e {
+    NetError.Timeout => return none
+    NetError.Closed => return none
+    _ => return "unexpected type on 2nd nested level: #{inner_of(e)}"
+  }
+}
+
+# Go's parseWriteError.
+def parse_write_error(e: Error) -> Str? {
+  if w = op_error_shape(e) {
+    return w
+  }
+  return none if syscall_cause?(e)
+  case e {
+    NetError.Timeout => return none
+    NetError.Closed => return none
+    NetError.BadAddr => return none
+    NetError.Lookup => return none
+    _ => nil
+  }
+  s = inner_of(e)
+  ok = s.start_with?("unknown network") || s == ERR_CANCELED || s == ERR_MISSING_ADDRESS || s == "use of WriteTo with pre-connected connection" || s == "unexpected EOF"
+  ok ? none : "unexpected type on 2nd nested level: #{s}"
+}
+
+# Go's parseCloseError.
+def parse_close_error(e: Error, is_shutdown: Bool) -> Str? {
+  want = "use of closed network connection"
+  if !is_shutdown && !strings.contains(e.message, want) {
+    return "error string #{e.message} does not contain expected string #{want}"
+  }
+  return "is_closed(#{e.message}) returns false, want true" if !is_shutdown && !is_closed(e)
+  if w = op_error_shape(e) {
+    return w
+  }
+  return none if syscall_cause?(e)
+  case e {
+    NetError.Closed => return none
+    _ => return "unexpected type on 2nd nested level: #{inner_of(e)}"
+  }
+}
+
+# Go's parseAcceptError.
+def parse_accept_error(e: Error) -> Str? { parse_read_error(e) }
+
+# Go's parseCommonError.
+def parse_common_error(e: Error) -> Str? {
+  if w = op_error_shape(e) {
+    return w
+  }
+  return none if syscall_cause?(e)
+  case e {
+    NetError.Closed => return none
+    _ => return "unexpected type on 2nd nested level: #{inner_of(e)}"
+  }
+}
+
+# Go's localServer.transponder: accepts one connection and echoes what it
+# reads once; problems go to ch, which is closed at the end.
+def transponder(ln: Listener, ch: Chan[Str]) {
+  l = ln
+  l.set_deadline(after(some_timeout))
+  r = l.accept
+  if e = r.err {
+    if p = parse_accept_error(e) {
+      ch << p
+    }
+    ch << e.message
+    ch.close
+    return
+  }
+  c = r.unwrap
+  network = l.network
+  la = c.local_net_addr || UnixAddr.new
+  ra = c.remote_net_addr || UnixAddr.new
+  if la.network != network || ra.network != network {
+    ch << "got #{la.network}->#{ra.network}; expected #{network}->#{network}"
+    ch.close
+    return
+  }
+  c.set_deadline(after(some_timeout))
+  c.set_read_deadline(after(some_timeout))
+  c.set_write_deadline(after(some_timeout))
+  b: [Byte] = [0; 256]
+  rr = c.read!(b)
+  if e = rr.err {
+    if p = parse_read_error(e) {
+      ch << p
+    }
+    ch << e.message
+    ch.close
+    return
+  }
+  n = rr.unwrap
+  wr = c.write!(b[0...n])
+  if e = wr.err {
+    if p = parse_write_error(e) {
+      ch << p
+    }
+    ch << e.message
+  }
+  c.close!
+  ch.close
+}
+
+# Go's transceiver: writes wb and reads as much back.
+def transceiver(c0: Conn, wb: [Byte], ch: Chan[Str]) {
+  c = c0
+  c.set_deadline(after(some_timeout))
+  c.set_read_deadline(after(some_timeout))
+  c.set_write_deadline(after(some_timeout))
+  wr = c.write!(wb)
+  if e = wr.err {
+    if p = parse_write_error(e) {
+      ch << p
+    }
+    ch << e.message
+    ch.close
+    return
+  }
+  ch << "wrote #{wr.unwrap}; want #{wb.size}" if wr.unwrap != wb.size
+  rb: [Byte] = [0; wb.size]
+  rr = c.read!(rb)
+  if e = rr.err {
+    if p = parse_read_error(e) {
+      ch << p
+    }
+    ch << e.message
+    ch.close
+    return
+  }
+  ch << "read #{rr.unwrap}; want #{wb.size}" if rr.unwrap != wb.size
+  ch.close
+}
+
+# Go's packetTransponder.
+def packet_transponder(c0: PacketConn, ch: Chan[Str]) {
+  c = c0
+  c.set_deadline(after(some_timeout))
+  c.set_read_deadline(after(some_timeout))
+  c.set_write_deadline(after(some_timeout))
+  b: [Byte] = [0; 256]
+  rr = c.read_from!(b)
+  if e = rr.err {
+    if p = parse_read_error(e) {
+      ch << p
+    }
+    ch << e.message
+    ch.close
+    return
+  }
+  n, peer0 = rr.unwrap
+  peer: Addr = UnixAddr.new
+  if p = peer0 {
+    peer = p
+  } else {
+    # A connected-mode peer: its address is the payload.
+    peer = UnixAddr.new(name: Str.from_bytes(b[0...n]), net: "unixgram")
+  }
+  wr = c.write_to!(b[0...n], peer)
+  if e = wr.err {
+    if p = parse_write_error(e) {
+      ch << p
+    }
+    ch << e.message
+  }
+  ch.close
+}
+
+# Go's packetTransceiver.
+def packet_transceiver(c0: PacketConn, wb: [Byte], dst: Addr, ch: Chan[Str]) {
+  c = c0
+  c.set_deadline(after(some_timeout))
+  c.set_read_deadline(after(some_timeout))
+  c.set_write_deadline(after(some_timeout))
+  wr = c.write_to!(wb, dst)
+  if e = wr.err {
+    if p = parse_write_error(e) {
+      ch << p
+    }
+    ch << e.message
+    ch.close
+    return
+  }
+  ch << "wrote #{wr.unwrap}; want #{wb.size}" if wr.unwrap != wb.size
+  rb: [Byte] = [0; wb.size]
+  rr = c.read_from!(rb)
+  if e = rr.err {
+    if p = parse_read_error(e) {
+      ch << p
+    }
+    ch << e.message
+    ch.close
+    return
+  }
+  n, _ = rr.unwrap
+  ch << "read #{n}; want #{wb.size}" if n != wb.size
+  ch.close
+}
+
+# Everything a helper reported on ch, as one string ("" for nothing).
+def drain(ch: Chan[Str]) -> Str {
+  out = ""
+  for m in ch {
+    out = out + m + "; "
+  }
+  out
+}
+
+def bytes_of(s: Str) -> [Byte] { s.bytes.to_a }
+
+# Go's spawnTestSocketPair: a connected client and server.
+def spawn_test_socket_pair(network: Str) -> (Conn, Conn) {
+  ln = new_local_listener(network)
+  t = spawn { ln.~accept }
+  client = dial(ln.network, ln.addr).unwrap
+  server = t.wait.unwrap
+  ln.close!
+  (client, server)
+}

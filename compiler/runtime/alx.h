@@ -544,6 +544,30 @@ int64_t alx_sock_shutdown(int64_t fd, int64_t how);
 int64_t alx_sock_lookup(const char *host, uint8_t *out, int64_t n);
 int64_t alx_sock_open(int64_t kind, const char *host, int64_t port, int64_t listen_, int64_t backlog);
 int64_t alx_sock_recvfrom(int64_t fd, uint8_t *buf, int64_t n, uint8_t *out);
+int64_t alx_fd_wait_until(int64_t fd, int64_t mode, int64_t until);
+int64_t alx_fd_wake(int64_t fd);
+int64_t alx_net_socket(int64_t family, int64_t sotype, int64_t proto);
+int64_t alx_net_bind(int64_t fd, const uint8_t *sa);
+int64_t alx_net_connect(int64_t fd, const uint8_t *sa);
+int64_t alx_net_listen(int64_t fd, int64_t backlog);
+int64_t alx_net_accept(int64_t fd, uint8_t *out);
+int64_t alx_net_sockname(int64_t fd, uint8_t *out, int64_t peer);
+int64_t alx_net_recvfrom(int64_t fd, uint8_t *buf, int64_t n, int64_t flags, uint8_t *out);
+int64_t alx_net_sendto(int64_t fd, const uint8_t *buf, int64_t n, const uint8_t *sa);
+int64_t alx_net_recvmsg(int64_t fd, uint8_t *buf, int64_t n, uint8_t *oob, int64_t oobn, uint8_t *out, uint8_t *info);
+int64_t alx_net_sendmsg(int64_t fd, const uint8_t *buf, int64_t n, const uint8_t *oob, int64_t oobn, const uint8_t *sa);
+int64_t alx_net_unix_rights(const uint8_t *fds, int64_t n, uint8_t *out, int64_t room);
+int64_t alx_net_parse_rights(uint8_t *oob, int64_t n, uint8_t *fds, int64_t room);
+int64_t alx_net_setsockopt(int64_t fd, const char *name, int64_t v);
+int64_t alx_net_getsockopt(int64_t fd, const char *name);
+int64_t alx_net_mcast(int64_t fd, int64_t family, const uint8_t *ip, int64_t ifindex, const uint8_t *ifaddr, int64_t join);
+int64_t alx_net_mcast_if4(int64_t fd, const uint8_t *ifaddr);
+int64_t alx_net_getaddrinfo(const char *host, int64_t family, uint8_t *out, int64_t n);
+int64_t alx_net_canonname(const char *host, uint8_t *out, int64_t n);
+int64_t alx_net_getnameinfo(const uint8_t *sa, uint8_t *out, int64_t n);
+int64_t alx_net_interfaces(uint8_t *out, int64_t n);
+int64_t alx_net_socketpair(int64_t sotype, uint8_t *fds);
+int64_t alx_net_dup(int64_t fd, int64_t nonblock);
 
 
 

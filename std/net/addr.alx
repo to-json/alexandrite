@@ -1,0 +1,337 @@
+# Network endpoint addresses (Go's Addr, TCPAddr, UDPAddr, IPAddr,
+# UnixAddr; tcpsock.go, udpsock.go, iprawsock.go, unixsock.go and their
+# _posix halves).
+
+import "net/netip"
+
+# A network end point address (Go's Addr): `network` names the network
+# ("tcp", "udp", "ip", "unix", ...), `to_s` gives the address in that
+# network's form ("192.0.2.1:25", "[2001:db8::1]:80", "/tmp/sock").
+pub interface Addr {
+  def network -> Str
+  def to_s -> Str
+}
+
+# The text of an optional address: "" for none (Go's nil Addr).
+def addr_s(a: Addr?) -> Str {
+  x = a || return ""
+  x.to_s
+}
+
+def ip_empty_string(ip: IP) -> Str {
+  return "" if ip.size == 0
+  ip.to_s
+}
+
+def ip_port_string(ip: IP, port: Int, zone: Str) -> Str {
+  h = ip_empty_string(ip)
+  h = h + "%" + zone if zone != ""
+  join_host_port(h, "#{port}")
+}
+
+# Go's (*IP).AddrPort helpers: the netip form of ip%zone.
+def netip_of(ip: IP, zone: Str) -> netip.Addr {
+  na = netip.addr_from_slice(ip.bytes) || netip.Addr.new
+  zone == "" ? na : na.with_zone(zone)
+}
+
+# The address of a TCP end point.
+pub struct TCPAddr {
+  ip: IP
+  port: Int
+  # The IPv6 scoped addressing zone.
+  zone: Str
+
+  pub def network -> Str { "tcp" }
+  pub def to_s -> Str { ip_port_string(ip, port, zone) }
+  pub def string -> Str { to_s }
+
+  # The netip.AddrPort form (invalid for an address with no IP).
+  pub def addr_port -> netip.AddrPort { netip.addr_port_from(netip_of(ip, zone), port.as_u16) }
+
+  def wildcard? -> Bool { ip.size == 0 || ip.unspecified? }
+}
+
+# The address of a UDP end point.
+pub struct UDPAddr {
+  ip: IP
+  port: Int
+  zone: Str
+
+  pub def network -> Str { "udp" }
+  pub def to_s -> Str { ip_port_string(ip, port, zone) }
+  pub def string -> Str { to_s }
+  pub def addr_port -> netip.AddrPort { netip.addr_port_from(netip_of(ip, zone), port.as_u16) }
+
+  def wildcard? -> Bool { ip.size == 0 || ip.unspecified? }
+}
+
+# The address of an IP end point (raw IP sockets).
+pub struct IPAddr {
+  ip: IP
+  zone: Str
+
+  pub def network -> Str { "ip" }
+
+  pub def to_s -> Str {
+    s = ip_empty_string(ip)
+    return s + "%" + zone if zone != ""
+    s
+  }
+
+  pub def string -> Str { to_s }
+
+  def wildcard? -> Bool { ip.size == 0 || ip.unspecified? }
+}
+
+# The address of a Unix domain socket end point: a path (or, on Linux, an
+# abstract name starting with "@") on network "unix", "unixgram" or
+# "unixpacket".
+pub struct UnixAddr {
+  name: Str
+  net: Str
+
+  pub def network -> Str { net }
+  pub def to_s -> Str { name }
+  pub def string -> Str { to_s }
+
+  def wildcard? -> Bool { name == "" }
+}
+
+# Go's TCPAddrFromAddrPort.
+pub def tcp_addr_from_addr_port(ap: netip.AddrPort) -> TCPAddr {
+  a = ap.addr
+  TCPAddr.new(ip: IP.new(b: a.as_slice), port: ap.port.to_i, zone: a.zone)
+}
+
+# Go's UDPAddrFromAddrPort.
+pub def udp_addr_from_addr_port(ap: netip.AddrPort) -> UDPAddr {
+  a = ap.addr
+  UDPAddr.new(ip: IP.new(b: a.as_slice), port: ap.port.to_i, zone: a.zone)
+}
+
+def ip_addr_from_addr(a: netip.Addr) -> IPAddr { IPAddr.new(ip: IP.new(b: a.as_slice), zone: a.zone) }
+
+# A netip.AddrPort as a UDP Addr (Go's addrPortUDPAddr, for error messages).
+def udp_addr_of_ap(ap: netip.AddrPort) -> UDPAddr { udp_addr_from_addr_port(ap) }
+
+# Go's sockaddr.family for an internet address: AF_INET unless the IP is a
+# non-mapped IPv6 address (canonical family codes: 4, 6; 1 for Unix).
+def ip_family(ip: IP) -> Int {
+  return 4 if ip.size <= IPV4_LEN
+  return 4 if ip.to4.present?
+  6
+}
+
+def addr_family(a: Addr) -> Int {
+  case a {
+    TCPAddr(t) => ip_family(t.ip)
+    UDPAddr(u) => ip_family(u.ip)
+    IPAddr(i) => ip_family(i.ip)
+    UnixAddr => 1
+    _ => 4
+  }
+}
+
+def addr_wildcard?(a: Addr) -> Bool {
+  case a {
+    TCPAddr(t) => t.wildcard?
+    UDPAddr(u) => u.wildcard?
+    IPAddr(i) => i.wildcard?
+    UnixAddr(u) => u.wildcard?
+    _ => false
+  }
+}
+
+def is_ipv4?(a: Addr) -> Bool {
+  case a {
+    TCPAddr(t) => t.ip.to4.present?
+    UDPAddr(u) => u.ip.to4.present?
+    IPAddr(i) => i.ip.to4.present?
+    _ => false
+  }
+}
+
+def addr_ip(a: Addr) -> IP {
+  case a {
+    TCPAddr(t) => t.ip
+    UDPAddr(u) => u.ip
+    IPAddr(i) => i.ip
+    _ => IP.new
+  }
+}
+
+# Go's loopbackIP.
+def loopback_ip(net: Str) -> IP {
+  return ipv6_loopback if net.size > 0 && net[net.size - 1] == 54
+  ip_from([127, 0, 0, 1])
+}
+
+# Go's toLocal: the same address with the loopback IP.
+def to_local(a: Addr, net: Str) -> Addr {
+  case a {
+    TCPAddr(t) => TCPAddr.new(ip: loopback_ip(net), port: t.port, zone: t.zone)
+    UDPAddr(u) => UDPAddr.new(ip: loopback_ip(net), port: u.port, zone: u.zone)
+    IPAddr(i) => IPAddr.new(ip: loopback_ip(net), zone: i.zone)
+    _ => a
+  }
+}
+
+# ------------------------------------------------- the runtime's sockaddrs
+
+# A socket address in the runtime's canonical form (alx_net_* in alx.c):
+# 128 bytes, [0] the family (0 none, 1 unix, 4 inet, 6 inet6), [1..2] the
+# port, [4..7] the IPv6 scope id or a Unix path's length, [8..] the address.
+SA_SIZE = 128
+
+def sa_none -> [Byte] {
+  b: [Byte] = [0; SA_SIZE]
+  b
+}
+
+def sa_family(sa: [Byte]) -> Int { sa[0].to_i }
+
+def sa_port(sa: [Byte]) -> Int { (sa[1].to_i << 8) | sa[2].to_i }
+
+def sa_be32(sa: [Byte]) -> Int { (sa[4].to_i << 24) | (sa[5].to_i << 16) | (sa[6].to_i << 8) | sa[7].to_i }
+
+def sa_ip(sa: [Byte]) -> IP {
+  n = sa[0] == 4 ? 4 : 16
+  b: [Byte] = [0; n]
+  copy(b, sa[8...8 + n])
+  IP.new(b: b)
+}
+
+def sa_inet(family: Int, ip: [Byte], port: Int, scope: Int) -> [Byte] {
+  sa = sa_none
+  sa[0] = family.as_u8
+  sa[1] = (port >> 8).as_u8
+  sa[2] = port.as_u8
+  sa[4] = (scope >> 24).as_u8
+  sa[5] = (scope >> 16).as_u8
+  sa[6] = (scope >> 8).as_u8
+  sa[7] = scope.as_u8
+  copy(sa[8...8 + ip.size], ip)
+  sa
+}
+
+# Go's ipToSockaddr.
+def ip_to_sockaddr(family: Int, ip0: IP, port: Int, zone: Str) -> ~[Byte]<AddrError> {
+  ip = ip0
+  if family == 4 {
+    ip = ipv4_zero if ip.size == 0
+    ip4 = ip.to4 || fail addr_error("non-IPv4 address", ip.to_s)
+    return sa_inet(4, ip4.bytes, port, 0)
+  }
+  if family == 6 {
+    ip = ipv6_zero if ip.size == 0 || ip.equal?(ipv4_zero)
+    ip6 = ip.to16 || fail addr_error("non-IPv6 address", ip.to_s)
+    return sa_inet(6, ip6.bytes, port, zone_index(zone))
+  }
+  fail addr_error("invalid address family", ip.to_s)
+}
+
+# A Unix socket address; Linux's abstract names ("@name") start with a NUL.
+def sa_unix(name: Str) -> ~[Byte]<AddrError> {
+  b = name.bytes.to_a
+  fail addr_error("invalid argument", name) if b.size > 104
+  b[0] = 0 if b.size > 0 && b[0] == 64 && linux?
+  sa = sa_none
+  sa[0] = 1
+  sa[6] = (b.size >> 8).as_u8
+  sa[7] = b.size.as_u8
+  copy(sa[8...8 + b.size], b)
+  sa
+}
+
+def sa_unix_name(sa: [Byte]) -> Str {
+  n = (sa[6].to_i << 8) | sa[7].to_i
+  b: [Byte] = [0; n]
+  copy(b, sa[8...8 + n])
+  b[0] = 64 if n > 0 && b[0] == 0
+  Str.from_bytes(b)
+}
+
+# Go's sockaddr(family) for an Addr: none for a missing one.
+def addr_sockaddr(a: Addr?, family: Int) -> ~[Byte]<AddrError> {
+  x = a || return sa_none
+  case x {
+    TCPAddr(t) => return ~ip_to_sockaddr(family, t.ip, t.port, t.zone)
+    UDPAddr(u) => return ~ip_to_sockaddr(family, u.ip, u.port, u.zone)
+    IPAddr(i) => return ~ip_to_sockaddr(family, i.ip, 0, i.zone)
+    UnixAddr(u) => return ~sa_unix(u.name)
+    _ => fail addr_error("unexpected address type", x.to_s)
+  }
+}
+
+# The Addr of a canonical sockaddr for a socket on network `net` (Go's
+# sockaddrToTCP and friends); none for an empty one.
+def sockaddr_to_addr(net: Str, sa: [Byte]) -> Addr? {
+  f = sa_family(sa)
+  return none if f == 0
+  return UnixAddr.new(name: sa_unix_name(sa), net: net) if f == 1
+  ip = sa_ip(sa)
+  zone = f == 6 ? zone_name(sa_be32(sa)) : ""
+  k = net_kind(net)
+  return TCPAddr.new(ip: ip, port: sa_port(sa), zone: zone) if k == 0
+  return UDPAddr.new(ip: ip, port: sa_port(sa), zone: zone) if k == 1
+  IPAddr.new(ip: ip, zone: zone)
+}
+
+# The Addr written as `s` (to_s's form) for a socket on network `net`;
+# none for "".
+def addr_of_text(net: Str, s: Str) -> Addr? {
+  k = net_kind(net)
+  return UnixAddr.new(name: s, net: net) if k == 3
+  return none if s == ""
+  if k == 2 {
+    h, zone = split_host_zone(s)
+    ip = parse_ip(h) || IP.new
+    return IPAddr.new(ip: ip, zone: zone)
+  }
+  r = split_host_port(s)
+  return none if r.err?
+  h, p = r.unwrap
+  host, zone = split_host_zone(h)
+  ip = IP.new
+  if host != "" {
+    ip = parse_ip(host) || IP.new
+  }
+  port, _, _ = dtoi(p)
+  return UDPAddr.new(ip: ip, port: port, zone: zone) if k == 1
+  TCPAddr.new(ip: ip, port: port, zone: zone)
+}
+
+# 0 tcp, 1 udp, 2 ip, 3 unix (any), -1 other.
+def net_kind(net: Str) -> Int {
+  return 0 if net == "tcp" || net == "tcp4" || net == "tcp6"
+  return 1 if net == "udp" || net == "udp4" || net == "udp6"
+  return 3 if net == "unix" || net == "unixgram" || net == "unixpacket"
+  return 2 if net.start_with?("ip")
+  -1
+}
+
+# Whether this is Linux (constants differ between the kernels).
+def linux? -> Bool { c("AF_INET6") == 10 }
+
+# Go's zoneCache.index: an IPv6 zone (interface name or number) as its
+# interface index; 0 for "" or an unknown name.
+def zone_index(zone: Str) -> Int {
+  return 0 if zone == ""
+  for ifi in interface_table {
+    return ifi.index if ifi.name == zone
+  }
+  n, i, ok = dtoi(zone)
+  return n if ok && i == zone.size
+  0
+}
+
+# Go's zoneCache.name: the interface name of an index (its decimal form if
+# there's no such interface; "" for 0).
+def zone_name(index: Int) -> Str {
+  return "" if index == 0
+  for ifi in interface_table {
+    return ifi.name if ifi.index == index
+  }
+  "#{index}"
+}

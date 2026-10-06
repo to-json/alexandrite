@@ -1,0 +1,166 @@
+# In-memory, synchronous, full-duplex connections (Go's pipe.go).
+
+import "time"
+
+# Go's io.ErrClosedPipe, which a pipe end returns once either end is closed
+# (alx's io has no such error).
+pub error PipeError {
+  ClosedPipe
+
+  def message -> Str { "io: read/write on closed pipe" }
+}
+
+# Go's pipeAddr: both ends' address, "pipe" on network "pipe".
+pub struct PipeAddr {
+  pub def network -> Str { "pipe" }
+  pub def to_s -> Str { "pipe" }
+}
+
+# A deadline for one direction of a pipe (Go's pipeDeadline): `cancel` is
+# closed when it passes.
+struct PipeDeadline {
+  st: Mutex[PipeDlState]
+
+  def set(t: time.Time) {
+    me = st
+    dur = t.is_zero ? 0 : time.until(t).ns
+    # The gen of a timer to start (0: none).
+    g = st.lock { |s|
+      s.gen += 1
+      start = 0
+      if t.is_zero || dur > 0 {
+        if s.closed {
+          s.cancel = Chan[Bool].new
+          s.closed = false
+        }
+        start = s.gen if dur > 0
+      } elsif !s.closed {
+        s.cancel.close
+        s.closed = true
+      }
+      start
+    }
+    if g > 0 {
+      spawn {
+        alx_sleep_ns(dur)
+        me.lock { |s2|
+          if s2.gen == g && !s2.closed {
+            s2.cancel.close
+            s2.closed = true
+          }
+        }
+      }
+    }
+  }
+
+  def wait -> Chan[Bool] { st.lock { |s| s.cancel } }
+}
+
+struct PipeDlState {
+  cancel: Chan[Bool]
+  closed: Bool
+  gen: Int
+}
+
+def make_pipe_deadline -> PipeDeadline { PipeDeadline.new(st: Mutex.new(PipeDlState.new(cancel: Chan[Bool].new, closed: false, gen: 0))) }
+
+def closed_chan?(c: Chan[Bool]) -> Bool {
+  r = false
+  select {
+    when v = c.recv => r = true
+    else => r = false
+  }
+  r
+}
+
+# One end of a pipe (Go's pipe).
+struct PipeEnd {
+  wr_mu: Mutex[Int]
+  rd_rx: Chan[[Byte]]
+  rd_tx: Chan[Int]
+  wr_tx: Chan[[Byte]]
+  wr_rx: Chan[Int]
+  closed_once: Atomic[Bool]
+  local_done: Chan[Bool]
+  remote_done: Chan[Bool]
+  read_dl: PipeDeadline
+  write_dl: PipeDeadline
+
+  def read!(b: [Byte]) -> ~Int {
+    fail PipeError.ClosedPipe if closed_chan?(local_done)
+    return 0 if closed_chan?(remote_done)
+    dl = read_dl.wait
+    fail timeout_error("read", "pipe", "", "") if closed_chan?(dl)
+    select {
+      when bw = rd_rx.recv => {
+        nr = copy(b, bw.unwrap)
+        rd_tx << nr
+        return nr
+      }
+      when v = local_done.recv => { fail PipeError.ClosedPipe }
+      when v = remote_done.recv => { return 0 }
+      when v = dl.recv => { fail timeout_error("read", "pipe", "", "") }
+    }
+    0
+  }
+
+  def write!(b0: [Byte]) -> ~Int {
+    fail PipeError.ClosedPipe if closed_chan?(local_done) || closed_chan?(remote_done)
+    dl = write_dl.wait
+    fail timeout_error("write", "pipe", "", "") if closed_chan?(dl)
+    me = self
+    r = wr_mu.lock { |_u| me.write_locked(b0, dl) }
+    ~r
+  }
+
+  def write_locked(b0: [Byte], dl: Chan[Bool]) -> ~Int {
+    b = b0
+    n = 0
+    once = true
+    while once || b.size > 0 {
+      once = false
+      select {
+        when wr_tx.send(b.dup) => {
+          nw = wr_rx.recv || 0
+          b = b[nw...b.size]
+          n += nw
+        }
+        when v = local_done.recv => { fail PipeError.ClosedPipe }
+        when v = remote_done.recv => { fail PipeError.ClosedPipe }
+        when v = dl.recv => { fail timeout_error("write", "pipe", "", "") }
+      }
+    }
+    n
+  }
+
+  # mode: 1 read, 2 write, 3 both.
+  def set_deadline(mode: Int, t: time.Time) -> ~Unit {
+    fail PipeError.ClosedPipe if closed_chan?(local_done) || closed_chan?(remote_done)
+    read_dl.set(t) if mode & 1 != 0
+    write_dl.set(t) if mode & 2 != 0
+  }
+
+  def close! -> ~Unit {
+    local_done.close if closed_once.compare_and_swap(false, true)
+  }
+}
+
+# Go's Pipe: two connected in-memory ends; a write blocks until the other
+# end has read all of it (no buffering). Both ends are Conns (network
+# "pipe", addresses "pipe"); a closed end reads 0 (end of stream) on the
+# other side and fails writes with PipeError.ClosedPipe.
+pub def pipe -> (Conn, Conn) {
+  cb1 = Chan[[Byte]].new
+  cb2 = Chan[[Byte]].new
+  cn1 = Chan[Int].new
+  cn2 = Chan[Int].new
+  done1 = Chan[Bool].new
+  done2 = Chan[Bool].new
+  p1 = PipeEnd.new(wr_mu: Mutex.new(0), rd_rx: cb1, rd_tx: cn1, wr_tx: cb2, wr_rx: cn2, closed_once: Atomic.new(false), local_done: done1, remote_done: done2, read_dl: make_pipe_deadline, write_dl: make_pipe_deadline)
+  p2 = PipeEnd.new(wr_mu: Mutex.new(0), rd_rx: cb2, rd_tx: cn2, wr_tx: cb1, wr_rx: cn1, closed_once: Atomic.new(false), local_done: done2, remote_done: done1, read_dl: make_pipe_deadline, write_dl: make_pipe_deadline)
+  (pipe_conn(p1), pipe_conn(p2))
+}
+
+def pipe_conn(p: PipeEnd) -> Conn {
+  Conn.new(nfd: new_fd(-1, 0, 0, "pipe", none, none, false), pp: p)
+}

@@ -1,0 +1,549 @@
+# The socket layer (Go's netFD and poll.FD: fd_posix.go, fd_unix.go,
+# sock_posix.go, ipsock_posix.go, sockopt_posix.go), over the runtime's
+# socket calls (alx_net_* in alx.c) and its event loop: a task that would
+# block parks until the descriptor is ready or its deadline passes.
+
+import "context"
+import "time"
+
+extern def c_read(fd: I32, buf: [Byte], n: Int) -> Int = "read"
+extern def c_write(fd: I32, buf: [Byte], n: Int) -> Int = "write"
+extern def alx_sys_const(name: Str) -> Int
+extern def alx_fd_wait_until(fd: Int, mode: Int, until: Int) -> Int
+extern def alx_fd_wake(fd: Int) -> Int
+extern def alx_fd_close(fd: Int) -> Int
+extern def alx_wall_ns() -> Int
+extern def alx_mono_ns() -> Int
+extern def alx_sleep_ns(ns: Int)
+extern def alx_sock_error(fd: Int) -> Int
+extern def alx_sock_shutdown(fd: Int, how: Int) -> Int
+extern def alx_net_socket(family: Int, sotype: Int, proto: Int) -> Int
+extern def alx_net_bind(fd: Int, sa: [Byte]) -> Int
+extern def alx_net_connect(fd: Int, sa: [Byte]) -> Int
+extern def alx_net_listen(fd: Int, backlog: Int) -> Int
+extern def alx_net_accept(fd: Int, out: [Byte]) -> Int
+extern def alx_net_sockname(fd: Int, out: [Byte], peer: Int) -> Int
+extern def alx_net_recvfrom(fd: Int, buf: [Byte], n: Int, flags: Int, out: [Byte]) -> Int
+extern def alx_net_sendto(fd: Int, buf: [Byte], n: Int, sa: [Byte]) -> Int
+extern def alx_net_recvmsg(fd: Int, buf: [Byte], n: Int, oob: [Byte], oobn: Int, out: [Byte], info: [Byte]) -> Int
+extern def alx_net_sendmsg(fd: Int, buf: [Byte], n: Int, oob: [Byte], oobn: Int, sa: [Byte]) -> Int
+extern def alx_net_setsockopt(fd: Int, name: Str, v: Int) -> Int
+extern def alx_net_getsockopt(fd: Int, name: Str) -> Int
+extern def alx_net_dup(fd: Int, nonblock: Int) -> Int
+extern def c_unlink(p: Str) -> I32 = "unlink"
+
+# Socket types (the runtime's codes).
+SOCK_STREAM = 1
+SOCK_DGRAM = 2
+SOCK_RAW = 3
+SOCK_SEQPACKET = 5
+
+# alx_fd_wait_until's verdict when the deadline passed.
+WAIT_EXPIRED = -1000000
+
+# Go's listenerBacklog: SOMAXCONN as the system reports it (128 here).
+LISTENER_BACKLOG = 4096
+
+# Go's aLongTimeAgo, as a deadline (Unix ns): any past time works.
+A_LONG_TIME_AGO = 1000000000
+
+# A socket: Go's netFD. The descriptor and the deadlines live in Atomics,
+# so copies are the same socket and tasks may share it (D36).
+struct NetFD {
+  # The descriptor; -1 once closed.
+  sysfd: Atomic[Int]
+  # 4 (AF_INET), 6 (AF_INET6) or 1 (AF_UNIX).
+  family: Int
+  sotype: Int
+  # The network the socket was made for: "tcp", "udp6", "unixgram", ...
+  net: Str
+  # The addresses as text ("" for none): plain values keep a socket free
+  # of shared storage, so it can move into tasks.
+  la_s: Str
+  ra_s: Str
+  # Whether there is a local / remote address (an unnamed Unix socket's is
+  # "" but present, as in Go).
+  has_la: Bool
+  has_ra: Bool
+  # The deadlines (Unix ns; 0: none).
+  rdl: Atomic[Int]
+  wdl: Atomic[Int]
+  # Whether connect succeeded (Go's isConnected).
+  connected: Bool
+
+  def fd -> Int { sysfd.load }
+  def la -> Str { la_s }
+  def ra -> Str { ra_s }
+  def laddr -> Addr? {
+    return none unless has_la
+    addr_of_text(net, la_s)
+  }
+
+  def raddr -> Addr? {
+    return none unless has_ra
+    addr_of_text(net, ra_s)
+  }
+
+  # Go's fd.name: "net:laddr->raddr".
+  def name -> Str { net + ":" + la + "->" + ra }
+
+  # The NetError of a failed operation: `op` on this socket.
+  def err_closed(op: Str, src: Str, dst: Str) -> NetError { closed_error(op, net, src, dst) }
+
+  # Whether the deadline for `mode` (1 read, 2 write) has passed.
+  def expired?(mode: Int) -> Bool {
+    dl = mode == 1 ? rdl.load : wdl.load
+    dl != 0 && dl <= alx_wall_ns()
+  }
+
+  # Waits until the socket is ready for mode (1 read, 2 write) or its
+  # deadline passes: 0 (retry the call), WAIT_EXPIRED, or -errno.
+  def wait(f: Int, mode: Int) -> Int {
+    dl = mode == 1 ? rdl.load : wdl.load
+    until = 0
+    if dl != 0 {
+      left = dl - alx_wall_ns()
+      return WAIT_EXPIRED if left <= 0
+      until = alx_mono_ns() + left
+    }
+    r = alx_fd_wait_until(f, mode, until)
+    return WAIT_EXPIRED if r == -c("ETIMEDOUT") && until > 0
+    r
+  }
+
+  # Go's netFD.Read (poll.FD.Read): up to p.size bytes; 0 at end of stream.
+  def fd_read(p: [Byte], op: Str, src: Str, dst: Str) -> ~Int<NetError> {
+    return 0 if p.size == 0 && sotype == SOCK_STREAM
+    loop {
+      f = fd
+      fail err_closed(op, src, dst) if f < 0
+      fail timeout_error(op, net, src, dst) if expired?(1)
+      n = c_read(f.to_i32, p, p.size)
+      return n if n >= 0
+      code = C.errno
+      if code == c("EAGAIN") {
+        w = wait(f, 1)
+        fail timeout_error(op, net, src, dst) if w == WAIT_EXPIRED
+        fail op_error(op, net, src, dst, "read", -w) if w < 0
+      } elsif code != c("EINTR") {
+        fail err_closed(op, src, dst) if code == c("EBADF")
+        fail op_error(op, net, src, dst, "read", code)
+      }
+    }
+  }
+
+  # Go's netFD.Write: all of p for a stream (looping on partial writes),
+  # one datagram otherwise.
+  def fd_write(p: [Byte], op: Str, src: Str, dst: Str) -> ~Int<NetError> {
+    off = 0
+    loop {
+      f = fd
+      fail err_closed(op, src, dst) if f < 0
+      fail timeout_error(op, net, src, dst) if expired?(2)
+      n = c_write(f.to_i32, p[off...p.size], p.size - off)
+      if n >= 0 {
+        off += n
+        return off if off >= p.size || sotype != SOCK_STREAM
+        next
+      }
+      code = C.errno
+      if code == c("EAGAIN") {
+        w = wait(f, 2)
+        fail timeout_error(op, net, src, dst) if w == WAIT_EXPIRED
+        fail op_error(op, net, src, dst, "write", -w) if w < 0
+      } elsif code != c("EINTR") {
+        fail err_closed(op, src, dst) if code == c("EBADF")
+        fail op_error(op, net, src, dst, "write", code)
+      }
+    }
+  }
+
+  # recvfrom: the length and the sender (canonical sockaddr).
+  def fd_read_from(p: [Byte], op: Str, src: Str, dst: Str) -> ~(Int, [Byte])<NetError> {
+    from = sa_none
+    loop {
+      f = fd
+      fail err_closed(op, src, dst) if f < 0
+      fail timeout_error(op, net, src, dst) if expired?(1)
+      n = alx_net_recvfrom(f, p, p.size, 0, from)
+      return (n, from) if n >= 0
+      code = -n
+      if code == c("EAGAIN") {
+        w = wait(f, 1)
+        fail timeout_error(op, net, src, dst) if w == WAIT_EXPIRED
+        fail op_error(op, net, src, dst, "recvfrom", -w) if w < 0
+      } elsif code != c("EINTR") {
+        fail err_closed(op, src, dst) if code == c("EBADF")
+        fail op_error(op, net, src, dst, "recvfrom", code)
+      }
+    }
+  }
+
+  # sendto (sa: canonical; family 0 sends to the connected peer).
+  def fd_write_to(p: [Byte], sa: [Byte], op: Str, src: Str, dst: Str) -> ~Int<NetError> {
+    loop {
+      f = fd
+      fail err_closed(op, src, dst) if f < 0
+      fail timeout_error(op, net, src, dst) if expired?(2)
+      n = alx_net_sendto(f, p, p.size, sa)
+      return n if n >= 0
+      code = -n
+      if code == c("EAGAIN") {
+        w = wait(f, 2)
+        fail timeout_error(op, net, src, dst) if w == WAIT_EXPIRED
+        fail op_error(op, net, src, dst, "sendto", -w) if w < 0
+      } elsif code != c("EINTR") {
+        fail err_closed(op, src, dst) if code == c("EBADF")
+        fail op_error(op, net, src, dst, "sendto", code)
+      }
+    }
+  }
+
+  # recvmsg: (n, oobn, flags, sender).
+  def fd_read_msg(p: [Byte], oob: [Byte], op: Str, src: Str, dst: Str) -> ~(Int, Int, Int, [Byte])<NetError> {
+    from = sa_none
+    info: [Byte] = [0; 16]
+    loop {
+      f = fd
+      fail err_closed(op, src, dst) if f < 0
+      fail timeout_error(op, net, src, dst) if expired?(1)
+      n = alx_net_recvmsg(f, p, p.size, oob, oob.size, from, info)
+      return (n, le64(info, 0), le64(info, 8), from) if n >= 0
+      code = -n
+      if code == c("EAGAIN") {
+        w = wait(f, 1)
+        fail timeout_error(op, net, src, dst) if w == WAIT_EXPIRED
+        fail op_error(op, net, src, dst, "recvmsg", -w) if w < 0
+      } elsif code != c("EINTR") {
+        fail err_closed(op, src, dst) if code == c("EBADF")
+        fail op_error(op, net, src, dst, "recvmsg", code)
+      }
+    }
+  }
+
+  # sendmsg: (n, oobn).
+  def fd_write_msg(p: [Byte], oob: [Byte], sa: [Byte], op: Str, src: Str, dst: Str) -> ~(Int, Int)<NetError> {
+    loop {
+      f = fd
+      fail err_closed(op, src, dst) if f < 0
+      fail timeout_error(op, net, src, dst) if expired?(2)
+      n = alx_net_sendmsg(f, p, p.size, oob, oob.size, sa)
+      return (n, oob.size) if n >= 0
+      code = -n
+      if code == c("EAGAIN") {
+        w = wait(f, 2)
+        fail timeout_error(op, net, src, dst) if w == WAIT_EXPIRED
+        fail op_error(op, net, src, dst, "sendmsg", -w) if w < 0
+      } elsif code != c("EINTR") {
+        fail err_closed(op, src, dst) if code == c("EBADF")
+        fail op_error(op, net, src, dst, "sendmsg", code)
+      }
+    }
+  }
+
+  # Go's netFD.accept: the new connection's socket.
+  def fd_accept(op: Str, dst: Str) -> ~NetFD<NetError> {
+    rsa = sa_none
+    loop {
+      f = fd
+      fail err_closed(op, "", dst) if f < 0
+      fail timeout_error(op, net, "", dst) if expired?(1)
+      r = alx_net_accept(f, rsa)
+      if r >= 0 {
+        lsa = sa_none
+        alx_net_sockname(r, lsa, 0)
+        return new_fd(r, family, sotype, net, sockaddr_to_addr(net, lsa), sockaddr_to_addr(net, rsa), true)
+      }
+      code = -r
+      if code == c("EAGAIN") {
+        w = wait(f, 1)
+        fail timeout_error(op, net, "", dst) if w == WAIT_EXPIRED
+        fail op_error(op, net, "", dst, "accept", -w) if w < 0
+      } elsif code != c("EINTR") && code != c("ECONNABORTED") {
+        fail err_closed(op, "", dst) if code == c("EBADF")
+        fail op_error(op, net, "", dst, "accept", code)
+      }
+    }
+  }
+
+  # Closes the descriptor (every copy) and wakes its waiters; a second close
+  # fails with Closed.
+  def fd_close(op: Str, src: Str, dst: Str) -> ~Unit<NetError> {
+    f = sysfd.swap(-1)
+    fail err_closed(op, src, dst) if f < 0
+    r = alx_fd_close(f)
+    fail op_error(op, net, src, dst, "close", -r) if r < 0
+  }
+
+  # shutdown(2): how 0 read side, 1 write side.
+  def fd_shutdown(how: Int, op: Str, src: Str, dst: Str) -> ~Unit<NetError> {
+    f = fd
+    fail err_closed(op, src, dst) if f < 0
+    r = alx_sock_shutdown(f, how)
+    fail op_error(op, net, src, dst, "shutdown", -r) if r < 0
+  }
+
+  # Sets a deadline (mode 1 read, 2 write, 3 both) to t (zero: none), and
+  # wakes the waiters so the new one takes effect at once.
+  def set_deadline(mode: Int, t: time.Time) -> ~Unit<NetError> {
+    f = fd
+    fail err_closed("set", "", la) if f < 0
+    v = deadline_ns(t)
+    rdl.store(v) if mode & 1 != 0
+    wdl.store(v) if mode & 2 != 0
+    alx_fd_wake(f)
+  }
+
+  # setsockopt with an int, failing as Go's "set" OpErrors do.
+  def setsockopt(name: Str, v: Int) -> ~Unit<NetError> {
+    f = fd
+    fail err_closed("set", la, ra) if f < 0
+    r = alx_net_setsockopt(f, name, v)
+    fail op_error("set", net, la, ra, "setsockopt", -r) if r < 0
+  }
+
+  def getsockopt(name: Str) -> ~Int<NetError> {
+    f = fd
+    fail err_closed("get", la, ra) if f < 0
+    r = alx_net_getsockopt(f, name)
+    fail op_error("get", net, la, ra, "getsockopt", -r) if r < 0
+    r
+  }
+}
+
+# A deadline as Unix nanoseconds (0 for the zero Time: none). A past
+# deadline stays in the past (never 0).
+def deadline_ns(t: time.Time) -> Int {
+  return 0 if t.is_zero
+  v = t.unix_nano
+  v <= 0 ? 1 : v
+}
+
+# Go's setDefaultSockopts.
+def set_default_sockopts(s: Int, family: Int, sotype: Int, ipv6only: Bool) -> Int {
+  if family == 6 && sotype != SOCK_RAW {
+    r = alx_net_setsockopt(s, "IPV6_V6ONLY", ipv6only ? 1 : 0)
+    return r if r < 0
+  }
+  if (sotype == SOCK_DGRAM || sotype == SOCK_RAW) && family != 1 {
+    r = alx_net_setsockopt(s, "SO_BROADCAST", 1)
+    return r if r < 0
+  }
+  0
+}
+
+# The hooks Dialer.control and ListenConfig.control receive: Go's
+# syscall.RawConn, reduced to its Control method.
+pub struct RawConn {
+  sysfd: Atomic[Int]
+
+  # Calls f with the descriptor. Go's Control.
+  pub def control(f: (Int) -> Unit) -> ~Unit {
+    d = sysfd.load
+    fail closed_error("raw-control", "", "", "") if d < 0
+    f.call(d)
+  }
+
+  # The descriptor (-1 once closed).
+  pub def fd -> Int { sysfd.load }
+}
+
+
+# Go's socket(): makes, binds and connects (dial) or binds and listens
+# (listen) a socket. Errors are the bare cause (the caller wraps them in
+# its NetError); `ctx` cancels and bounds a connect.
+def socket(ctx: context.Context, net: Str, family: Int, sotype: Int, proto: Int, ipv6only: Bool, laddr: Addr?, raddr: Addr?, ctrl: ((Str, Str, RawConn) -> ~Unit)?) -> ~NetFD {
+  s = alx_net_socket(family, sotype, proto)
+  fail syscall_error("socket", -s) if s < 0
+  r = set_default_sockopts(s, family, sotype, ipv6only)
+  if r < 0 {
+    alx_fd_close(s)
+    fail syscall_error("setsockopt", -r)
+  }
+  res = socket_setup(ctx, s, net, family, sotype, laddr, raddr, ctrl)
+  if res.err? {
+    alx_fd_close(s)
+  }
+  ~res
+}
+
+def socket_setup(ctx: context.Context, s: Int, net: Str, family: Int, sotype: Int, laddr: Addr?, raddr: Addr?, ctrl: ((Str, Str, RawConn) -> ~Unit)?) -> ~NetFD {
+  rc = RawConn.new(sysfd: Atomic.new(s))
+  cnet = ctrl_network(net, family)
+  if la = laddr {
+    unless raddr.present? {
+      if sotype == SOCK_STREAM || sotype == SOCK_SEQPACKET {
+        # listenStream
+        r = alx_net_setsockopt(s, "SO_REUSEADDR", 1)
+        fail syscall_error("setsockopt", -r) if r < 0
+        lsa = ~addr_sockaddr(la, family)
+        if h = ctrl {
+          ~h.call(cnet, la.to_s, rc)
+        }
+        r = alx_net_bind(s, lsa)
+        fail syscall_error("bind", -r) if r < 0
+        r = alx_net_listen(s, LISTENER_BACKLOG)
+        fail syscall_error("listen", -r) if r < 0
+        got = sa_none
+        alx_net_sockname(s, got, 0)
+        return new_fd(s, family, sotype, net, sockaddr_to_addr(net, got), none, false)
+      }
+      if sotype == SOCK_DGRAM {
+        # listenDatagram
+        la2 = la
+        case la {
+          UDPAddr(u) => {
+            if u.ip.size > 0 && u.ip.multicast? {
+              r = alx_net_setsockopt(s, "SO_REUSEADDR", 1)
+              fail syscall_error("setsockopt", -r) if r < 0
+              if c("SO_REUSEPORT") >= 0 {
+                r = alx_net_setsockopt(s, "SO_REUSEPORT", 1)
+                fail syscall_error("setsockopt", -r) if r < 0
+              }
+              la2 = UDPAddr.new(ip: family == 4 ? ipv4_zero : ipv6_unspecified, port: u.port, zone: u.zone)
+            }
+          }
+          _ => nil
+        }
+        lsa = ~addr_sockaddr(la2, family)
+        if h = ctrl {
+          ~h.call(cnet, la2.to_s, rc)
+        }
+        r = alx_net_bind(s, lsa)
+        fail syscall_error("bind", -r) if r < 0
+        got = sa_none
+        alx_net_sockname(s, got, 0)
+        return new_fd(s, family, sotype, net, sockaddr_to_addr(net, got), none, false)
+      }
+    }
+  }
+  # dial
+  if h = ctrl {
+    ca = raddr.present? ? addr_s(raddr) : addr_s(laddr)
+    ~h.call(cnet, ca, rc)
+  }
+  if la = laddr {
+    lsa = ~addr_sockaddr(la, family)
+    if sa_family(lsa) != 0 {
+      r = alx_net_bind(s, lsa)
+      fail syscall_error("bind", -r) if r < 0
+    }
+  }
+  connected = false
+  crsa = sa_none
+  if ra = raddr {
+    rsa = ~addr_sockaddr(ra, family)
+    fd0 = new_fd(s, family, sotype, net, none, none, false)
+    crsa = ~connect(ctx, fd0, rsa)
+    connected = true
+  }
+  lsa2 = sa_none
+  alx_net_sockname(s, lsa2, 0)
+  if sa_family(crsa) != 0 {
+    return new_fd(s, family, sotype, net, sockaddr_to_addr(net, lsa2), sockaddr_to_addr(net, crsa), connected)
+  }
+  psa = sa_none
+  if alx_net_sockname(s, psa, 1) == 0 && sa_family(psa) != 0 {
+    return new_fd(s, family, sotype, net, sockaddr_to_addr(net, lsa2), sockaddr_to_addr(net, psa), connected)
+  }
+  new_fd(s, family, sotype, net, sockaddr_to_addr(net, lsa2), raddr, connected)
+}
+
+def new_fd(s: Int, family: Int, sotype: Int, net: Str, laddr: Addr?, raddr: Addr?, connected: Bool) -> NetFD {
+  NetFD.new(sysfd: Atomic.new(s), family: family, sotype: sotype, net: net, la_s: addr_s(laddr), ra_s: addr_s(raddr), has_la: laddr.present?, has_ra: raddr.present?, rdl: Atomic.new(0), wdl: Atomic.new(0), connected: connected)
+}
+
+# Go's ctrlNetwork: the network with its family digit.
+def ctrl_network(net: Str, family: Int) -> Str {
+  return net if net == "unix" || net == "unixgram" || net == "unixpacket"
+  last = net[net.size - 1]
+  return net if last == 52 || last == 54
+  family == 4 ? net + "4" : net + "6"
+}
+
+# A failed system call as an error (Go's os.SyscallError); the NetError a
+# caller wraps it in (wrap_any) keeps the call and the errno.
+def syscall_error(call: Str, code: Int) -> NetError { op_error("", "", "", "", call, code) }
+
+# Go's netFD.connect: connects fd to rsa, waiting (parked) until it
+# completes, the context is canceled or its deadline passes. The address
+# actually connected to (or an empty sockaddr).
+def connect(ctx: context.Context, fd: NetFD, rsa: [Byte]) -> ~[Byte] {
+  s = fd.fd
+  r = alx_net_connect(s, rsa)
+  code = -r
+  if r == 0 || code == c("EISCONN") {
+    fail ctx_error(ctx) if ctx.done?
+    return sa_none
+  }
+  unless code == c("EINPROGRESS") || code == c("EALREADY") || code == c("EINTR") {
+    fail syscall_error("connect", code)
+  }
+  # The context's deadline bounds the wait; cancellation wakes it.
+  if dl = ctx.deadline {
+    fd.wdl.store(dl <= 0 ? 1 : dl)
+  }
+  done = Chan[Bool].new(1)
+  if ctx.cancelable? {
+    wd = fd.wdl
+    spawn {
+      select {
+        when v = ctx.done.recv => {
+          wd.store(A_LONG_TIME_AGO)
+          alx_fd_wake(s)
+        }
+        when v = done.recv => nil
+      }
+    }
+  }
+  res = connect_wait(fd, s)
+  done << true
+  fd.wdl.store(0)
+  if ctx.done? {
+    fail ctx_error(ctx)
+  }
+  ~res
+}
+
+def connect_wait(fd: NetFD, s: Int) -> ~[Byte] {
+  loop {
+    w = fd.wait(s, 2)
+    fail timeout_error("", "", "", "") if w == WAIT_EXPIRED
+    fail syscall_error("connect", -w) if w < 0
+    e = alx_sock_error(s)
+    if e == c("EINPROGRESS") || e == c("EALREADY") || e == c("EINTR") {
+      next
+    }
+    return sa_none if e == c("EISCONN")
+    if e == 0 {
+      psa = sa_none
+      return psa if alx_net_sockname(s, psa, 1) == 0
+      next
+    }
+    fail syscall_error("connect", e)
+  }
+}
+
+# A native (little-endian) int64 at b[off...off + 8].
+def le64(b: [Byte], off: Int) -> Int {
+  v = 0
+  for i in 0...8 {
+    v = v | (b[off + i].to_i << (8 * i))
+  }
+  v
+}
+
+def put_le64(b: [Byte], off: Int, v: Int) {
+  for i in 0...8 {
+    b[off + i] = (v >> (8 * i)).as_u8
+  }
+}
+
+# Go's mapErr(ctx.Err()): errCanceled or errTimeout.
+def ctx_error(ctx: context.Context) -> NetError {
+  e = ctx.err || return wrap_error("", "", "", "", "", ERR_CANCELED)
+  case e {
+    context.ContextError.DeadlineExceeded => timeout_error("", "", "", "")
+    _ => wrap_error("", "", "", "", "", ERR_CANCELED)
+  }
+}

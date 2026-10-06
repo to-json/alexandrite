@@ -1,0 +1,227 @@
+# Package server: the LSP message loop, document store, scheduler and
+# publishing logic (M1: diagnostics).
+#
+# One task, no Chan, no spawn (docs/notes/lsp-plan.md 0.1): `serve` reads a
+# message, handles it, and when nothing more is queued (`input_ready`) and a
+# document changed, runs the compiler synchronously and publishes. Messages
+# that arrive during a run wait in the pipe and are handled next. Because
+# nothing else runs during a check, the document versions a result was
+# computed for are always still current when it is published; an edit that
+# arrives meanwhile is handled next and marks its documents dirty again.
+#
+# The store (texts, versions, last results) is local to `serve`: texts are
+# stored by the loop function itself, never through a method of a passed-in
+# value, so they live in its region and are freed when replaced.
+
+import "alx.dev/lsp/compiler"
+import "alx.dev/lsp/jsonrpc"
+import "alx.dev/lsp/position"
+import "alx.dev/lsp/protocol"
+import "bufio"
+import "encoding/json"
+import "os"
+import "path"
+
+pub NAME = "alx-lsp"
+pub VERSION = "0.1.0"
+DEBOUNCE_MS = 150
+
+def send(w: bufio.Writer, body: Str) -> ~Unit {
+  ~jsonrpc.write_frame(w, body)
+}
+
+def log(w: bufio.Writer, kind: Int, msg: Str) -> ~Unit {
+  p = protocol.LogMessageParams.new(kind: kind, message: msg)
+  ~send(w, jsonrpc.notification("window/logMessage", p.~to_json))
+}
+
+# Serves one client until `exit` or end of input; returns the process exit
+# code (0 after a `shutdown`, 1 otherwise). `fake` replaces the compiler (tests).
+pub def serve(r: bufio.Reader, w: bufio.Writer, fake: compiler.Client?, self_path: Str) -> ~Int {
+  docs: Map[Str, Str] = {}
+  vers: Map[Str, Int] = {}
+  results: Map[Str, Entry] = {}
+  sent: Map[Str, Str] = {}       # uri -> the diagnostics JSON last published
+  dirty: [Str] = []
+  enc = position.UTF16
+  opts = Opts.new(path: "", std_dir: "", unit: "")
+  workspace = ""
+  client: compiler.Client = compiler.ExecClient.new(alx: "alx")
+  shut_id: Str? = none
+  state = 0       # 0 new, 1 initialized, 2 shutdown
+  loop {
+    if dirty.size > 0 && (shut_id != none || !input_ready(r, DEBOUNCE_MS)) {
+      todo = plan(docs, results, dirty)
+      dirty = []
+      for focus in todo {
+        fpath = protocol.uri_to_path(focus)
+        if fpath == "" {
+          next
+        }
+        overlays: Map[Str, Str] = {}
+        for u in docs.keys {
+          up = protocol.uri_to_path(u)
+          overlays[up] = docs[u] || "" if up != ""
+        }
+        req = compiler.Request.new(file: fpath, overlays: overlays, unit: opts.unit, std_dir: std_dir_for(opts.std_dir, workspace, fpath))
+        out = client.check!(req)
+        prev = results[focus]
+        prev_diags: [compiler.Diag] = []
+        if p = prev {
+          prev_diags = p.diags
+        }
+        e = Entry.new(root: "", files: [], diags: [])
+        if rep = out.report {
+          e = entry_of(fpath, rep.root, merge(prev_diags, rep.diagnostics, fpath))
+        } else {
+          ~log(w, protocol.MSG_ERROR, out.failure + "\n" + out.stderr)
+          e = entry_of(fpath, "", merge(prev_diags, [failure_diag(fpath, out.failure)], fpath))
+        }
+        if out.report != none && out.stderr != "" {
+          ~log(w, protocol.MSG_LOG, out.stderr)
+        }
+        results[focus] = e
+        affected: [Str] = e.files
+        if p = prev {
+          for f in p.files {
+            affected << f unless has(affected, f)
+          }
+        }
+        ~publish(w, affected, docs, vers, results, sent, enc)
+      }
+    }
+    if sid = shut_id {
+      # `shutdown` was held back until the pending check above had run
+      ~send(w, jsonrpc.response(sid, "null"))
+      shut_id = none
+      state = 2
+    }
+    body = ~jsonrpc.read_frame(r) || break
+    m = jsonrpc.parse(body)
+    if m.err != none {
+      ~send(w, jsonrpc.error_response("null", jsonrpc.PARSE_ERROR, "parse error"))
+      next
+    }
+    msg = m.unwrap
+    method = msg.method
+    if msg.method == "" {
+      next   # a response from the client: M1 sends no requests
+    }
+    if method == "exit" {
+      return state == 2 ? 0 : 1
+    }
+    if msg.request? {
+      id = msg.id.unwrap
+      if method == "initialize" && state == 0 {
+        ip = protocol.InitializeParams.from_json(msg.params.to_s)
+        params = ip.ok? ? ip.unwrap : protocol.InitializeParams.new(rootUri: none, capabilities: none, initializationOptions: none)
+        enc = pick_encoding(params)
+        opts = parse_opts(params.initializationOptions)
+        workspace = protocol.uri_to_path(params.rootUri || "")
+        if f = fake {
+          client = f
+        } else {
+          client = compiler.ExecClient.new(alx: compiler.find_alx(opts.path, self_path))
+        }
+        res = protocol.InitializeResult.new(
+          capabilities: protocol.ServerCaps.new(positionEncoding: encoding_name(enc), textDocumentSync: protocol.SyncOptions.new(openClose: true, change: 1, save: false)),
+          serverInfo: protocol.ServerInfo.new(name: NAME, version: VERSION))
+        ~send(w, jsonrpc.response(id, res.~to_json))
+        state = 1
+      } else if method == "shutdown" && state == 1 {
+        shut_id = id
+      } else if state == 0 {
+        ~send(w, jsonrpc.error_response(id, jsonrpc.SERVER_NOT_INITIALIZED, "server not initialized"))
+      } else if state == 2 {
+        ~send(w, jsonrpc.error_response(id, jsonrpc.INVALID_REQUEST, "server is shutting down"))
+      } else if method == "initialize" {
+        ~send(w, jsonrpc.error_response(id, jsonrpc.INVALID_REQUEST, "already initialized"))
+      } else {
+        ~send(w, jsonrpc.error_response(id, jsonrpc.METHOD_NOT_FOUND, "method not found: #{method}"))
+      }
+      next
+    }
+    next unless state == 1
+    case method {
+      "initialized" => {
+        v = fake != none ? "fake compiler" : compiler.version(compiler.find_alx(opts.path, self_path))
+        ~log(w, protocol.MSG_INFO, "#{NAME} #{VERSION}; compiler: #{v}; positions: #{encoding_name(enc)}")
+      }
+      "textDocument/didOpen" => {
+        pp = protocol.DidOpenParams.from_json(msg.params.to_s)
+        if pp.ok? {
+          d = pp.unwrap.textDocument
+          docs[d.uri] = d.text
+          vers[d.uri] = d.version
+          dirty << d.uri
+        }
+      }
+      "textDocument/didChange" => {
+        pp = protocol.DidChangeParams.from_json(msg.params.to_s)
+        if pp.ok? {
+          c = pp.unwrap
+          u = c.textDocument.uri
+          if c.contentChanges.size > 0 && docs.has_key?(u) {
+            old = docs[u] || ""
+            nt = c.contentChanges[c.contentChanges.size - 1].text
+            e = position.diff(old, nt)
+            fp = protocol.uri_to_path(u)
+            for k in results.keys {
+              en = results[k] || next
+              results[k] = Entry.new(root: en.root, files: en.files, diags: shift_diags(en.diags, fp, e))
+            }
+            docs[u] = nt
+            vers[u] = c.textDocument.version
+            dirty << u unless has(dirty, u)
+          }
+        }
+      }
+      "textDocument/didSave" => {
+        pp = protocol.DidSaveParams.from_json(msg.params.to_s)
+        if pp.ok? {
+          u = pp.unwrap.textDocument.uri
+          dirty << u unless has(dirty, u)
+        }
+      }
+      "textDocument/didClose" => {
+        pp = protocol.DidCloseParams.from_json(msg.params.to_s)
+        if pp.ok? {
+          u = pp.unwrap.textDocument.uri
+          docs.delete(u)
+          vers.delete(u)
+          gone = results[u]
+          results.delete(u)
+          dirty = dirty.select { it != u }
+          if g = gone {
+            ~publish(w, g.files, docs, vers, results, sent, enc)
+          }
+          # the buffer's text no longer shadows disk: recheck its dependents
+          dirty << u
+        }
+      }
+      _ => {}
+    }
+  }
+  state == 2 ? 0 : 1
+}
+
+# Publishes, for each of `uris` (file paths), the union over all results of
+# the diagnostics in that file; skips a file whose list did not change.
+def publish(w: bufio.Writer, files: [Str], docs: Map[Str, Str], vers: Map[Str, Int], results: Map[Str, Entry], sent: Map[Str, Str], enc: Int) -> ~Unit {
+  for f in files {
+    u = protocol.path_to_uri(f)
+    all: [compiler.Diag] = []
+    for k in results.keys {
+      en = results[k] || next
+      all = all + en.diags.select { it.file == f }
+    }
+    ds = lsp_diags(all, f, docs[u], enc)
+    ver: Int? = vers[u]
+    pr = protocol.PublishDiagnosticsParams.new(uri: u, version: ver, diagnostics: ds)
+    js = pr.~to_json
+    old = sent[u]
+    next if old == js || (old == none && ds.size == 0)
+    sent[u] = js
+    ~send(w, jsonrpc.notification("textDocument/publishDiagnostics", js))
+  }
+}

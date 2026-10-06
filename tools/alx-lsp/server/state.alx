@@ -1,0 +1,196 @@
+# The server's pure helpers: settings, diagnostic bookkeeping, conversion to
+# LSP diagnostics. State itself lives in `serve` (loop.alx), not here: texts
+# are stored by the loop function so they live in its region (docs/notes/
+# lsp-plan.md 0.1, R3), and everything here takes values and returns values.
+
+import "alx.dev/lsp/compiler"
+import "alx.dev/lsp/position"
+import "alx.dev/lsp/protocol"
+import "bufio"
+import "encoding/json"
+import "os"
+import "path"
+import "strings"
+
+pub struct Opts {
+  path: Str      # alx.path: the compiler binary
+  std_dir: Str   # alx.stdDir: ALX_STD_DIR for the child
+  unit: Str      # alx.unit: "", "script" or "package"
+}
+
+# What the last check of one focused file found.
+pub struct Entry {
+  root: Str                 # the unit's root directory
+  files: [Str]              # files that carry diagnostics, plus the focused one
+  diags: [compiler.Diag]
+}
+
+# Settings from initializationOptions: {"alx": {"path": ..}} or the same keys
+# at the top level.
+pub def parse_opts(v: json.Value?) -> Opts {
+  o = Opts.new(path: "", std_dir: "", unit: "")
+  return o unless v != none
+  top = v.unwrap
+  s = top
+  if inner = top.get("alx") {
+    s = inner
+  }
+  o.path = (s.get("path") || json.Value.json_zero).as_str || ""
+  o.std_dir = (s.get("stdDir") || json.Value.json_zero).as_str || ""
+  o.unit = (s.get("unit") || json.Value.json_zero).as_str || ""
+  o.unit = "" unless o.unit == "script" || o.unit == "package"
+  o
+}
+
+pub def pick_encoding(p: protocol.InitializeParams) -> Int {
+  if caps = p.capabilities {
+    if g = caps.general {
+      return position.UTF8 if has(g.positionEncodings, "utf-8")
+    }
+  }
+  position.UTF16
+}
+
+pub def encoding_name(enc: Int) -> Str {
+  enc == position.UTF8 ? "utf-8" : "utf-16"
+}
+
+# ---- TEMPORARY SHIM (plan 0.5): the timed stdin wait.
+# True when more input is ready: bytes already buffered, else (once
+# `os.File.wait_readable` lands) whether stdin becomes readable within `ms`.
+# Until then it only looks at the buffer, so a check runs as soon as the
+# buffer is empty (no debounce, just batching of already-queued messages).
+# SWAP: replace the body's last line with `os.stdin.~wait_readable(ms)`.
+pub def input_ready(r: bufio.Reader, ms: Int) -> Bool {
+  return true if r.buffered > 0
+  false
+}
+
+# ---- diagnostics bookkeeping
+
+# Moves the offsets of diagnostics in `file` through an edit of that file.
+pub def shift_diags(ds: [compiler.Diag], file: Str, e: position.Edit) -> [compiler.Diag] {
+  return ds if e.none?
+  ds.map { |d|
+    if d.file == file {
+      lo = e.shift(d.lo)
+      hi = e.shift(d.hi)
+      hi = lo if hi < lo
+      compiler.Diag.new(file: d.file, phase: d.phase, severity: d.severity, lo: lo, hi: hi, line: d.line, col: d.col, end_line: d.end_line, end_col: d.end_col, message: d.message, notes: d.notes)
+    } else {
+      d
+    }
+  }
+}
+
+def semantic?(d: compiler.Diag) -> Bool {
+  d.phase == "check" || d.phase == "prove" || d.phase == "warning"
+}
+
+# The diagnostics to keep after a check of `focus`: the fresh ones, unless the
+# focused file has a syntax error, in which case the previous semantic ones
+# (already shifted through the edits) stay beside the fresh syntax errors.
+pub def merge(prev: [compiler.Diag], fresh: [compiler.Diag], focus: Str) -> [compiler.Diag] {
+  broken = false
+  for d in fresh {
+    broken = true if d.file == focus && d.syntax?
+  }
+  return fresh unless broken
+  kept = prev.select { semantic?(it) }
+  fresh.select { it.syntax? || !semantic?(it) } + kept
+}
+
+# A synthetic diagnostic at the top of a file.
+pub def failure_diag(file: Str, msg: Str) -> compiler.Diag {
+  compiler.Diag.new(file: file, phase: "internal", severity: "error", lo: 0, hi: 0, line: 0, col: 0, end_line: 0, end_col: 0, message: msg, notes: [])
+}
+
+pub def entry_of(focus: Str, root: Str, diags: [compiler.Diag]) -> Entry {
+  files = [focus]
+  for d in diags {
+    files << d.file unless has(files, d.file)
+  }
+  Entry.new(root: root, files: files, diags: diags)
+}
+
+# LSP diagnostics of `file` among `ds`. `text` is the buffer when the file is
+# open (offsets are authoritative then, they were shifted through edits).
+pub def lsp_diags(ds: [compiler.Diag], file: Str, text: Str?, enc: Int) -> [protocol.Diagnostic] {
+  mine = ds.select { it.file == file }
+  return [] if mine.size == 0
+  open = text != none
+  body = ""
+  if open {
+    body = text.unwrap
+  } else if enc == position.UTF16 {
+    r = os.read_file_string(file)
+    body = r.unwrap_or("")
+  }
+  ix = position.index(body)
+  out: [protocol.Diagnostic] = []
+  seen: [Str] = []
+  for d in mine {
+    sl = d.line
+    sc = d.col
+    el = d.end_line
+    ec = d.end_col
+    if open {
+      sl, sc = ix.line_col(d.lo)
+      el, ec = ix.line_col(d.hi)
+    }
+    if open || enc == position.UTF16 {
+      sc = ix.to_client(sl, sc, enc)
+      ec = ix.to_client(el, ec, enc)
+    }
+    msg = d.message
+    msg = msg + "\n" + d.notes.join("\n") if d.notes.size > 0
+    sev = case d.severity { "error" => 1; "warning" => 2; _ => 3 }
+    key = "#{sl}:#{sc}:#{el}:#{ec}:#{msg}"
+    next if has(seen, key)
+    seen << key
+    rng = protocol.Range.new(start: protocol.Position.new(line: sl, character: sc), end: protocol.Position.new(line: el, character: ec))
+    out << protocol.Diagnostic.new(range: rng, severity: sev, source: "alx", message: msg)
+  }
+  out
+}
+
+# Open buffers to recheck after `changed` (uris) changed: the buffers
+# themselves, and every other open buffer whose last check was of the same
+# unit root or listed one of them.
+pub def plan(docs: Map[Str, Str], results: Map[Str, Entry], changed: [Str]) -> [Str] {
+  out: [Str] = []
+  for u in changed {
+    out << u if docs.has_key?(u) && !has(out, u)
+  }
+  for u in changed {
+    p = protocol.uri_to_path(u)
+    for o in docs.keys {
+      next if has(out, o)
+      e = results[o] || next
+      out << o if e.root == path.dir(p) || has(e.files, p)
+    }
+  }
+  out
+}
+
+# The ALX_STD_DIR for a check of `file`: the setting, else <repo>/std when the
+# workspace is the alexandrite repo or `file` is a std buffer; "" otherwise.
+pub def std_dir_for(setting: Str, workspace: Str, file: Str) -> Str {
+  return setting if setting != ""
+  if workspace != "" {
+    r = compiler.find_repo(workspace)
+    return r + "/std" if r != ""
+  }
+  if strings.contains(file, "/std/") {
+    r = compiler.find_repo(file)
+    return r + "/std" if r != "" && file.start_with?(r + "/std/")
+  }
+  ""
+}
+
+pub def has(xs: [Str], x: Str) -> Bool {
+  for y in xs {
+    return true if y == x
+  }
+  false
+}

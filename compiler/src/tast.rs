@@ -7,7 +7,12 @@ use crate::ast::{BinOp, Overflow};
 use num_bigint::BigInt;
 use num_rational::BigRational;
 use crate::diag::Span;
+use std::rc::Rc;
 
+/// A type: a structural tree. A struct's or enum's field list is shared
+/// (`Rc`), so cloning a type is cheap however large its fields are: the
+/// checker copies types into every expression, and a struct like
+/// crypto/tls.Conn expands to ~11,000 nodes (port-issues #160).
 #[derive(Clone, Debug)]
 pub enum Ty {
     /// I64, the default integer.
@@ -24,7 +29,7 @@ pub enum Ty {
     Fixed(Box<Ty>, u64),
     /// `enum`: its name and variants (each with its fields). A value: the
     /// tag, then every variant's fields side by side.
-    Enum(String, Vec<(String, Vec<(String, Ty)>)>),
+    Enum(String, Rc<Vec<(String, Vec<(String, Ty)>)>>),
     /// Any error value: one of the program's `error` types (and the
     /// builtin ones), with where it happened and any `wrap` context.
     Error,
@@ -57,7 +62,7 @@ pub enum Ty {
     /// `Ptr`: an opaque C pointer (pointer-sized; no deref in alexandrite).
     Ptr,
     /// A user struct (a value): its name and fields, in order.
-    Struct(String, Vec<(String, Ty)>),
+    Struct(String, Rc<Vec<(String, Ty)>>),
     /// Range[Int]
     Range,
     /// An unmaterialized pipeline: elements of type T. `true` = lazy.
@@ -588,6 +593,11 @@ pub enum TK {
     Array(Vec<TExpr>),
     /// `place = v`, or `place op= v`: a local, then index and field steps.
     PlaceAssign(LocalId, Vec<TStep>, Option<BinOp>, Box<TExpr>),
+    /// `place.m!(args)`: the call (whose receiver argument is `Local(view)`)
+    /// runs with `view` a one-element slice that *is* the place (a local,
+    /// then index and field steps): writes through it land in the place.
+    /// See docs/notes/bang-calls.md.
+    Bang(LocalId, Vec<TStep>, LocalId, Box<TExpr>),
     /// `format("...", args)`: pieces checked against the arguments.
     Format(Vec<FmtPiece>, Vec<TExpr>),
     /// Statements whose value is the last one's (a `case` arm, a desugaring).

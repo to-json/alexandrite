@@ -7,6 +7,7 @@
 //! records the concrete types it learned per binding site and the next pass
 //! starts from them. Only the final pass reports errors.
 
+use std::rc::Rc;
 use crate::ast::*;
 use crate::consts;
 use crate::diag::{Diag, SourceMap, Span};
@@ -653,13 +654,13 @@ impl<'a> World<'a> {
             done.insert(name.to_string(), Ty::Rec(name.to_string()));
             let prev = enter_pkg(&pkg_of(name));
             let t = match d {
-                Def::S(s) => Ty::Struct(name.to_string(), fields_of(&s.fields, by_name, done, visiting, consts)?),
+                Def::S(s) => Ty::Struct(name.to_string(), Rc::new(fields_of(&s.fields, by_name, done, visiting, consts)?)),
                 Def::E(e) => {
                     let mut vs = vec![];
                     for (v, fs, _) in &e.variants {
                         vs.push((v.clone(), fields_of(fs, by_name, done, visiting, consts)?));
                     }
-                    Ty::Enum(name.to_string(), vs)
+                    Ty::Enum(name.to_string(), Rc::new(vs))
                 }
             };
             leave_pkg(prev);
@@ -741,7 +742,7 @@ impl<'a> World<'a> {
             ("TaskError", vec![("Panicked".to_string(), vec![("message".to_string(), Ty::Str)])]),
         ];
         for (n, vs) in builtins {
-            let t = Ty::Enum(n.into(), vs);
+            let t = Ty::Enum(n.into(), Rc::new(vs));
             self.structs.insert(n.into(), t.clone());
             self.errors.push(t);
         }
@@ -1291,7 +1292,7 @@ pub fn inline_cycle(name: &str) -> Option<Vec<String>> {
     }
     fn fields(def: &Ty, target: &str, path: &mut Vec<String>, seen: &mut Vec<String>) -> bool {
         let fs: Vec<(String, Ty)> = match def {
-            Ty::Struct(_, fs) => fs.clone(),
+            Ty::Struct(_, fs) => fs.to_vec(),
             Ty::Enum(_, vs) => vs.iter().flat_map(|(v, fs)| fs.iter().map(move |(f, t)| (format!("{v}({f})"), t.clone()))).collect(),
             _ => return false,
         };
@@ -1403,8 +1404,8 @@ pub fn instantiate(n: &str, g: &GenDef, targs: Vec<Ty>, sp: Span, structs: &Stru
     let prev = enter_pkg(&pkg_of(n));
     let fields = |fs: &[(String, TypeExpr, Span)]| fs.iter().map(|(f, te, _)| Ok((f.clone(), type_from(te, &env, consts)?))).collect::<R<Vec<_>>>();
     let r = match g {
-        GenDef::S(d) => fields(&d.fields).map(|fs| Ty::Struct(name.clone(), fs)),
-        GenDef::E(d) => d.variants.iter().map(|(v, fs, _)| Ok((v.clone(), fields(fs)?))).collect::<R<Vec<_>>>().map(|vs| Ty::Enum(name.clone(), vs)),
+        GenDef::S(d) => fields(&d.fields).map(|fs| Ty::Struct(name.clone(), Rc::new(fs))),
+        GenDef::E(d) => d.variants.iter().map(|(v, fs, _)| Ok((v.clone(), fields(fs)?))).collect::<R<Vec<_>>>().map(|vs| Ty::Enum(name.clone(), Rc::new(vs))),
     };
     leave_pkg(prev);
     DEPTH.with(|d| d.set(d.get() - 1));
@@ -1672,9 +1673,9 @@ struct FnCx<'w, 'a> {
     /// Inside a `lock` block: `self.loops`' length outside it (leaving the
     /// block early would keep the lock held).
     lock_floor: Option<usize>,
-    /// The `!`-call cells of the function being checked, made empty on
-    /// entry (None inside lambdas, task and generator bodies, which become
-    /// functions of their own).
+    /// The `!`-call receiver views of the function being checked, by type
+    /// (`view_local`), made empty on entry (None inside lambdas, task and
+    /// generator bodies, which become functions of their own).
     cells: Option<Vec<(LocalId, Ty)>>,
     /// Lambda literals checked so far: (block span start, fn type, captures).
     lambdas: Vec<(u64, Ty, Vec<LocalId>)>,
@@ -1930,22 +1931,8 @@ impl<'w, 'a> FnCx<'w, 'a> {
             self.tail_want = Some(self.ret.clone());
         }
         let r = self.body_as(body, def.is_some_and(|d| d.ret.is_some()));
-        let cells = self.cells.take().unwrap_or_default();
+        self.cells = None;
         let (mut stmts, tail_ty) = r?;
-        // The cells exist from the start, in the frame (a cell made inside a
-        // loop would die with the iteration it was made in).
-        if !cells.is_empty() {
-            let mut init: Vec<TStmt> = cells
-                .into_iter()
-                .map(|(c, t)| {
-                    let sp = def.map_or(Span::default(), |d| d.span);
-                    let empty = self.mk(TK::Array(vec![]), t.clone(), sp);
-                    TStmt::Expr(self.mk(TK::Assign(c, Box::new(empty)), t, sp))
-                })
-                .collect();
-            init.append(&mut stmts);
-            stmts = init;
-        }
         if !self.is_main {
             let sp = def.map_or(Span::default(), |d| d.span);
             // The value of the last statement is the return value.
@@ -2011,7 +1998,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
         let mut read = std::collections::HashSet::new();
         fn reads(e: &TExpr, out: &mut std::collections::HashSet<LocalId>) {
             match &e.kind {
-                TK::Local(l) | TK::IndexAssign(l, ..) | TK::PlaceAssign(l, ..) => {
+                TK::Local(l) | TK::IndexAssign(l, ..) | TK::PlaceAssign(l, ..) | TK::Bang(l, ..) => {
                     out.insert(*l);
                 }
                 _ => {}
@@ -2023,11 +2010,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     }
                 }
             }
-            if let TK::M(_, _, _, Some(b)) = &e.kind {
-                for s in &b.body {
-                    crate::prove::stmt_exprs(s, &mut |x| reads(x, out));
-                }
-            }
+            // (each_child visits blocks' and Seqs' statements too.)
             crate::prove::each_child(e, &mut |x| reads(x, out));
         }
         for s in &body {
@@ -2165,6 +2148,18 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     .collect(),
                 op,
                 b(v),
+            ),
+            TK::Bang(l, steps, view, call) => TK::Bang(
+                l,
+                steps
+                    .into_iter()
+                    .map(|st| match st {
+                        TStep::Index(i) => TStep::Index(self.zonk(i)),
+                        f => f,
+                    })
+                    .collect(),
+                view,
+                b(call),
             ),
             k => k,
         };
@@ -2841,7 +2836,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 let mut mut_call = false;
                 let held = if let Ty::Result(t) = self.resolve(&inner.ty) {
                     match (&inner.kind, self.mut_errs.take()) {
-                        (TK::Seq(..), Some(es)) if !es.is_empty() => {
+                        (TK::Seq(..) | TK::Bang(..), Some(es)) if !es.is_empty() => {
                             errs.extend(es.into_iter().filter(|e| !e.is_empty()));
                             mut_call = true;
                         }
@@ -2874,7 +2869,9 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     }
                     None
                 };
-                let fallible_op = held.is_some() || is_fallible_expr(&inner, self);
+                // (A `!` call that can't fail is accepted under `~`: a generic
+                // body's `w.~write!(b)` may be instantiated with either kind.)
+                let fallible_op = held.is_some() || is_fallible_expr(&inner, self) || is_bang(&inner);
                 if !mut_call {
                     let selfl = if self.method == Some(true) { self.lookup("self") } else { None };
                     let eqi: std::collections::HashSet<LocalId> = self.locals.iter().enumerate().filter(|(_, l)| l.name.starts_with("_eqi")).map(|(k, _)| k).collect();
@@ -3276,9 +3273,9 @@ impl<'w, 'a> FnCx<'w, 'a> {
             Ty::Enum(_, vs) => {
                 // The first variant, with zero fields.
                 let mut slots = vec![];
-                for (_, fs) in vs.clone() {
+                for (_, fs) in vs.clone().iter() {
                     for (_, ft) in fs {
-                        slots.push(self.zero_of(&ft, sp)?);
+                        slots.push(self.zero_of(ft, sp)?);
                     }
                 }
                 TK::M(M::VariantNew(0), None, slots, None)
@@ -4319,15 +4316,16 @@ impl<'w, 'a> FnCx<'w, 'a> {
         }
     }
 
-    /// `recv.m!(args)`: call a mutating method on a place, through a
-    /// one-element slice, and write the receiver back.
+    /// `recv.m!(args)`: call a mutating method on a place. The method gets
+    /// a view of the place (a one-element slice referring to it), so its
+    /// writes land in the place (docs/notes/bang-calls.md).
     fn mutating_call(&mut self, recv: &Expr, def: usize, name: &str, name_span: Span, args: &[Expr], block: Option<&Block>, sp: Span) -> R<TExpr> {
         let (id, steps, pty) = self.place(recv).map_err(|d| {
             if matches!(recv.kind, ExprKind::Name(_) | ExprKind::Index(..) | ExprKind::Call { .. }) { d } else { Diag::new(recv.span, format!("`{name}` changes its receiver; call it on a variable")) }
         })?;
-        // Arguments are evaluated before the receiver is read: an argument
-        // that calls something (`p.push!(p.new_node!)`) may change the
-        // receiver, and the call must see that change.
+        // Arguments are evaluated before the call starts writing through
+        // the view: an argument that calls something (`p.push!(p.new_node!)`)
+        // may change the receiver, and the call must see that change.
         let mut pre = vec![];
         let mut vals = vec![];
         let args = &*self.fill_args(def, args, 1, block.is_some(), sp)?;
@@ -4341,15 +4339,8 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 vals.push(v);
             }
         }
-        let cur = self.place_read(id, &steps, &pty, recv.span);
-        let (tid, s1) = self.call_cell(cur, &pty, recv.span, true);
-        let s1 = if pre.is_empty() {
-            s1
-        } else {
-            pre.push(s1);
-            TStmt::Expr(self.mk(TK::Seq(pre), Ty::Unit, sp))
-        };
-        let mut targs = vec![self.mk(TK::Local(tid), Ty::arr(pty.clone()), recv.span)];
+        let view = self.view_local(&pty);
+        let mut targs = vec![self.mk(TK::Local(view), Ty::arr(pty.clone()), recv.span)];
         targs.extend(vals);
         // A block for a last parameter of function type (`r.shuffle!(n) { |i, j| }`).
         if let Some(b) = block {
@@ -4360,8 +4351,9 @@ impl<'w, 'a> FnCx<'w, 'a> {
             let f = self.block_as_lambda(def, &targs, b)?;
             targs.push(f);
         }
-        // The receiver is written back after the call, so a fallible call
-        // is held (a `~T`) here; an enclosing `~` propagates it after.
+        // A fallible call is held (a `~T`) here, as it always was (the
+        // receiver used to be written back after it); an enclosing `~`
+        // propagates it after.
         let saved = std::mem::replace(&mut self.under_try, false);
         let call = self.call_def(def, name, name_span, targs, sp);
         self.under_try = saved;
@@ -4376,87 +4368,66 @@ impl<'w, 'a> FnCx<'w, 'a> {
             };
         }
         let rty = call.ty.clone();
-        if matches!(self.resolve(&rty), Ty::Unit) {
-            let tl = self.mk(TK::Local(tid), Ty::arr(pty.clone()), sp);
-            let z = self.mk(TK::Int(0), Ty::Int, sp);
-            let back = self.mk(TK::Index(Box::new(tl), Box::new(z)), pty.clone(), sp);
-            let wb = if steps.is_empty() { self.mk(TK::Assign(id, Box::new(back)), pty, sp) } else { self.mk(TK::PlaceAssign(id, steps, None, Box::new(back)), pty, sp) };
-            let u = self.mk(TK::Unit, Ty::Unit, sp);
-            return Ok(self.mk(TK::Seq(vec![s1, TStmt::Expr(call), TStmt::Expr(wb), TStmt::Expr(u)]), Ty::Unit, sp));
+        let bang = self.mk(TK::Bang(id, steps, view, Box::new(call)), rty.clone(), sp);
+        if pre.is_empty() {
+            return Ok(bang);
         }
-        let (rid, s2) = self.opt_tmp(call, sp);
-        let tl = self.mk(TK::Local(tid), Ty::arr(pty.clone()), sp);
-        let z = self.mk(TK::Int(0), Ty::Int, sp);
-        let back = self.mk(TK::Index(Box::new(tl), Box::new(z)), pty.clone(), sp);
-        let wb = if steps.is_empty() { self.mk(TK::Assign(id, Box::new(back)), pty, sp) } else { self.mk(TK::PlaceAssign(id, steps, None, Box::new(back)), pty, sp) };
-        let r = self.mk(TK::Local(rid), rty.clone(), sp);
-        Ok(self.mk(TK::Seq(vec![s1, s2, TStmt::Expr(wb), TStmt::Expr(r)]), rty, sp))
+        pre.push(TStmt::Expr(bang));
+        Ok(self.mk(TK::Seq(pre), rty, sp))
     }
 
-    /// The one-element slice a `!` call gets its receiver in: one per call
-    /// site, made on first use and reused after (a loop allocates it once).
-    ///
-    /// `share`: the call's arguments are evaluated before the cell is filled
-    /// (`mutating_call`), so no other `!` call on the same type can run while
-    /// the cell is in use, and call sites with the same receiver type share
-    /// one cell. That keeps frames small in recursive methods with many `!`
-    /// calls (std/regexp/syntax's printer and compiler).
-    fn call_cell(&mut self, cur: TExpr, pty: &Ty, sp: Span, share: bool) -> (LocalId, TStmt) {
-        let n = self.locals.len();
+    /// The local a `!` call's view of its receiver is held in (`TK::Bang`):
+    /// one per receiver type in a function, since a view is only used by
+    /// the call it's made for (arguments that call something are evaluated
+    /// before it's made). Shared views keep frames small in recursive
+    /// methods with many `!` calls (std/regexp/syntax's printer and compiler).
+    fn view_local(&mut self, pty: &Ty) -> LocalId {
         let at = Ty::arr(pty.clone());
-        if self.cells.is_none() {
-            // A lambda or task body: a fresh cell per call.
-            let arr = self.mk(TK::Array(vec![cur]), at, sp);
-            return self.opt_tmp(arr, sp);
+        if let Some(c) = self.cells.as_ref().and_then(|cs| cs.iter().find(|(_, t)| *t == at).map(|(c, _)| *c)) {
+            return c;
         }
-        let shared = if share { self.cells.as_ref().unwrap().iter().find(|(_, t)| *t == at).map(|(c, _)| *c) } else { None };
-        let cell = match shared {
-            Some(c) => c,
-            None => self.declare(&format!("__cell{n}"), at.clone()),
-        };
-        let l = |ck: &mut Self| ck.mk(TK::Local(cell), at.clone(), sp);
-        let size = { let c = l(self); self.mk(TK::M(M::Size, Some(Box::new(c)), vec![], None), Ty::Int, sp) };
-        let zero = self.mk(TK::Int(0), Ty::Int, sp);
-        let fresh = self.mk(TK::Bin(BinOp::Eq, Box::new(size), Box::new(zero)), Ty::Bool, sp);
-        if shared.is_none() {
-            self.cells.as_mut().unwrap().push((cell, at.clone()));
+        let n = self.locals.len();
+        let v = self.declare(&format!("__view{n}"), at.clone());
+        self.locals[v].mutated = true;
+        if let Some(cs) = self.cells.as_mut() {
+            cs.push((v, at));
         }
-        self.locals[cell].mutated = true;
-        self.locals[cell].pushed = true;
-        let c = l(self);
-        let make = self.mk(TK::M(M::Push, Some(Box::new(c)), vec![cur.clone()], None), Ty::Unit, sp);
-        let z = self.mk(TK::Int(0), Ty::Int, sp);
-        let reuse = self.mk(TK::IndexAssign(cell, Box::new(z), Box::new(cur)), pty.clone(), sp);
-        (cell, TStmt::If(fresh, vec![TStmt::Expr(make)], vec![TStmt::Expr(reuse)]))
+        v
     }
 
     /// `w.m!(args)` where `w` is an interface value in a place: dispatch on
-    /// a one-element slice holding the value, then write it back.
+    /// a view of the place; each implementor's method gets a view of the
+    /// value inside it (lower.rs).
     fn mutating_iface_call(&mut self, recv: &Expr, iname: &str, k: usize, m: &IfaceMethod, args: &[Expr], sp: Span) -> R<TExpr> {
         let (id, steps, pty) = self.place(recv)?;
-        let cur = self.place_read(id, &steps, &pty, recv.span);
-        let (tid, s1) = self.call_cell(cur, &pty, recv.span, false);
         if args.len() != m.params.len() {
             return Err(Diag::new(sp, format!("`{iname}.{}` takes {} argument(s), got {}", m.name, m.params.len(), args.len())));
         }
+        let mut pre = vec![];
         let mut targs = vec![];
         for (a, pt) in args.iter().zip(&m.params) {
             let v = self.value(a)?;
             let v = self.coerce(v, pt)?;
             self.expect(&v.ty, pt, v.span, "argument")?;
-            targs.push(v);
+            if has_call(&v) {
+                let (aid, st) = self.opt_tmp(v.clone(), v.span);
+                pre.push(st);
+                targs.push(self.mk(TK::Local(aid), v.ty.clone(), v.span));
+            } else {
+                targs.push(v);
+            }
         }
         self.impure = true;
-        let tl = self.mk(TK::Local(tid), Ty::arr(pty.clone()), sp);
+        let view = self.view_local(&pty);
+        let tl = self.mk(TK::Local(view), Ty::arr(pty.clone()), sp);
         let call = self.mk(TK::M(M::IfaceCall(k), Some(Box::new(tl)), targs, None), m.ret.clone(), sp);
         let rty = call.ty.clone();
-        let (rid, s2) = self.opt_tmp(call, sp);
-        let tl = self.mk(TK::Local(tid), Ty::arr(pty.clone()), sp);
-        let z = self.mk(TK::Int(0), Ty::Int, sp);
-        let back = self.mk(TK::Index(Box::new(tl), Box::new(z)), pty.clone(), sp);
-        let wb = if steps.is_empty() { self.mk(TK::Assign(id, Box::new(back)), pty, sp) } else { self.mk(TK::PlaceAssign(id, steps, None, Box::new(back)), pty, sp) };
-        let r = self.mk(TK::Local(rid), rty.clone(), sp);
-        Ok(self.mk(TK::Seq(vec![s1, s2, TStmt::Expr(wb), TStmt::Expr(r)]), rty, sp))
+        let bang = self.mk(TK::Bang(id, steps, view, Box::new(call)), rty.clone(), sp);
+        if pre.is_empty() {
+            return Ok(bang);
+        }
+        pre.push(TStmt::Expr(bang));
+        Ok(self.mk(TK::Seq(pre), rty, sp))
     }
 
     /// The type of a local or a field path, without checking anything.
@@ -4662,7 +4633,12 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 s
             }
             TK::Call(f, _) => self.w.declared_errs.get(f).cloned(),
-            // A `!` call: `Seq[.., tmp = call, .., tmp]`.
+            // A `!` call (its arguments may be evaluated ahead of it).
+            TK::Bang(.., call) => self.held_set(call),
+            TK::Seq(ss) if matches!(ss.last(), Some(TStmt::Expr(x)) if matches!(x.kind, TK::Bang(..))) => {
+                let Some(TStmt::Expr(x)) = ss.last() else { unreachable!() };
+                self.held_set(x)
+            }
             TK::Seq(ss) => {
                 let Some(TStmt::Expr(TExpr { kind: TK::Local(r), .. })) = ss.last() else { return None };
                 ss.iter().find_map(|s| match s {
@@ -4902,7 +4878,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             }
             Ty::Struct(_, fields) => {
                 let mut vals = vec![];
-                for (f, ft) in fields.clone() {
+                for (f, ft) in fields.clone().iter().cloned() {
                     let v = match f.as_str() {
                         "names" => {
                             let items = files.iter().map(|(n, _)| self.mk(TK::Str(n.clone()), Ty::Str, sp)).collect();
@@ -4931,7 +4907,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             (CVal::Enum(_, k), Some(et @ Ty::Enum(..))) => {
                 let Ty::Enum(_, vs) = &et else { unreachable!() };
                 let mut slots = vec![];
-                for (_, fs) in vs {
+                for (_, fs) in vs.iter() {
                     for (_, ft) in fs {
                         slots.push(self.zero_of(ft, sp).ok_or_else(|| Diag::new(sp, format!("{} has no zero value", ft.show())))?);
                     }
@@ -5617,7 +5593,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             let tn = st.as_ref().and_then(|t| t.type_name()).map(str::to_string);
             if let Some(sn) = &tn {
                 let fs: Vec<(String, Ty)> = match &st {
-                    Some(Ty::Struct(_, fs)) => fs.clone(),
+                    Some(Ty::Struct(_, fs)) => fs.to_vec(),
                     _ => vec![],
                 };
                 let is_field = args.is_empty() && block.is_none() && fs.iter().any(|(f, _)| f == name);
@@ -6133,7 +6109,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 return Err(Diag::new(sp, format!("`{c}.new` takes {} arguments ({}), got {}", fields.len(), fields.iter().map(|(f, _)| f.as_str()).collect::<Vec<_>>().join(", "), args.len())));
             }
             let mut vals = vec![];
-            for (a, (f, ft)) in args.iter().zip(fields) {
+            for (a, (f, ft)) in args.iter().zip(fields.iter()) {
                 let v = self.value(a)?;
                 let v = self.coerce(v, ft)?;
                 if !self.unify(&v.ty, ft) {
@@ -7340,9 +7316,18 @@ fn is_fallible_expr(e: &TExpr, cx: &FnCx) -> bool {
     }
 }
 
+/// A `!` call (`TK::Bang`), after any arguments evaluated ahead of it.
+fn is_bang(e: &TExpr) -> bool {
+    match &e.kind {
+        TK::Bang(..) => true,
+        TK::Seq(ss) => matches!(ss.last(), Some(TStmt::Expr(x)) if matches!(x.kind, TK::Bang(..))),
+        _ => false,
+    }
+}
+
 /// Whether evaluating `e` calls a function (and so may change state).
 fn has_call(e: &TExpr) -> bool {
-    if matches!(e.kind, TK::Call(..) | TK::Seq(..)) {
+    if matches!(e.kind, TK::Call(..) | TK::Seq(..) | TK::Bang(..)) {
         return true;
     }
     let mut found = false;

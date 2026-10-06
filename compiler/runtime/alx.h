@@ -157,6 +157,9 @@ static inline AlxRegion *alx_region_of(const void *p) {
     if (g && g == alx_tls.last_g) return alx_tls.last_r;  /* (granule 0 is never a region's) */
     return alx_region_of_slow(p);
 }
+/* The region of an array that may be a `!` call's receiver view (lir.rs
+ * LS::View): a view carries its region as a negative cap. */
+#define ALX_VIEW_REGION(a) ({ __typeof__(a) v_ = (a); v_.cap < 0 ? (AlxRegion *)(intptr_t)-v_.cap : alx_region_of(v_.ptr); })
 /* Stats (all threads): bytes held in chunks/large blocks, live regions + free lists. */
 size_t alx_mem_held(void);
 size_t alx_mem_peak(void);

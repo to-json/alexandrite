@@ -342,6 +342,7 @@ pub fn browser_rt(x: &FfiSig) -> Option<&'static str> {
 pub fn emit(p: &LProgram) -> Result<Vec<u8>, String> {
     alx::lir::set_recs(&p.recs);
     let mut owned = p.clone();
+    alx::lir::copy_views(&mut owned);
     let info = suspend::prepare(&mut owned)?;
     let p = &owned;
     rt::sh().consts.clear();
@@ -1246,6 +1247,7 @@ impl<'c, 'p> Fx<'c, 'p> {
                 self.store(&t, base, 0, &vals);
             }
             LS::RegionFree(_) => {}
+            LS::View { .. } | LS::Unview { .. } => unreachable!("copy_views ran first"),
             LS::RegionEnter { .. } | LS::RegionExit { .. } | LS::RegionUse { .. } | LS::RegionRestore(_) => {}
             LS::Spawn { dst, worker, env } => {
                 let p = self.boxed(env);
@@ -1742,7 +1744,7 @@ impl<'c, 'p> Fx<'c, 'p> {
         match e {
             LE::RegionNew(_) => self.i64c(0),
             LE::RegionBytes(_) => self.i64c(0),
-            LE::RegionOf(_) => self.i64c(0),
+            LE::RegionOf(_) | LE::ViewRegion(_) => self.i64c(0),
             // The browser never frees: regions are no-ops (handle 0).
             LE::RegionProgram => self.i64c(0),
             LE::Ffi(i, args) => {
@@ -2408,7 +2410,7 @@ pub(crate) fn ty_of(tys: &Tys, vars: &[LVar], e: &LE) -> LTy {
         LE::AtomicCas(..) => LTy::Bool,
         LE::RegionNew(_) => LTy::Region,
         LE::RegionBytes(_) => LTy::I64,
-        LE::RegionOf(_) => LTy::Region,
+        LE::RegionOf(_) | LE::ViewRegion(_) => LTy::Region,
         LE::RegionProgram => LTy::Region,
         LE::ChanNew(t, _) => LTy::Chan(Box::new(t.clone())),
         LE::ChanLen(_) => LTy::I64,
@@ -2472,6 +2474,7 @@ pub(crate) fn ty_of(tys: &Tys, vars: &[LVar], e: &LE) -> LTy {
 
 /// Byte offset of field `k` of a tuple type (C layout).
 fn field_offset(t: &LTy, k: usize) -> u32 {
+    let t = &t.unrec();
     let t = &t.unrec();
     let LTy::Tup(ts) = t else { panic!("wasmgen: field of {t:?}") };
     let mut off = 0u32;

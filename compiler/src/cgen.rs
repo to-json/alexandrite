@@ -1,7 +1,7 @@
 //! LIR → C (the primary backend).
 
 use crate::lir::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
 /// The C name of a type. Names spell the layout (`Tup2_I64_Str`); a long
@@ -289,6 +289,196 @@ struct FnEmit<'f> {
     yields: usize,
     out: String,
     ind: usize,
+    /// The locals declared at the start of an inner block (by the block's
+    /// address), not at the top of the function: see `homes`.
+    homes: HashMap<usize, Vec<V>>,
+}
+
+/// The variables an LIR statement reads or writes itself (not in the
+/// blocks nested in it). Expressions are scanned through their Debug form
+/// (`Var(n)`): a false hit only widens a scope.
+fn own_vars(s: &LS, out: &mut Vec<V>) {
+    fn le(e: &LE, out: &mut Vec<V>) {
+        let t = format!("{e:?}");
+        for (i, _) in t.match_indices("Var(") {
+            let n: String = t[i + 4..].chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(v) = n.parse() {
+                out.push(v);
+            }
+        }
+    }
+    fn steps(ss: &[Step], out: &mut Vec<V>) {
+        for s in ss {
+            if let Step::Index(i, _) = s {
+                le(i, out);
+            }
+        }
+    }
+    match s {
+        LS::Set(v, e) | LS::Push(v, e) => {
+            out.push(*v);
+            le(e, out);
+        }
+        LS::SetIndex { arr, idx, val, .. } => {
+            out.push(*arr);
+            le(idx, out);
+            le(val, out);
+        }
+        LS::SetPlace { var, steps: st, val } => {
+            out.push(*var);
+            steps(st, out);
+            le(val, out);
+        }
+        LS::View { dst, var, steps: st, region, .. } => {
+            out.extend([*dst, *var]);
+            steps(st, out);
+            le(region, out);
+        }
+        LS::Unview { dst, var, steps: st } => {
+            out.extend([*dst, *var]);
+            steps(st, out);
+        }
+        LS::Eval(e) | LS::Yield(e) | LS::Print(e) | LS::PanicStr(e) | LS::Exit(e) | LS::RegionFree(e) | LS::Lock(e, _) | LS::Unlock(e) | LS::LockClearPoison(e) | LS::Die(e) | LS::SetGlobal(_, e) | LS::Puts(e, _) | LS::If(e, ..) => le(e, out),
+        LS::Return(e) => e.iter().for_each(|e| le(e, out)),
+        LS::Loop(..) | LS::Break(_) | LS::Continue(_) | LS::Panic(..) => {}
+        LS::NextOrBreak { source, dst, .. } => {
+            out.push(*dst);
+            le(source, out);
+        }
+        LS::Pmap { dst, arr, err, .. } => {
+            out.push(*dst);
+            out.extend(err.iter().copied());
+            le(arr, out);
+        }
+        LS::RegionEnter { region, saved } | LS::RegionExit { region, saved } => out.extend([*region, *saved]),
+        LS::RegionUse { region, saved } => {
+            out.push(*saved);
+            le(region, out);
+        }
+        LS::RegionRestore(v) | LS::SortInPlace(v, _) => out.push(*v),
+        LS::Spawn { dst, env, .. } => {
+            out.push(*dst);
+            le(env, out);
+        }
+        LS::Wait { task, ok, val, msg } => {
+            out.extend([*ok, *val, *msg]);
+            le(task, out);
+        }
+        LS::ChanSend { ch, val, .. } | LS::AtomicStore(ch, val) => {
+            le(ch, out);
+            le(val, out);
+        }
+        LS::ChanRecv { ch, ok, val } => {
+            out.extend([*ok, *val]);
+            le(ch, out);
+        }
+        LS::ChanClose { ch, .. } => le(ch, out),
+        LS::Select { cases, dst, .. } => {
+            out.push(*dst);
+            for c in cases {
+                match c {
+                    SelCase::Send { ch, val } => {
+                        le(ch, out);
+                        le(val, out);
+                    }
+                    SelCase::Recv { ch, ok, val } => {
+                        out.extend([*ok, *val]);
+                        le(ch, out);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Does this statement (at the top of a block) set `v` without reading it?
+fn kills(s: &LS, v: V) -> bool {
+    let reads = |f: &dyn Fn(&mut Vec<V>)| {
+        let mut o = vec![];
+        f(&mut o);
+        o.contains(&v)
+    };
+    match s {
+        LS::Set(x, e) => *x == v && !reads(&|o| own_vars(&LS::Eval(e.clone()), o)),
+        LS::View { dst, var, steps, region, .. } => *dst == v && *var != v && !reads(&|o| own_vars(&LS::Unview { dst: usize::MAX, var: usize::MAX, steps: steps.clone() }, o)) && !reads(&|o| own_vars(&LS::Eval(region.clone()), o)),
+        LS::RegionEnter { region, saved } => *region == v || *saved == v,
+        LS::RegionUse { region, saved } => *saved == v && !reads(&|o| own_vars(&LS::Eval(region.clone()), o)),
+        _ => false,
+    }
+}
+
+/// Where each local is declared (C backend; frame size, port-issues #81):
+/// at the start of the innermost block (an `if` arm, a loop body) that
+/// holds all its uses and whose first statement using it sets it whole,
+/// so it starts fresh there. Locals of blocks that don't overlap can then
+/// share stack (clang's stack coloring works on block-scoped locals; a
+/// function-scope one is live, and holds its slot, for the whole call).
+/// The rest stay at the top of the function.
+fn homes(f: &LFunc) -> HashMap<usize, Vec<V>> {
+    // Each block's address and the blocks around it (outermost first).
+    type Path = Vec<usize>;
+    fn walk<'a>(ss: &'a Vec<LS>, path: &mut Path, at: &mut HashMap<V, Path>, blocks: &mut HashMap<usize, &'a Vec<LS>>) {
+        let me = ss as *const Vec<LS> as usize;
+        blocks.insert(me, ss);
+        path.push(me);
+        for s in ss {
+            let mut vs = vec![];
+            own_vars(s, &mut vs);
+            for v in vs {
+                match at.get_mut(&v) {
+                    // The common prefix of the paths of all its uses.
+                    Some(p) => {
+                        let k = p.iter().zip(path.iter()).take_while(|(a, b)| a == b).count();
+                        p.truncate(k);
+                    }
+                    None => {
+                        at.insert(v, path.clone());
+                    }
+                }
+            }
+            match s {
+                LS::If(_, a, b) => {
+                    walk(a, path, at, blocks);
+                    walk(b, path, at, blocks);
+                }
+                LS::Loop(_, b) => walk(b, path, at, blocks),
+                _ => {}
+            }
+        }
+        path.pop();
+    }
+    fn uses(s: &LS, v: V) -> bool {
+        let mut vs = vec![];
+        own_vars(s, &mut vs);
+        if vs.contains(&v) {
+            return true;
+        }
+        match s {
+            LS::If(_, a, b) => a.iter().chain(b).any(|s| uses(s, v)),
+            LS::Loop(_, b) => b.iter().any(|s| uses(s, v)),
+            _ => false,
+        }
+    }
+    let mut at = HashMap::new();
+    let mut blocks = HashMap::new();
+    walk(&f.body, &mut vec![], &mut at, &mut blocks);
+    let mut out: HashMap<usize, Vec<V>> = HashMap::new();
+    let mut vs: Vec<(&V, &Path)> = at.iter().collect();
+    vs.sort();
+    for (v, path) in vs {
+        if f.params.contains(v) {
+            continue;
+        }
+        // From the innermost block out (the function's own block stays the top).
+        for &b in path.iter().skip(1).rev() {
+            let first = blocks[&b].iter().find(|s| uses(s, *v));
+            if first.is_some_and(|s| kills(s, *v)) {
+                out.entry(b).or_default().push(*v);
+                break;
+            }
+        }
+    }
+    out
 }
 
 impl Gen<'_> {
@@ -374,9 +564,14 @@ impl Gen<'_> {
         } else {
             Ctx::Plain
         };
-        let mut e = FnEmit { p: self.p, f, ctx, yields: 0, out: String::new(), ind: 1 };
+        let homes = homes(f);
+        let mut e = FnEmit { p: self.p, f, ctx, yields: 0, out: String::new(), ind: 1, homes: homes.clone() };
         let _ = writeln!(self.out, "{} {{", proto_named(f, true));
+        let inner: HashSet<V> = homes.values().flatten().copied().collect();
         for (i, v) in f.vars.iter().enumerate() {
+            if inner.contains(&i) {
+                continue;
+            }
             if !f.params.contains(&i) {
                 let _ = writeln!(e.out, "    {} {} = {};", cty(&v.ty), vname(f, i), zero(&v.ty));
             } else if aggregate(&v.ty) {
@@ -398,9 +593,14 @@ impl Gen<'_> {
 
     fn worker(&mut self, w: &LWorker) {
         let f = &w.func;
-        let mut e = FnEmit { p: self.p, f, ctx: Ctx::Worker, yields: 0, out: String::new(), ind: 1 };
+        let homes = homes(f);
+        let mut e = FnEmit { p: self.p, f, ctx: Ctx::Worker, yields: 0, out: String::new(), ind: 1, homes: homes.clone() };
         let _ = writeln!(self.out, "static void worker{}(const void *in_, void *out_) {{", w.id);
+        let inner: HashSet<V> = homes.values().flatten().copied().collect();
         for (i, v) in f.vars.iter().enumerate() {
+            if inner.contains(&i) {
+                continue;
+            }
             if f.params.contains(&i) {
                 let _ = writeln!(e.out, "    {} {} = *(const {} *)in_;", cty(&v.ty), vname(f, i), cty_mem(&v.ty));
             } else {
@@ -420,7 +620,7 @@ impl Gen<'_> {
             let _ = writeln!(self.out, "    {} {};", cty(&v.ty), vname(f, i));
         }
         let _ = writeln!(self.out, "}} Gen{id};\n");
-        let mut e = FnEmit { p: self.p, f, ctx: Ctx::Gen, yields: 0, out: String::new(), ind: 1 };
+        let mut e = FnEmit { p: self.p, f, ctx: Ctx::Gen, yields: 0, out: String::new(), ind: 1, homes: HashMap::new() };
         e.block(&f.body);
         let n = e.yields;
         let elem = cty(&gn.elem);
@@ -488,7 +688,32 @@ impl FnEmit<'_> {
         }
     }
 
-    fn block(&mut self, ss: &[LS]) {
+    /// `at = x` for a tuple literal `x`, one (non-zero) field at a time,
+    /// into zeroed memory.
+    fn fields_into(&self, at: &str, x: &LE, s: &mut String) {
+        let LE::Tup(_, vs) = x else { unreachable!() };
+        for (k, v) in vs.iter().enumerate() {
+            if c_zero(v) {
+                continue;
+            }
+            let f = format!("{at}.f{k}");
+            if matches!(v, LE::Tup(..)) {
+                self.fields_into(&f, v, s);
+            } else {
+                let x = self.e(v);
+                let _ = write!(s, "{f} = {x}; ");
+            }
+        }
+    }
+
+    fn block(&mut self, ss: &Vec<LS>) {
+        if let Some(vs) = self.homes.get(&(ss as *const Vec<LS> as usize)).cloned() {
+            for v in vs {
+                let t = cty(&self.f.vars[v].ty);
+                let n = self.v(v);
+                self.line(&format!("{t} {n};"));
+            }
+        }
         for s in ss {
             self.stmt(s);
         }
@@ -623,6 +848,22 @@ impl FnEmit<'_> {
                 let x = self.e(val);
                 self.line(&format!("{lv} = {x};"));
             }
+            LS::View { dst, var, steps, region, .. } => {
+                let mut lv = self.v(*var);
+                for st in steps {
+                    lv = match st {
+                        Step::Index(i, Some(loc)) => format!("ALX_IDX_SET({lv}, {}, {})", self.e(i), c_str(loc)),
+                        Step::Index(i, None) => format!("({lv}).ptr[{}]", self.e(i)),
+                        Step::Field(k) => format!("({lv}).f{k}"),
+                    };
+                }
+                let r = self.e(region);
+                let ty = cty(&self.f.vars[*dst].ty);
+                let d = self.v(*dst);
+                self.line(&format!("{d} = ({ty}){{ .ptr = &{lv}, .len = 1, .cap = -(int64_t)(intptr_t)({r}) }};"));
+            }
+            // The callee wrote through the view.
+            LS::Unview { .. } => {}
             LS::Push(v, e) => {
                 let ty = ty_name(&self.f.vars[*v].ty);
                 let x = self.e(e);
@@ -780,6 +1021,7 @@ impl FnEmit<'_> {
             LE::RegionNew(p) => format!("alx_region_new_child({})", self.e(p)),
             LE::RegionBytes(r) => format!("alx_region_bytes({})", self.e(r)),
             LE::RegionOf(x) => format!("alx_region_of(({}).ptr)", self.e(x)),
+            LE::ViewRegion(x) => format!("ALX_VIEW_REGION({})", self.e(x)),
             LE::RegionProgram => "alx_region_program()".into(),
             LE::ChanNew(t, cap) => format!("alx_chan_new({}, sizeof({}))", self.e(cap), cty_mem(t)),
             LE::ChanLen(c) => format!("alx_chan_len({})", self.e(c)),
@@ -1049,6 +1291,26 @@ impl FnEmit<'_> {
                 let n = ty_name(&LTy::Arr(Box::new(t.clone())));
                 if vs.is_empty() {
                     format!("{n}_cap(0)")
+                } else if vs.len() == 1 || matches!(t, LTy::Tup(_) | LTy::Rec(_)) {
+                    // Elements written straight into the new array: a
+                    // literal array (`{n}_lit`) is a stack temporary that
+                    // clang keeps for the whole call, and an Error's body
+                    // is over a kilobyte (each `fail` site made one).
+                    let mut s = format!("({{ {n} a_ = {n}_cap({}); ", vs.len());
+                    for (i, x) in vs.iter().enumerate() {
+                        let at = format!("a_.ptr[{i}]");
+                        if matches!(x, LE::Tup(..)) {
+                            // Field by field: a struct literal is a
+                            // temporary of its own too.
+                            let _ = write!(s, "memset(&{at}, 0, sizeof {at}); ");
+                            self.fields_into(&at, x, &mut s);
+                        } else {
+                            let x = self.e(x);
+                            let _ = write!(s, "{at} = {x}; ");
+                        }
+                    }
+                    let _ = write!(s, "a_.len = {}; a_; }})", vs.len());
+                    s
                 } else {
                     format!("{n}_lit({}, ({}[]){{{}}})", vs.len(), cty_mem(t), vs.iter().map(|x| self.e(x)).collect::<Vec<_>>().join(", "))
                 }

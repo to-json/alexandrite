@@ -1184,6 +1184,7 @@ impl<'a> Lw<'a> {
                 let v = self.var_of(l);
                 let region = match self.owner_region(l) {
                     Some(reg) => reg,
+                    None if matches!(self.lty(&self.f.locals[l].ty), LTy::Arr(_)) => LE::ViewRegion(Box::new(LE::Var(v))),
                     None => LE::RegionOf(Box::new(LE::Var(v))),
                 };
                 self.emit(LS::Set(r, region));
@@ -1261,10 +1262,19 @@ impl<'a> Lw<'a> {
         // (stored into a captured variable that outlives the call, say) must
         // go there: the region current when the lambda runs may be the
         // frame of whoever called it, freed when that returns.
+        if !crate::regions::allocates(e, self.promote()) {
+            return None;
+        }
+        self.placed(e as *const TExpr as usize)
+    }
+
+    /// Where allocation site `key` (by address) is placed, when that isn't
+    /// the current region (and its placement class).
+    fn placed(&mut self, key: usize) -> Option<(LE, crate::regions::Place)> {
         if let (Some(pl), None) = (self.lambda_place, self.frame) {
             use crate::regions::Place;
-            if crate::regions::allocates(e, self.promote()) {
-                let class = pl.sites.get(&(e as *const TExpr as usize)).copied().unwrap_or(Place::Global);
+            {
+                let class = pl.sites.get(&key).copied().unwrap_or(Place::Global);
                 if matches!(class, Place::Global | Place::Into(_)) && self.ambient != Place::Global {
                     return Some((LE::RegionProgram, Place::Global));
                 }
@@ -1272,9 +1282,9 @@ impl<'a> Lw<'a> {
             return None;
         }
         if let (Some(pl), Some((frame, dest))) = (self.place, self.frame) {
-            if crate::regions::allocates(e, self.promote()) {
+            {
                 use crate::regions::Place;
-                let mut class = pl.sites.get(&(e as *const TExpr as usize)).copied().unwrap_or(Place::Global);
+                let mut class = pl.sites.get(&key).copied().unwrap_or(Place::Global);
                 // A loop not open here (can't happen, but never guess): the frame.
                 if let Place::Iter(k) = class {
                     if !self.iter_open.iter().any(|(_, r, _)| Some(r) == self.iter_vars.get(&k).map(|x| &x.0)) {
@@ -1289,8 +1299,13 @@ impl<'a> Lw<'a> {
                         Place::Into(p) => match self.into.last().copied() {
                             Some(r) => LE::Var(r),
                             None if self.place.is_some_and(|pl| pl.owner_alias.contains_key(&p)) => self.owner_region(p).unwrap(),
-                            // Where the parameter's own storage lives.
-                            None if matches!(self.lty(&self.f.locals[p].ty), LTy::Arr(_) | LTy::Str) => {
+                            // Where the parameter's own storage lives (a
+                            // `!` method's receiver: the view's region).
+                            None if matches!(self.lty(&self.f.locals[p].ty), LTy::Arr(_)) => {
+                                let v = self.var_of(p);
+                                LE::ViewRegion(Box::new(LE::Var(v)))
+                            }
+                            None if matches!(self.lty(&self.f.locals[p].ty), LTy::Str) => {
                                 let v = self.var_of(p);
                                 LE::RegionOf(Box::new(LE::Var(v)))
                             }
@@ -1317,6 +1332,7 @@ impl<'a> Lw<'a> {
             TK::Const(_) => unreachable!("constants are typed by the checker"),
             TK::Float(v) => LE::F(*v),
             TK::PlaceAssign(l, steps, op, v) => self.place_assign(*l, steps, *op, v, e),
+            TK::Bang(l, steps, view, call) => self.bang(*l, steps, *view, call, e),
             TK::Format(pieces, args) => self.format(pieces, args),
             TK::Seq(ss) => self.scoped_value(ss, &e.ty),
             TK::Zero => zero_le(&self.lty(&e.ty)),
@@ -2815,6 +2831,124 @@ impl<'a> Lw<'a> {
         val
     }
 
+    /// `place.m!(args)` (`TK::Bang`): `view` refers to the place for the
+    /// call (docs/notes/bang-calls.md). A copy instead (made in the region
+    /// the view would carry, written back after) where the callee might
+    /// keep its receiver past the call, and for a bare narrow-integer local
+    /// (its C variable is wider than the element a view points at).
+    fn bang(&mut self, l: LocalId, steps: &[TStep], view: LocalId, call: &TExpr, e: &TExpr) -> LE {
+        let var = self.var_of(l);
+        let mut lsteps = vec![];
+        for (k, st) in steps.iter().enumerate() {
+            match st {
+                TStep::Index(i) => {
+                    let check = if k == 0 {
+                        let arr_t = TExpr { kind: TK::Local(l), ty: self.f.locals[l].ty.clone(), span: e.span };
+                        self.index_check(&arr_t, i)
+                    } else {
+                        Some(self.loc(i.span))
+                    };
+                    let iv = self.expr(i);
+                    let iv = self.int_in_t(iv, &i.ty, i.span);
+                    let iv = self.bind(iv, LTy::I64);
+                    lsteps.push(Step::Index(iv, check));
+                }
+                TStep::Field(f) => lsteps.push(Step::Field(*f)),
+            }
+        }
+        if self.try_mode {
+            // Each index checked against the place it indexes, in order.
+            let mut cur = LE::Var(var);
+            for (st, ts) in lsteps.iter_mut().zip(steps) {
+                cur = match st {
+                    Step::Index(i, check) => {
+                        let TStep::Index(ie) = ts else { unreachable!() };
+                        self.guard(Self::out_of_bounds(&cur, i), "index out of bounds", ie.span, "IndexError", 0);
+                        *check = None;
+                        LE::Index { arr: Box::new(cur), idx: Box::new(i.clone()), check: None }
+                    }
+                    Step::Field(f) => LE::Field(Box::new(cur), *f),
+                };
+            }
+        }
+        let vv = self.var_of(view);
+        let LTy::Arr(et) = self.lty(&self.f.locals[view].ty) else { unreachable!("a view is an Arr") };
+        let et = *et;
+        // The region what the callee stores into the place must live in:
+        // the region of the array holding it (the innermost index), else
+        // (a local's own variables) where the analysis placed this site.
+        let last = lsteps.iter().rposition(|s| matches!(s, Step::Index(..)));
+        let region = match last {
+            Some(j) => LE::ViewRegion(Box::new(crate::lir::place_le(var, &lsteps[..j]))),
+            None => match self.placed(e as *const TExpr as usize) {
+                Some((r, _)) => r,
+                // The current region: by its variable where there is one
+                // (a JIT call per `!` call otherwise).
+                None => {
+                    use crate::regions::Place;
+                    match (self.ambient, self.frame) {
+                        (Place::Frame, Some((frame, _))) if self.lambda_place.is_none() => LE::Var(frame),
+                        (Place::Iter(k), Some(_)) if self.iter_vars.contains_key(&k) => LE::Var(self.iter_vars[&k].0),
+                        _ => LE::Rt(Rt::RegionCur, vec![]),
+                    }
+                }
+            },
+        };
+        let narrow = last.is_none() && matches!(et, LTy::IntK(_));
+        let escapes = self.bang_callees(call).into_iter().any(|f| self_escapes(&self.p.funcs[f]));
+        let unchecked: Vec<Step> = lsteps.iter().map(|s| match s {
+            Step::Index(i, _) => Step::Index(i.clone(), None),
+            Step::Field(f) => Step::Field(*f),
+        }).collect();
+        if escapes || narrow {
+            let r = self.bind(region, LTy::Region);
+            let saved = self.tmp(LTy::Region);
+            let cur = crate::lir::place_le(var, &lsteps);
+            self.emit(LS::RegionUse { region: r, saved });
+            self.emit(LS::Set(vv, LE::ArrLit(et, vec![cur])));
+            self.emit(LS::RegionRestore(saved));
+        } else {
+            let r = self.bind(region, LTy::Region);
+            self.emit(LS::View { dst: vv, var, steps: lsteps, ty: et, region: r });
+        }
+        let rt = self.lty(&e.ty);
+        let v = self.expr(call);
+        let out = if rt == LTy::Unit {
+            if !matches!(v, LE::Unit | LE::Var(_) | LE::I(_) | LE::B(_)) {
+                self.emit(LS::Eval(v));
+            }
+            LE::Unit
+        } else {
+            let o = self.tmp(rt.clone());
+            self.emit(LS::Set(o, v));
+            LE::Var(o)
+        };
+        if escapes || narrow {
+            let back = LE::Index { arr: Box::new(LE::Var(vv)), idx: Box::new(LE::I(0)), check: None };
+            if unchecked.is_empty() {
+                self.emit(LS::Set(var, back));
+            } else {
+                self.emit(LS::SetPlace { var, steps: unchecked, val: back });
+            }
+        } else {
+            self.emit(LS::Unview { dst: vv, var, steps: unchecked });
+        }
+        out
+    }
+
+    /// The functions a `!` call (`TK::Bang`'s call) may run.
+    fn bang_callees(&self, call: &TExpr) -> Vec<FuncId> {
+        match &call.kind {
+            TK::Call(f, _) => vec![*f],
+            TK::M(M::IfaceCall(mi), Some(r), ..) => {
+                let Ty::Array(it) = &r.ty else { return vec![] };
+                let Ty::Iface(iname) = &**it else { return vec![] };
+                self.p.ifaces.get(iname).into_iter().flatten().filter_map(|(_, fids)| fids.get(*mi).copied()).collect()
+            }
+            _ => vec![],
+        }
+    }
+
     /// `a op b` on promoted Ints. Under `~`, a zero divisor and a negative
     /// or oversized exponent are ArithErrors (there is no overflow).
     fn parith(&mut self, op: BinOp, a: LE, b: LE, sp: Span) -> LE {
@@ -3001,7 +3135,7 @@ impl<'a> Lw<'a> {
                 let tag = LE::Field(Box::new(x.clone()), 0);
                 let mut slot = 1;
                 let mut shown = vec![];
-                for (name, fs) in vs {
+                for (name, fs) in vs.iter() {
                     let s = if fs.is_empty() {
                         LE::S(name.clone())
                     } else {
@@ -3911,9 +4045,8 @@ impl<'a> Lw<'a> {
                 LE::Var(out)
             }
             IfaceCall(mi) if matches!(recv.unwrap().ty, Ty::Array(_)) => {
-                // A `!` method: the receiver is a one-element slice holding the
-                // interface value; each implementor's method gets a slice of its
-                // own type (in the same region), which is written back.
+                // A `!` method: the receiver is a view of the interface value;
+                // each implementor's method gets a view of the value inside it.
                 let r = recv.unwrap();
                 let Ty::Array(it) = &r.ty else { unreachable!() };
                 let Ty::Iface(iname) = &**it else { unreachable!() };
@@ -3937,12 +4070,22 @@ impl<'a> Lw<'a> {
                     let ct = self.lty(ty);
                     let cell = self.tmp(LTy::Arr(Box::new(ct.clone())));
                     let f = self.p.funcs[fids[mi]].cname.clone();
+                    let escapes = self_escapes(&self.p.funcs[fids[mi]]);
                     let body = self.sub(|lw| {
-                        let saved = lw.tmp(LTy::Region);
-                        lw.emit(LS::RegionUse { region: LE::RegionOf(Box::new(LE::Var(tv))), saved });
-                        let cur = lw.iface_get(held.clone(), it, k);
-                        lw.emit(LS::Set(cell, LE::ArrLit(ct.clone(), vec![cur])));
-                        lw.emit(LS::RegionRestore(saved));
+                        let steps = vec![crate::lir::Step::Index(LE::I(0), None), crate::lir::Step::Field(k + 1)];
+                        let region = LE::ViewRegion(Box::new(LE::Var(tv)));
+                        if escapes || boxed {
+                            // The method may keep its receiver (or the value sits in a
+                            // box that may be empty, R13): a copy, written back.
+                            let saved = lw.tmp(LTy::Region);
+                            lw.emit(LS::RegionUse { region, saved });
+                            let cur = lw.iface_get(held.clone(), it, k);
+                            lw.emit(LS::Set(cell, LE::ArrLit(ct.clone(), vec![cur])));
+                            lw.emit(LS::RegionRestore(saved));
+                        } else {
+                            let r = lw.bind(region, LTy::Region);
+                            lw.emit(LS::View { dst: cell, var: tv, steps: steps.clone(), ty: ct.clone(), region: r });
+                        }
                         let call = LE::Call(f.clone(), std::iter::once(LE::Var(cell)).chain(avs.iter().cloned()).collect());
                         let (pre, call) = lw.iface_result(e, fids[mi], call);
                         for st in pre {
@@ -3952,9 +4095,15 @@ impl<'a> Lw<'a> {
                             Some(o) => lw.emit(LS::Set(o, call)),
                             None => lw.emit(LS::Eval(call)),
                         }
-                        // A boxed implementor (R13): the cell is its new box.
-                        let back = if boxed { LE::Var(cell) } else { LE::Index { arr: Box::new(LE::Var(cell)), idx: Box::new(LE::I(0)), check: None } };
-                        lw.emit(LS::SetPlace { var: tv, steps: vec![crate::lir::Step::Index(LE::I(0), None), crate::lir::Step::Field(k + 1)], val: back });
+                        if boxed {
+                            // A boxed implementor (R13): the cell is its new box.
+                            lw.emit(LS::SetPlace { var: tv, steps, val: LE::Var(cell) });
+                        } else if escapes {
+                            let back = LE::Index { arr: Box::new(LE::Var(cell)), idx: Box::new(LE::I(0)), check: None };
+                            lw.emit(LS::SetPlace { var: tv, steps, val: back });
+                        } else {
+                            lw.emit(LS::Unview { dst: cell, var: tv, steps });
+                        }
                     });
                     self.emit(LS::If(LE::Cmp(Op::Eq, Box::new(tag.clone()), Box::new(LE::I(k as i64)), LTy::I64), body, vec![]));
                 }
@@ -5116,8 +5265,11 @@ pub(crate) fn collect_locals(e: &TExpr, out: &mut Vec<LocalId>) {
         }
         TK::Call(_, xs) | TK::Array(xs) | TK::Format(_, xs) => xs.iter().for_each(|x| collect_locals(x, out)),
         TK::Seq(ss) => ss.iter().for_each(|s| collect_locals_stmt(s, out)),
-        TK::PlaceAssign(l, steps, _, v) => {
+        TK::PlaceAssign(l, steps, _, v) | TK::Bang(l, steps, _, v) => {
             out.push(*l);
+            if let TK::Bang(_, _, view, _) = &e.kind {
+                out.push(*view);
+            }
             for st in steps {
                 if let TStep::Index(i) = st {
                     collect_locals(i, out);
@@ -5223,7 +5375,7 @@ fn le_allocates(e: &LE, rets: &(std::collections::HashSet<String>, std::collecti
     match e {
         LE::Var(_) | LE::I(_) | LE::F(_) | LE::B(_) | LE::S(_) | LE::SB(_) | LE::Loc(_) | LE::Unit | LE::RegionProgram | LE::Global(_) => false,
         LE::Tup(_, xs) | LE::Prim(_, xs) => any(xs),
-        LE::Field(x, _) | LE::Neg(x, _) | LE::FNeg(x) | LE::Not(x) | LE::Len(x) | LE::RangeField(x, _) | LE::ChanLen(x) | LE::LockPoisoned(x) | LE::AtomicLoad(x) | LE::RegionOf(x) | LE::RegionBytes(x) => one(x),
+        LE::Field(x, _) | LE::Neg(x, _) | LE::FNeg(x) | LE::Not(x) | LE::Len(x) | LE::RangeField(x, _) | LE::ChanLen(x) | LE::LockPoisoned(x) | LE::AtomicLoad(x) | LE::RegionOf(x) | LE::ViewRegion(x) | LE::RegionBytes(x) => one(x),
         LE::Arith(_, a, b, _) | LE::Cmp(_, a, b, _) | LE::FArith(_, a, b) | LE::Range(a, b, _) => one(a) || one(b),
         LE::Cond(a, b, c) => one(a) || one(b) || one(c),
         LE::Index { arr, idx, .. } => one(arr) || one(idx),
@@ -5286,7 +5438,8 @@ fn frame_allocates(body: &[LS], frame: V, rets: &(std::collections::HashSet<Stri
                     *cur = *cur || c2;
                     false
                 }
-                LS::Break(_) | LS::Continue(_) | LS::Panic(..) | LS::RegionFree(_) => false,
+                LS::Break(_) | LS::Continue(_) | LS::Panic(..) | LS::RegionFree(_) | LS::Unview { .. } => false,
+                LS::View { region, .. } => *cur && alloc(region),
                 _ => *cur,
             };
             if hit {
@@ -5338,7 +5491,8 @@ fn stmts_allocate(ss: &[LS], rets: &(std::collections::HashSet<String>, std::col
         LS::SetIndex { idx, val, .. } => alloc(idx) || alloc(val),
         LS::If(c, a, b) => alloc(c) || stmts_allocate(a, rets) || stmts_allocate(b, rets),
         LS::Loop(_, b) => stmts_allocate(b, rets),
-        LS::Break(_) | LS::Continue(_) => false,
+        LS::Break(_) | LS::Continue(_) | LS::Unview { .. } => false,
+        LS::View { region, .. } => alloc(region),
         _ => true,
     })
 }
@@ -5457,7 +5611,8 @@ fn iter_light_ok(body: &[LS], r: V, rets: &(std::collections::HashSet<String>, s
                 _ if !open => false,
                 LS::Break(_) | LS::Continue(_) | LS::Panic(..) => false,
                 LS::Set(_, e) | LS::Eval(e) | LS::Return(Some(e)) | LS::Puts(e, _) | LS::Print(e) | LS::Die(e) | LS::PanicStr(e) | LS::Exit(e) => calls_storing(e, sp) || (*st == St::Other && alloc(e)),
-                LS::Return(None) => false,
+                LS::Return(None) | LS::Unview { .. } => false,
+                LS::View { region, .. } => calls_storing(region, sp) || (*st == St::Other && alloc(region)),
                 LS::SetIndex { idx, val, .. } => calls_storing(idx, sp) || calls_storing(val, sp) || (*st == St::Other && (alloc(idx) || alloc(val))),
                 LS::Push(_, e) => calls_storing(e, sp) || *st == St::Other,
                 _ => true,
@@ -5476,7 +5631,7 @@ fn visit_le(e: &LE, f: &mut dyn FnMut(&LE)) {
     f(e);
     match e {
         LE::Tup(_, xs) | LE::Prim(_, xs) | LE::Call(_, xs) | LE::Ffi(_, xs) | LE::Rt(_, xs) | LE::ArrLit(_, xs) | LE::GenNew(_, xs) => xs.iter().for_each(|x| visit_le(x, f)),
-        LE::Field(x, _) | LE::Neg(x, _) | LE::FNeg(x) | LE::Not(x) | LE::Len(x) | LE::RangeField(x, _) | LE::ChanLen(x) | LE::LockPoisoned(x) | LE::AtomicLoad(x) | LE::RegionOf(x) | LE::RegionBytes(x) | LE::RegionNew(x) | LE::ToP(x) | LE::AtomicNew(x) | LE::ArrWithCap(_, x) | LE::ChanNew(_, x) => visit_le(x, f),
+        LE::Field(x, _) | LE::Neg(x, _) | LE::FNeg(x) | LE::Not(x) | LE::Len(x) | LE::RangeField(x, _) | LE::ChanLen(x) | LE::LockPoisoned(x) | LE::AtomicLoad(x) | LE::RegionOf(x) | LE::ViewRegion(x) | LE::RegionBytes(x) | LE::RegionNew(x) | LE::ToP(x) | LE::AtomicNew(x) | LE::ArrWithCap(_, x) | LE::ChanNew(_, x) => visit_le(x, f),
         LE::Arith(_, a, b, _) | LE::Cmp(_, a, b, _) | LE::FArith(_, a, b) | LE::PArith(_, a, b) | LE::Range(a, b, _) | LE::AtomicRmw(_, a, b) | LE::ArrNew(_, a, b, _) => {
             visit_le(a, f);
             visit_le(b, f);
@@ -5523,6 +5678,47 @@ fn light_iter(ss: &mut Vec<LS>, r: V, mark: V, larges: V) {
         }
     }
     *ss = out;
+}
+
+/// Can a `!` method keep its receiver (the view of its caller's place)
+/// past the call? Only through `self` itself, the one-element slice: a
+/// lambda, task or generator capturing it, or a copy of it stored
+/// somewhere. Its other uses (`self[0]`, places under it, receivers of
+/// further `!` calls) end with the call.
+pub(crate) fn self_escapes(f: &TFunc) -> bool {
+    let Some(&me) = f.params.first() else { return false };
+    if !f.src_name.ends_with('!') || f.locals[me].name != "self" || !matches!(f.locals[me].ty, Ty::Array(_)) {
+        return false;
+    }
+    fn walk(e: &TExpr, me: LocalId, hit: &mut bool) {
+        if *hit {
+            return;
+        }
+        match &e.kind {
+            TK::Local(l) if *l == me => {
+                *hit = true;
+                return;
+            }
+            // `self[0]`.
+            TK::Index(a, i) if matches!(a.kind, TK::Local(l) if l == me) => {
+                walk(i, me, hit);
+                return;
+            }
+            // The receiver of a `!` call: a view of `self[0]`'s place, or
+            // `self` passed through (its first argument).
+            TK::Call(_, args) if matches!(args.first().map(|a| &a.kind), Some(TK::Local(l)) if *l == me) => {
+                args[1..].iter().for_each(|a| walk(a, me, hit));
+                return;
+            }
+            _ => {}
+        }
+        crate::prove::each_child(e, &mut |c| walk(c, me, hit));
+    }
+    let mut hit = false;
+    for s in &f.body {
+        crate::prove::stmt_exprs(s, &mut |e| walk(e, me, &mut hit));
+    }
+    hit
 }
 
 /// The range of an integer type narrower than 64 bits (I64, U64: none).

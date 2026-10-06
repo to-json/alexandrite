@@ -222,6 +222,28 @@ impl<'a> Graph<'a> {
                 let boxes = v.clone();
                 self.flow(&boxes, &[Node::Local(*l)]);
             }
+            // `place.m!(..)`: the view refers to the place (an alias). A
+            // place in a local's own variables (no index step) gets its
+            // region from this site: what the callee stores into it lives
+            // there (see docs/notes/bang-calls.md).
+            TK::Bang(l, steps, view, call) => {
+                for st in steps {
+                    if let TStep::Index(i) = st {
+                        self.expr(i);
+                    }
+                }
+                let vw = [Node::Local(*view)];
+                self.alias(&[Node::Local(*l)], &vw);
+                if !steps.iter().any(|s| matches!(s, TStep::Index(_))) {
+                    let k = e as *const TExpr as usize;
+                    self.sites.push(k);
+                    self.site_exprs.insert(k, e);
+                    self.site_loops.insert(k, self.loops.clone());
+                    self.flow(&[site(e)], &vw);
+                }
+                self.mutations.push((vw.to_vec(), self.loops.clone()));
+                v.extend(self.expr(call));
+            }
             TK::Call(fid, args) => {
                 let sum = self.sums.get(*fid).cloned().unwrap_or_default();
                 for (i, a) in args.iter().enumerate() {
@@ -878,11 +900,7 @@ fn loop_extent(g: &Graph, key: usize) -> (u32, u32) {
 fn span_extent(e: &TExpr, lo: &mut u32, hi: &mut u32) {
     *lo = (*lo).min(e.span.lo);
     *hi = (*hi).max(e.span.hi);
-    if let TK::M(_, _, _, Some(b)) = &e.kind {
-        for s in &b.body {
-            crate::prove::stmt_exprs(s, &mut |x| span_extent(x, lo, hi));
-        }
-    }
+    // (each_child visits blocks' statements too.)
     crate::prove::each_child(e, &mut |c| span_extent(c, lo, hi));
 }
 
@@ -898,23 +916,29 @@ fn local_spans(s: &TStmt, l: LocalId, out: &mut Vec<crate::diag::Span>) {
 
 fn expr_spans(e: &TExpr, l: LocalId, out: &mut Vec<crate::diag::Span>) {
     match &e.kind {
-        TK::Local(x) | TK::Assign(x, _) | TK::IndexAssign(x, ..) | TK::PlaceAssign(x, ..) if *x == l => out.push(e.span),
+        TK::Local(x) | TK::Assign(x, _) | TK::IndexAssign(x, ..) | TK::PlaceAssign(x, ..) | TK::Bang(x, ..) if *x == l => out.push(e.span),
         _ => {}
     }
-    if let TK::M(_, _, _, Some(b)) = &e.kind {
-        if b.params.contains(&l) {
-            out.push(b.span);
+    // A block's or a Seq's statements go through local_spans (multiple
+    // assignment); `each_child` would visit them again, doubling the work
+    // at every level of nesting.
+    match &e.kind {
+        TK::M(_, r, args, Some(b)) => {
+            r.iter().map(|r| &**r).chain(args).for_each(|c| expr_spans(c, l, out));
+            if b.params.contains(&l) {
+                out.push(b.span);
+            }
+            for s in &b.body {
+                local_spans(s, l, out);
+            }
         }
-        for s in &b.body {
-            local_spans(s, l, out);
+        TK::Seq(ss) => {
+            for s in ss {
+                local_spans(s, l, out);
+            }
         }
+        _ => crate::prove::each_child(e, &mut |c| expr_spans(c, l, out)),
     }
-    if let TK::Seq(ss) = &e.kind {
-        for s in ss {
-            local_spans(s, l, out);
-        }
-    }
-    crate::prove::each_child(e, &mut |c| expr_spans(c, l, out));
 }
 
 /// `alx explain mem`: every allocation site of the program's own code,
@@ -951,7 +975,7 @@ pub fn explain(p: &TProgram, sm: &crate::diag::SourceMap, files: &[u32]) -> Stri
                 None => "?".into(),
             };
             // Values without storage allocate nothing, except a store's growth.
-            let stores = matches!(e.kind, TK::IndexAssign(..) | TK::PlaceAssign(..) | TK::M(M::Push | M::MapSet | M::CopyInto | M::PoolAdd | M::PoolSet, ..));
+            let stores = matches!(e.kind, TK::IndexAssign(..) | TK::PlaceAssign(..) | TK::Bang(..) | TK::M(M::Push | M::MapSet | M::CopyInto | M::PoolAdd | M::PoolSet, ..));
             if (!has_storage(&e.ty) && !stores) || !shown.insert((e.span.lo, e.span.hi)) {
                 continue;
             }

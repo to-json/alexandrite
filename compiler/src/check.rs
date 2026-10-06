@@ -4446,7 +4446,12 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 s
             }
             TK::Call(f, _) => self.w.declared_errs.get(f).cloned(),
-            // A `!` call: `Seq[.., tmp = call, .., tmp]`.
+            // A `!` call (its arguments may be evaluated ahead of it).
+            TK::Bang(.., call) => self.held_set(call),
+            TK::Seq(ss) if matches!(ss.last(), Some(TStmt::Expr(x)) if matches!(x.kind, TK::Bang(..))) => {
+                let Some(TStmt::Expr(x)) = ss.last() else { unreachable!() };
+                self.held_set(x)
+            }
             TK::Seq(ss) => {
                 let Some(TStmt::Expr(TExpr { kind: TK::Local(r), .. })) = ss.last() else { return None };
                 ss.iter().find_map(|s| match s {

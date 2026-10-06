@@ -233,6 +233,8 @@ pub struct IfaceMethod {
     pub ret: Ty,
     pub default: bool,
     pub span: Span,
+    /// `#[track_caller]` (S9): calls pass their location as a last argument.
+    pub caller: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -827,7 +829,7 @@ impl<'a> World<'a> {
                     Some(t) => type_from(t, &self.structs, &self.consts)?,
                     None => Ty::Unit,
                 };
-                ms.push(IfaceMethod { name: name.clone(), params: ps, ret, default: *default, span: *span });
+                ms.push(IfaceMethod { name: name.clone(), params: ps, ret, default: *default, span: *span, caller: d.tracked.contains(name) });
             }
             if self.ifaces.insert(d.name.clone(), ms).is_none() {
                 self.iface_order.push(d.name.clone());
@@ -875,6 +877,11 @@ impl<'a> World<'a> {
             if nparams != m.params.len() + 1 {
                 self.impls.get_mut(iface).unwrap().pop();
                 return Err(Diag::new(sp, format!("{tn}.{} takes {} argument(s), but {iface}.{} takes {}", m.name, nparams - 1, m.name, m.params.len())));
+            }
+            if self.defs[def].def.track_caller != m.caller {
+                self.impls.get_mut(iface).unwrap().pop();
+                let (yes, no) = if m.caller { (format!("{iface}.{}", m.name), format!("{tn}.{}", m.name)) } else { (format!("{tn}.{}", m.name), format!("{iface}.{}", m.name)) };
+                return Err(Diag::new(sp, format!("{tn} doesn't satisfy {iface}: `{yes}` is `#[track_caller]` and `{no}` isn't")).note("an implementation tracks its caller exactly when the interface's method does (S9)"));
             }
             // A `!` method gets its receiver in a one-element slice.
             let me = if m.name.ends_with('!') { Ty::arr(t.clone()) } else { t.clone() };
@@ -1916,6 +1923,11 @@ impl<'w, 'a> FnCx<'w, 'a> {
         if let Some(d) = def {
             for (p, a) in d.params.iter().zip(args) {
                 params.push(self.declare(&p.name, a.clone()));
+            }
+            if d.track_caller {
+                // S9: the hidden last parameter, the caller's CallSite.
+                let t = self.call_site_ty(d.name_span)?;
+                params.push(self.declare(CALLER_PARAM, t));
             }
             self.n_params = params.len();
             self.ret = match &d.ret {
@@ -4417,6 +4429,9 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 targs.push(v);
             }
         }
+        if m.caller {
+            targs.push(self.call_site(sp)?);
+        }
         self.impure = true;
         let view = self.view_local(&pty);
         let tl = self.mk(TK::Local(view), Ty::arr(pty.clone()), sp);
@@ -5451,14 +5466,23 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 let m = self.show_value(m)?;
                 return Ok(self.mk(TK::Panic(Box::new(m)), Ty::Never, sp));
             }
+            "caller_location" if self.w.by_name.get("caller_location").is_none() => {
+                // S9: in a `#[track_caller]` def, where it was called from;
+                // elsewhere, where this is.
+                if !args.is_empty() || block.is_some() {
+                    return Err(Diag::new(sp, "`caller_location` takes no arguments"));
+                }
+                return self.call_site(sp);
+            }
             "assert" if self.w.by_name.get("assert").is_none() => {
                 if args.is_empty() || args.len() > 2 {
                     return Err(Diag::new(sp, "`assert` takes a condition and maybe a message: `assert cond, \"why\"`"));
                 }
                 let c = self.value(&args[0])?;
                 self.expect(&c.ty, &Ty::Bool, c.span, "`assert` condition")?;
-                let text = format!("assertion failed: {} at {}", self.w.sm.snippet(args[0].span).trim(), self.w.sm.loc(sp));
-                let msg = self.mk(TK::Str(text), Ty::Str, sp);
+                let text = format!("assertion failed: {} at ", self.w.sm.snippet(args[0].span).trim());
+                let loc = self.call_site_text(sp)?;
+                let msg = self.mk(TK::Format(vec![FmtPiece::Lit(text), FmtPiece::Str(0)], vec![loc]), Ty::Str, sp);
                 // `assert cond, why`: the message goes after the source text.
                 let msg = match args.get(1) {
                     Some(w) => {
@@ -5496,7 +5520,8 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     }
                     vals.push(v);
                 }
-                let pieces = vec![FmtPiece::Lit(format!("assert_eq failed at {}: got ", self.w.sm.loc(sp))), FmtPiece::Str(0), FmtPiece::Lit(", want ".into()), FmtPiece::Str(1)];
+                vals.insert(0, self.call_site_text(sp)?);
+                let pieces = vec![FmtPiece::Lit("assert_eq failed at ".into()), FmtPiece::Str(0), FmtPiece::Lit(": got ".into()), FmtPiece::Str(1), FmtPiece::Lit(", want ".into()), FmtPiece::Str(2)];
                 let msg = self.mk(TK::Format(pieces, vals), Ty::Str, sp);
                 let fail = self.mk(TK::Panic(Box::new(msg)), Ty::Unit, sp);
                 let neg = self.mk(TK::Not(Box::new(eq)), Ty::Bool, sp);
@@ -5527,13 +5552,15 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 if matches!(t, Ty::Result(_)) {
                     return Err(Diag::new(b.span, "an `assert_panics` block can't fail with an error (`~`, `fail`, or ending in a `~T`): it checks for a panic; use `.unwrap` to turn the error into one"));
                 }
-                let loc = self.w.sm.loc(sp);
+                let loc = self.call_site_text(sp)?;
+                let (lid, s0) = self.opt_tmp(loc, sp);
+                let loc = self.mk(TK::Local(lid), Ty::Str, sp);
                 let rty = Ty::Result(Box::new(t));
                 let waited = self.mk(TK::M(M::TaskWait, Some(Box::new(task)), vec![], None), rty.clone(), sp);
                 let (rid, s1) = self.opt_tmp(waited, sp);
                 let rl = self.mk(TK::Local(rid), rty.clone(), sp);
                 let ok = self.mk(TK::M(M::ResIsOk, Some(Box::new(rl.clone())), vec![], None), Ty::Bool, sp);
-                let none = self.mk(TK::Str(format!("assert_panics failed at {loc}: the block didn't panic")), Ty::Str, sp);
+                let none = self.mk(TK::Format(vec![FmtPiece::Lit("assert_panics failed at ".into()), FmtPiece::Str(0), FmtPiece::Lit(": the block didn't panic".into())], vec![loc.clone()]), Ty::Str, sp);
                 let fail_none = self.mk(TK::Panic(Box::new(none)), Ty::Unit, sp);
                 let mut otherwise = vec![];
                 if let Some(w) = want {
@@ -5547,13 +5574,13 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     let ml = self.mk(TK::Local(mid), Ty::Str, sp);
                     let wl = self.mk(TK::Local(wid), Ty::Str, sp);
                     let has = self.mk(TK::M(M::StrHelper(5), Some(Box::new(ml.clone())), vec![wl.clone()], None), Ty::Bool, sp);
-                    let pieces = vec![FmtPiece::Lit(format!("assert_panics failed at {loc}: the panic message doesn't contain \"")), FmtPiece::Str(0), FmtPiece::Lit("\": ".into()), FmtPiece::Str(1)];
-                    let text = self.mk(TK::Format(pieces, vec![wl, ml]), Ty::Str, sp);
+                    let pieces = vec![FmtPiece::Lit("assert_panics failed at ".into()), FmtPiece::Str(0), FmtPiece::Lit(": the panic message doesn't contain \"".into()), FmtPiece::Str(1), FmtPiece::Lit("\": ".into()), FmtPiece::Str(2)];
+                    let text = self.mk(TK::Format(pieces, vec![loc, wl, ml]), Ty::Str, sp);
                     let fail = self.mk(TK::Panic(Box::new(text)), Ty::Unit, sp);
                     let neg = self.mk(TK::Not(Box::new(has)), Ty::Bool, sp);
                     otherwise = vec![s2, s3, s4, TStmt::If(neg, vec![TStmt::Expr(fail)], vec![])];
                 }
-                return Ok(self.mk(TK::Seq(vec![s1, TStmt::If(ok, vec![TStmt::Expr(fail_none)], otherwise)]), Ty::Unit, sp));
+                return Ok(self.mk(TK::Seq(vec![s0, s1, TStmt::If(ok, vec![TStmt::Expr(fail_none)], otherwise)]), Ty::Unit, sp));
             }
             "loop" => {
                 let Some(b) = block else { return Err(Diag::new(sp, "`loop` needs a block")) };
@@ -5657,6 +5684,46 @@ impl<'w, 'a> FnCx<'w, 'a> {
             targs.push(v);
         }
         self.call_def(def, name, name_span, targs, sp)
+    }
+
+    /// S9: the builtin struct `CallSite` (builtin.alx).
+    fn call_site_ty(&self, sp: Span) -> R<Ty> {
+        type_from(&TypeExpr::Named("CallSite".into(), sp), &self.w.structs, &self.w.consts)
+    }
+
+    /// S9: where `sp` is, as a `CallSite` value.
+    fn here(&mut self, sp: Span) -> R<TExpr> {
+        let t = self.call_site_ty(sp)?;
+        let f = &self.w.sm.files[sp.file as usize];
+        let (line, col) = f.line_col(sp.lo);
+        let file = f.name.clone();
+        let function = if current_pkg().is_empty() { format!("main.{}", self.fn_name) } else { self.fn_name.clone() };
+        let vals = vec![self.mk(TK::Str(file), Ty::Str, sp), self.mk(TK::Int(line as i64), Ty::Int, sp), self.mk(TK::Int(col as i64), Ty::Int, sp), self.mk(TK::Str(function), Ty::Str, sp)];
+        Ok(self.mk(TK::M(M::StructNew, None, vals, None), t, sp))
+    }
+
+    /// S9: the hidden argument of a call at `sp` to a `#[track_caller]`
+    /// def: this def's own caller when it is tracked too, else `sp`.
+    fn call_site(&mut self, sp: Span) -> R<TExpr> {
+        match self.lookup(CALLER_PARAM) {
+            Some(id) => Ok(self.mk(TK::Local(id), self.locals[id].ty.clone(), sp)),
+            None => self.here(sp),
+        }
+    }
+
+    /// S9: the text `file:line:col` of `call_site(sp)`, for messages.
+    fn call_site_text(&mut self, sp: Span) -> R<TExpr> {
+        match self.lookup(CALLER_PARAM) {
+            Some(id) => {
+                let v = self.mk(TK::Local(id), self.locals[id].ty.clone(), sp);
+                let Ty::Struct(_, fs) = self.resolve(&v.ty) else { unreachable!("CallSite is a struct") };
+                let field = |ck: &mut Self, k: usize| ck.mk(TK::M(M::TupleGet(k), Some(Box::new(v.clone())), vec![], None), fs[k].1.clone(), sp);
+                let (f, l, c) = (field(self, 0), field(self, 1), field(self, 2));
+                let (l, c) = (self.show_value(l)?, self.show_value(c)?);
+                Ok(self.mk(TK::Format(vec![FmtPiece::Str(0), FmtPiece::Lit(":".into()), FmtPiece::Str(1), FmtPiece::Lit(":".into()), FmtPiece::Str(2)], vec![f, l, c]), Ty::Str, sp))
+            }
+            None => Ok(self.mk(TK::Str(self.w.sm.loc(sp)), Ty::Str, sp)),
+        }
     }
 
     /// S8: a call's arguments matched to def `def`'s parameters: keyword
@@ -5841,7 +5908,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn call_def_inst(&mut self, def: usize, name: &str, name_span: Span, targs: Vec<TExpr>, extra: Vec<Ty>, sp: Span, d: &Def) -> R<TExpr> {
+    fn call_def_inst(&mut self, def: usize, name: &str, name_span: Span, mut targs: Vec<TExpr>, extra: Vec<Ty>, sp: Span, d: &Def) -> R<TExpr> {
         let mut arg_tys: Vec<Ty> = targs.iter().map(|a| self.resolve(&a.ty)).collect();
         if arg_tys.iter().any(Ty::has_var) {
             let t = self.unknown(sp, "this call's arguments")?;
@@ -5867,6 +5934,9 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 return Err(Diag::new(name_span, format!("`#[pure] def {}` calls `{name}`, which does I/O", self.fn_name)));
             }
             self.impure = true;
+        }
+        if d.track_caller {
+            targs.push(self.call_site(name_span)?);
         }
         let call = self.mk(TK::Call(fid, targs), ret, sp);
         self.fallible_use(call, fallible, name)
@@ -6786,6 +6856,9 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 let v = self.coerce(v, pt)?;
                 self.expect(&v.ty, pt, v.span, &format!("`{iname}.{name}` argument"))?;
                 targs.push(v);
+            }
+            if m.caller {
+                targs.push(self.call_site(name_span)?);
             }
             self.impure = true;
             return Ok(mk_m(self, M::IfaceCall(k), recv, targs, None, m.ret.clone()));

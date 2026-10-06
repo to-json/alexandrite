@@ -1,0 +1,90 @@
+#![test(external)]
+# log/slog's slogtest_test.go: the JSON and text handlers pass
+# testing/slogtest. An external test (S11): testing/slogtest imports
+# log/slog. (parse_lines and parse_text are Go's helpers of this file.)
+
+import "bytes"
+import "encoding/json"
+import "log/slog"
+import "strconv"
+import "strings"
+import "testing/slogtest"
+
+# A buffer that copies share (a handler owns a copy of its writer).
+struct SharedBuf {
+  mu: Mutex[bytes.Buffer]
+
+  pub def write!(p: [Byte]) -> ~Int {
+    mu.lock { |b| b.write!(p) }
+    p.size
+  }
+  def string -> Str { mu.lock { |b| b.string } }
+  def reset { mu.lock { |b| b = bytes.Buffer.new } }
+}
+
+def new_buf -> SharedBuf { SharedBuf.new(mu: Mutex.new(bytes.Buffer.new)) }
+
+def parse_lines(src: Str, text: Bool) -> ~[json.Value] {
+  out: [json.Value] = []
+  for line in src.split("\n") {
+    next if line.size == 0
+    out << (text ? ~parse_text(line) : ~json.parse(line))
+  }
+  out
+}
+
+# Go's parseText: "a=b G.c=d" into {"a":"b","G":{"c":"d"}} (assumes one
+# space between attributes and no quoting, as Go's does).
+def parse_text(line: Str) -> ~json.Value {
+  paths: [[Str]] = []
+  vals: [Str] = []
+  for kv in strings.trim_space(line).split(" ") {
+    i = strings.index(kv, "=")
+    fail json.JsonError.Syntax(msg: "no '=' in " + strconv.quote(kv), offset: 0) if i < 0
+    paths << kv[0...i].split(".")
+    vals << kv[i + 1...kv.size]
+  }
+  ~json.parse(object(paths, vals, 0))
+}
+
+# The JSON object of the entries whose paths share a prefix of length
+# `depth` (the caller passes only those), in first-seen key order.
+def object(paths: [[Str]], vals: [Str], depth: Int) -> Str {
+  keys: [Str] = []
+  for p in paths {
+    keys << p[depth] if !keys.include?(p[depth])
+  }
+  parts: [Str] = []
+  for k in keys {
+    sub: [[Str]] = []
+    sv: [Str] = []
+    leaf = ""
+    i = 0
+    while i < paths.size {
+      if paths[i][depth] == k {
+        if paths[i].size == depth + 1 {
+          leaf = vals[i]
+        } else {
+          sub << paths[i]
+          sv << vals[i]
+        }
+      }
+      i += 1
+    }
+    v = sub.size > 0 ? object(sub, sv, depth + 1) : json.quote(leaf)
+    parts << json.quote(k) + ":" + v
+  }
+  "{" + parts.join(",") + "}"
+}
+
+test "slogtest json" {
+  buf = new_buf
+  h = slog.new_json_handler(buf, slog.HandlerOptions.new)
+  slogtest.test_handler(h, -> {~parse_lines(buf.string, false)}).unwrap
+}
+
+test "slogtest text" {
+  buf = new_buf
+  h = slog.new_text_handler(buf, slog.HandlerOptions.new)
+  slogtest.test_handler(h, -> {~parse_lines(buf.string, true)}).unwrap
+}

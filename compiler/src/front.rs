@@ -318,6 +318,9 @@ pub fn load_with(path: &Path, display: &str, read: &dyn Fn(&Path) -> std::io::Re
     if let Err(d) = crate::embed::resolve(&mut main, path.parent().unwrap_or(Path::new("."))) {
         return Err((sm, d));
     }
+    if main.external_test {
+        return Err((sm, not_external(main.file)));
+    }
     if let Some(t) = main.tests.first() {
         return Err((sm, not_a_test_file(t)));
     }
@@ -387,6 +390,9 @@ fn load_pkg(
         crate::embed::resolve(&mut m, &embed_dir(f))?;
         if let Some(s) = m.main.iter().find(|s| !matches!(s.kind, crate::ast::StmtKind::Using(_))) {
             return Err(Diag::new(s.span, format!("a package (`{path}`) holds only declarations; move statements into a def")).note("package-level values are constants (`NAME = 42`), or, for state that changes, `NAME = Atomic.new(v)` / `NAME = Mutex.new(v)` (R11)"));
+        }
+        if m.external_test {
+            return Err(not_external(m.file));
         }
         if let Some(t) = m.tests.first() {
             return Err(not_a_test_file(t));
@@ -563,8 +569,9 @@ pub fn check_program(l: &Loaded, externs: Vec<DefInfo>) -> Result<TProgram, Diag
             // aren't checked), so a reference in the file's text counts too.
             let in_text = l.sm.files.get(i.span.file as usize).is_some_and(|f| mentions(&f.text, &alias));
             // An import a derive added for its own code (`alxjson`, `alxdyn`, ...):
-            // the derived methods the program doesn't call aren't checked.
-            if i.alias.as_deref().is_some_and(|a| matches!(a, "alxjson" | "alxjson2" | "alxjsontext" | "alxdyn")) {
+            // the derived methods the program doesn't call aren't checked. Or one
+            // `alx test` added (no span: the runner's, an external test's testing).
+            if i.alias.as_deref().is_some_and(|a| matches!(a, "alxjson" | "alxjson2" | "alxjsontext" | "alxdyn") || a.starts_with("__alx")) || i.span.hi == 0 {
                 continue;
             }
             if !crate::check::import_used(&pkg, &alias) && !in_text && !ext.contains(i.path.trim_end_matches('/')) {
@@ -622,6 +629,8 @@ pub fn separable(p: &Package) -> bool {
         && !m.consts.iter().any(|c| c.var || matches!(c.value.kind, crate::ast::ExprKind::Array(_) | crate::ast::ExprKind::ArrayRepeat(..)))
         // The builtin Complex is declared with the program.
         && !uses_complex(&p.source)
+        // So is CallSite (S9).
+        && !["track_caller", "caller_location", "CallSite"].iter().any(|w| p.source.contains(w))
         // Formats with flags reach the fmt engine, declared with the program (builtin.alx).
         && !["format(", "printf(", "sprintf(", "errorf("].iter().any(|f| p.source.contains(f))
         // So is `==` on maps (`__map_eq`).
@@ -767,6 +776,7 @@ pub fn parse_header(text: &str, overflow: Overflow, span: Span, pkg: &str) -> Re
             fallible: flags.contains(&"fallible"),
             errs: Some(vec!["Error".into()]),
             pure: flags.contains(&"pure"),
+            track_caller: false,
             ffi: None,
             body: vec![],
         };
@@ -973,8 +983,11 @@ pub fn load_tests(dir: &Path, dir_shown: &str, only: Option<&Path>, o: &TestOpts
     };
     let mut next_id = 0;
     let mut overflow = HashMap::new();
+    // The package's files and its in-package tests (`acc`), and the
+    // external tests (`xacc`, files declaring `#![test(external)]`, S11).
     let mut acc: Option<Module> = None;
-    let mut decls: Vec<TestDecl> = vec![];
+    let mut xacc: Option<Module> = None;
+    let mut decls: Vec<(TestDecl, bool)> = vec![];
     for f in files.iter().filter(|p| !is_test(p)).chain(tests.iter()) {
         let text = match std::fs::read_to_string(f) {
             Ok(t) => t,
@@ -995,50 +1008,85 @@ pub fn load_tests(dir: &Path, dir_shown: &str, only: Option<&Path>, o: &TestOpts
             let why = if test_file { "a test file holds only declarations and test blocks; move statements into a `test`" } else { "a package holds only declarations; move statements into a def" };
             return Err((sm, Diag::new(s.span, why)));
         }
+        if m.external_test && !test_file {
+            return Err((sm, not_external(m.file)));
+        }
         overflow.insert(m.file, m.overflow);
-        decls.append(&mut m.tests);
-        match &mut acc {
-            None => acc = Some(m),
+        let ext = m.external_test;
+        decls.extend(std::mem::take(&mut m.tests).into_iter().map(|t| (t, ext)));
+        let slot = if ext { &mut xacc } else { &mut acc };
+        match slot {
+            None => *slot = Some(m),
             Some(a) => merge_decls(a, m),
         }
     }
-    let mut acc = acc.unwrap();
+    let Some(mut acc) = acc else {
+        sm.add(dir_shown.into(), String::new());
+        return fail(sm, format!("`{dir_shown}` has only external tests (`#![test(external)]`): there is no package to test"));
+    };
+    let read = |p: &Path| std::fs::read_to_string(p);
+    let mods = match load_mods(dir, &read) {
+        Ok(m) => m,
+        Err(d) => return Err((sm, d)),
+    };
     // A package declaring a type with a builtin's name (math/big's `Int`)
     // can't be merged into the runner's main module, where the name would
     // clash with the builtin: it is checked as a package of its own (under
     // its import path), with its tests made public for the runner to call.
-    let shadow = acc.structs.iter().map(|s| &s.name).chain(acc.enums.iter().map(|e| &e.name)).any(|n| crate::check::SHADOWABLE.contains(&n.as_str()));
+    // So is a package with external tests, which import it.
+    let external = xacc.is_some();
+    let shadow = external || acc.structs.iter().map(|s| &s.name).chain(acc.enums.iter().map(|e| &e.name)).any(|n| crate::check::SHADOWABLE.contains(&n.as_str()));
     let own_path = {
         let d = dir_shown.trim_end_matches('/');
         // `std/x` or `/abs/path/std/x` (a std package tested by its full path).
         match d.strip_prefix("std/").or_else(|| d.rfind("/std/").map(|i| &d[i + 5..])).filter(|p| is_std(p)) {
             Some(p) => p.to_string(),
+            // External tests import the package by its import path.
+            None if external => import_path_of(dir, &mods),
             None => format!("_test/{}", d.rsplit('/').next().unwrap_or(d)),
         }
     };
+    let xpath = format!("{own_path}_test");
     // A body taking `|t|` / `|b|` gets the package testing's T / B, and the
-    // runner imports testing (unless these are testing's own tests).
+    // runner imports testing (unless these are testing's own tests merged
+    // into it).
     let own_testing = own_path == "testing";
-    let tp = if own_testing { "" } else { "testing." };
-    let main_fn = acc.defs.iter().any(|d| d.name == "test_main" && d.params.len() == 1);
-    let mut needs_testing = main_fn;
+    let tp = if own_testing && !shadow { "" } else { "testing." };
+    let is_main = |d: &Def| d.name == "test_main" && d.params.len() == 1;
+    let main_in = if acc.defs.iter().any(is_main) {
+        Some("__alx_pkg.")
+    } else if xacc.as_ref().is_some_and(|x| x.defs.iter().any(is_main)) {
+        Some("__alx_xpkg.")
+    } else {
+        None
+    };
+    let mut needs_testing = main_in.is_some();
+    // Which side imports testing for its T / B (or test_main).
+    let mut x_testing = main_in == Some("__alx_xpkg.");
+    let mut in_testing = main_in == Some("__alx_pkg.");
     // Every body becomes a def; pick what to run.
     let mut items = vec![];
     let total = decls.len();
-    for (k, mut t) in decls.into_iter().enumerate() {
+    for (k, (mut t, ext)) in decls.into_iter().enumerate() {
         let mut func = format!("__alx_t{k}");
         t.def.name = func.clone();
         let param = !t.def.params.is_empty();
         if let Some(p) = t.def.params.first_mut() {
             let ty = if t.kind == TestKind::Bench { "B" } else { "T" };
-            p.ty = Some(crate::ast::TypeExpr::Named(format!("{tp}{ty}"), p.span));
+            let q = if ext || !own_testing { "testing." } else { "" };
+            p.ty = Some(crate::ast::TypeExpr::Named(format!("{q}{ty}"), p.span));
             needs_testing = true;
+            x_testing |= ext;
+            in_testing |= !ext;
         }
         if shadow {
             t.def.public = true;
-            func = format!("__alx_pkg.{func}");
+            func = format!("{}.{func}", if ext { "__alx_xpkg" } else { "__alx_pkg" });
         }
-        acc.defs.push(t.def);
+        match (ext, xacc.as_mut()) {
+            (true, Some(x)) => x.defs.push(t.def),
+            _ => acc.defs.push(t.def),
+        }
         let wanted = match t.kind {
             // `a|b` matches names containing a or b (the alternation of Go's
             // regexp filters; the parts are plain substrings).
@@ -1051,17 +1099,21 @@ pub fn load_tests(dir: &Path, dir_shown: &str, only: Option<&Path>, o: &TestOpts
         }
     }
     let (n, total) = (items.len(), total);
-    let main_name = main_fn.then(|| if shadow { "__alx_pkg.test_main".to_string() } else { "test_main".to_string() });
+    let main_name = main_in.map(|pre| if shadow { format!("{pre}test_main") } else { "test_main".to_string() });
+    if shadow {
+        for d in acc.defs.iter_mut().chain(xacc.iter_mut().flat_map(|x| x.defs.iter_mut())).filter(|d| is_main(d)) {
+            d.public = true;
+        }
+    }
     let testing_import = Import { alias: None, path: "testing".into(), span: Span::default() };
-    if needs_testing && !own_testing && !acc.imports.iter().any(|i| i.path == "testing") {
+    let has_testing = |m: &Module| m.imports.iter().any(|i| i.path == "testing");
+    if in_testing && !own_testing && !has_testing(&acc) {
         acc.imports.push(testing_import.clone());
     }
+    if let Some(x) = xacc.as_mut().filter(|x| x_testing && !has_testing(x)) {
+        x.imports.push(testing_import.clone());
+    }
     let mut runner = match parse_file(&mut sm, "<alx test>".into(), runner_source(&items, dir_shown, o, tp, main_name.as_deref()), &mut next_id) {
-        Ok(m) => m,
-        Err(d) => return Err((sm, d)),
-    };
-    let read = |p: &Path| std::fs::read_to_string(p);
-    let mods = match load_mods(dir, &read) {
         Ok(m) => m,
         Err(d) => return Err((sm, d)),
     };
@@ -1070,6 +1122,10 @@ pub fn load_tests(dir: &Path, dir_shown: &str, only: Option<&Path>, o: &TestOpts
     let own = if shadow {
         qualify(&mut acc, &own_path);
         runner.imports.push(Import { alias: Some("__alx_pkg".into()), path: own_path.clone(), span: Span::default() });
+        if let Some(x) = xacc.as_mut() {
+            qualify(x, &xpath);
+            runner.imports.push(Import { alias: Some("__alx_xpkg".into()), path: xpath.clone(), span: Span::default() });
+        }
         if needs_testing {
             runner.imports.push(testing_import);
         }
@@ -1093,13 +1149,49 @@ pub fn load_tests(dir: &Path, dir_shown: &str, only: Option<&Path>, o: &TestOpts
     }
     if let Some(m) = own {
         pkgs.retain(|p| p.path != own_path);
-        pkgs.push(Package { path: own_path, module: m, source: String::new() });
+        pkgs.push(Package { path: own_path.clone(), module: m, source: String::new() });
+    }
+    // The external tests' imports come after the package itself, so that
+    // theirs (and those of packages they import, testing/fstest's io/fs)
+    // are this one: the package is compiled once.
+    if let Some(x) = xacc {
+        for imp in &x.imports {
+            if let Err(d) = load_pkg(imp, &mods, &mut sm, &mut next_id, &mut pkgs, &mut visiting, &mut overflow, &read, &list, &root) {
+                return Err((sm, d));
+            }
+        }
+        if !x.imports.iter().any(|i| i.path.trim_end_matches('/') == own_path) {
+            let sp = Span { file: x.file, lo: 0, hi: 0 };
+            return Err((sm, Diag::new(sp, format!("an external test imports the package it tests: `import \"{own_path}\"`"))));
+        }
+        pkgs.push(Package { path: xpath, module: x, source: String::new() });
     }
     overflow.insert(runner.file, Overflow::Abort);
     if let Err(d) = add_builtins(&mut sm, &mut next_id, &mut runner, &mut overflow) {
         return Err((sm, d));
     }
     Ok((Loaded { sm, main: runner, pkgs, overflow }, n, total))
+}
+
+/// A non-test file declaring `#![test(external)]`.
+fn not_external(file: u32) -> Diag {
+    Diag::new(Span { file, lo: 0, hi: 0 }, "`#![test(external)]` belongs in a `*_test.alx` file")
+}
+
+/// The import path of the package in `dir` (for its external tests): its
+/// path inside the module (`alx.mod`), or, outside a module, the
+/// directory's name.
+fn import_path_of(dir: &Path, mods: &Mods) -> String {
+    let canon = |p: &Path| std::fs::canonicalize(p).ok();
+    let name = || canon(dir).and_then(|d| d.file_name().map(|n| n.to_string_lossy().to_string())).unwrap_or_else(|| "pkg".into());
+    match (&mods.module, canon(dir), canon(&mods.root)) {
+        (Some(m), Some(d), Some(r)) => match d.strip_prefix(&r) {
+            Ok(rel) if rel.as_os_str().is_empty() => m.clone(),
+            Ok(rel) => format!("{m}/{}", rel.to_string_lossy().replace('\\', "/")),
+            Err(_) => name(),
+        },
+        _ => name(),
+    }
 }
 
 /// Does `text` use `alias.` as a qualifier (not as part of a longer name)?

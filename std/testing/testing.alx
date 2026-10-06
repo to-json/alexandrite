@@ -8,6 +8,11 @@
 #    parameter its type and imports this package); `bench "x" { |b| ... }`
 #    gets a `testing.B`. Blocks without a parameter work as before (assert,
 #    assert_eq, `~` propagation).
+#  - Go's two kinds of test package (GO-VS-RUBY S11): a test file is part
+#    of the package (it sees private names), or, opening with
+#    `#![test(external)]`, a package of its own (Go's `package x_test`)
+#    that imports the package under test like a user; `alx test` runs
+#    both.
 #  - `def test_main(m: testing.M)` in a test file is Go's TestMain: the
 #    runner calls it instead of running the tests; `m.run` runs them and
 #    returns the exit code, which is the test binary's (Go 1.15+).
@@ -68,8 +73,13 @@
 #  - A benchmark's result line has no `-GOMAXPROCS` suffix and no column
 #    alignment across benchmarks; bodies without `|b|` keep alx's own
 #    `name   N   x ns/op` line.
-#  - No caller locations: a log line is `    msg`, not `    x_test.go:12:
-#    msg` (port issue 52), and `helper` changes nothing.
+#  - Log lines carry Go's `x_test.alx:12: ` location, passed at compile
+#    time: log, error, fatal and skip are `#[track_caller]` (GO-VS-RUBY S9).
+#    Go's `t.Helper()` is a def attribute instead: a helper marked
+#    `#[track_caller]` reports its caller's line, as Helper does, and
+#    `helper` itself changes nothing. A failure that isn't a log call (a
+#    panic, a failed `assert`) has no location prefix; `assert`'s message
+#    carries its own.
 #  - `parallel` doesn't run tests concurrently; parallel subtests run in
 #    order. There is no `-timeout`, so no `deadline` and no `context`.
 #  - Allocation counts are of alx's region allocations; there is no byte
@@ -81,13 +91,14 @@
 #  - Not ported: fuzzing (F, `Fuzz`), coverage instrumentation, `Init`,
 #    `Main`, `RunTests`/`RunBenchmarks`/`RunExamples` and `ArtifactDir`
 #    (the runner does those jobs), `B.SetParallelism` beyond the task count.
-#  - This package imports os: a package os depends on can still use `|t|`,
-#    but then two copies of it are compiled (port issue 54).
+#  - This package imports os: in-package tests of a package os depends on
+#    can still use `|t|`, but then two copies of it are compiled (port issue
+#    54); external tests (`#![test(external)]`, S11) use the one copy.
 
 import "os"
 
 # The panic message that stops a test's task (Go's runtime.Goexit).
-STOP = "testing: the test was stopped (FailNow or SkipNow)"
+STOP = "testing: the test was stopped (fail_now or skip_now)"
 
 # ------------------------------------------------------------------- flags
 
@@ -197,6 +208,21 @@ struct Common {
     for l in log_lines(msg) {
       puts l
     }
+  }
+
+  # Go's decorate: the line logged by a call at `at`, `file:line: msg`
+  # (the file's last path element).
+  def log_at(at: CallSite, msg: Str) {
+    f = at.file
+    i = f.size - 1
+    while i >= 0 {
+      if f[i] == 47 {
+        f = f[i + 1...f.size]
+        break
+      }
+      i -= 1
+    }
+    log("#{f}:#{at.line}: #{msg}")
   }
 
   def mark_failed {
@@ -335,9 +361,13 @@ def new_common(name: Str, depth: Int) -> Common {
 # What T and B have in common (Go's TB).
 pub interface TB {
   def name -> Str
+  #[track_caller]
   def log(msg: Str)
+  #[track_caller]
   def error(msg: Str)
+  #[track_caller]
   def fatal(msg: Str)
+  #[track_caller]
   def skip(msg: Str)
   def fail
   def fail_now
@@ -360,24 +390,29 @@ pub struct T {
   # The full name: the test's, then each subtest's, joined by `/`.
   pub def name -> Str { c.name }
 
-  # Logs a line (shown under the test, indented).
-  pub def log(msg: Str) { c.log(msg) }
+  # Logs a line (shown under the test, indented, after the caller's
+  # `file:line: `).
+  #[track_caller]
+  pub def log(msg: Str) { c.log_at(caller_location, msg) }
 
   # Log, then fail but keep going (Go's Error).
+  #[track_caller]
   pub def error(msg: Str) {
-    c.log(msg)
+    c.log_at(caller_location, msg)
     c.mark_failed
   }
 
   # Log, then fail and stop the test (Go's Fatal).
+  #[track_caller]
   pub def fatal(msg: Str) {
-    c.log(msg)
+    c.log_at(caller_location, msg)
     c.fail_now
   }
 
   # Log, then stop the test as skipped (Go's Skip).
+  #[track_caller]
   pub def skip(msg: Str) {
-    c.log(msg)
+    c.log_at(caller_location, msg)
     c.skip_now
   }
 
@@ -387,8 +422,8 @@ pub struct T {
   pub def skip_now { c.skip_now }
   pub def skipped? -> Bool { c.skipped? }
 
-  # Go's Helper marks a function to leave out of log locations; alx logs
-  # have no locations.
+  # Go's Helper marks a function to leave out of log locations; in alx the
+  # function is marked `#[track_caller]` instead (see the header).
   pub def helper {}
 
   # Go's Parallel: alx runs tests one at a time, so this changes nothing.
@@ -564,20 +599,24 @@ pub struct B {
   pub def n -> Int { iters.load }
 
   pub def name -> Str { c.name }
-  pub def log(msg: Str) { c.log(msg) }
+  #[track_caller]
+  pub def log(msg: Str) { c.log_at(caller_location, msg) }
 
+  #[track_caller]
   pub def error(msg: Str) {
-    c.log(msg)
+    c.log_at(caller_location, msg)
     c.mark_failed
   }
 
+  #[track_caller]
   pub def fatal(msg: Str) {
-    c.log(msg)
+    c.log_at(caller_location, msg)
     c.fail_now
   }
 
+  #[track_caller]
   pub def skip(msg: Str) {
-    c.log(msg)
+    c.log_at(caller_location, msg)
     c.skip_now
   }
 
@@ -671,7 +710,7 @@ pub struct B {
       }
     }
     return true if fast
-    fatal("B.Loop called with timer stopped") if !bs.lock { |s| s.timer_on }
+    fatal("B.loop called with timer stopped") if !bs.lock { |s| s.timer_on }
     first = bs.lock { |s| s.loop_n == 0 }
     if first {
       bs.lock { |s|
@@ -791,7 +830,7 @@ def bench_run(b: B, n: Int, f: (B) -> ~Unit) -> Bool {
   b.stop_timer
   unfinished = b.bs.lock { |s| s.loop_n > 0 && !s.loop_done }
   if unfinished && r.ok? && !b.failed? {
-    b.error("benchmark function returned without B.Loop() == false (break or return in loop?)")
+    b.error("benchmark function returned without B.loop == false (break or return in loop?)")
   }
   if e = r.err {
     msg = strip_prefix(e.message)

@@ -1,0 +1,859 @@
+#![test(external)]
+# Go's slices_test.go, sort_test.go and iter_test.go, translated (Go's
+# package slices_test). Not translated:
+#   - TestInsert's and TestGrow's allocation counts, TestConcat's allocation
+#     count, TestInsertGrowthRate, TestReplaceGrowthRate, TestIssue68488:
+#     allocation counts, capacities and pointer identity, which alx doesn't
+#     expose (no cap, no unsafe).
+#   - TestDeleteClearTail, TestDeleteFuncClearTail, TestCompactClearTail,
+#     TestCompactFuncClearTail, TestReplaceClearTail, TestReplaceEndClearTail:
+#     the zeroing of discarded elements (see the package header).
+#   - TestReplaceGrow: checks Go's pointers (`[]*int`) and the storage past
+#     len; the values half is in "replace" below.
+#   - TestInsertPanics, TestDeletePanics, TestReplacePanics rows that slice
+#     beyond len within cap (`a[:1:3]`): alx subslices have no spare capacity.
+#   - TestConcat_too_large, the big-slice half of TestRepeat, TestRepeatPanics'
+#     overflow rows: they need slices of MaxInt zero-size elements.
+#   - TestNilness: alx has no nil slices.
+#   - TestInference: named slice types (Go's `type S []int`).
+import "cmp"
+import "math"
+import "slices"
+import "strconv"
+import "strings"
+
+def ints -> [Int] {
+  [74, 59, 238, -784, 9845, 959, 905, 0, 0, 42, 7586, -5467984, 7586]
+}
+
+def float64s -> [Float] {
+  [74.3, 59.0, math.inf(1), 238.2, -784.0, 2.3, math.inf(-1), 9845.768, -959.7485, 905.0, 7.8, 7.8, 74.3, 59.0, math.inf(1), 238.2, -784.0, 2.3]
+}
+
+def strs -> [Str] {
+  ["", "Hello", "foo", "bar", "foo", "f00", "%*&^*&^&", "***"]
+}
+
+# A deterministic stand-in for Go's rand.Intn.
+struct Lcg {
+  st: [U64]
+
+  def intn!(n: Int) -> Int {
+    x = self.st[0] *% 6364136223846793005 +% 1442695040888963407
+    self.st[0] = x
+    ((x >> 33) % n.as_u64).as_i64
+  }
+}
+
+def new_lcg(seed: Int) -> Lcg {
+  Lcg.new(st: [seed.as_u64])
+}
+
+def equal_int_tests -> [([Int], [Int], Bool)] {
+  [([1], [], false), ([], [], true), ([1, 2, 3], [1, 2, 3], true), ([1, 2, 3], [1, 2, 3, 4], false)]
+}
+
+def equal_float_tests -> [([Float], [Float], Bool, Bool)] {
+  [([1.0, 2.0], [1.0, 2.0], true, true), ([1.0, 2.0, math.nan], [1.0, 2.0, math.nan], false, true)]
+}
+
+def equal[T](v1: T, v2: T) -> Bool {
+  v1 == v2
+}
+
+# equal, except that all NaNs are equal.
+def equal_nan[T](v1: T, v2: T) -> Bool {
+  v1 == v2 || (v1 != v1 && v2 != v2)
+}
+
+# Whether integers v1 and v2 differ by 1.
+def off_by_one(v1: Int, v2: Int) -> Bool {
+  v1 == v2 + 1 || v1 == v2 - 1
+}
+
+test "Equal" {
+  for t in equal_int_tests {
+    assert_eq slices.equal(t[0], t[1]), t[2]
+  }
+  for t in equal_float_tests {
+    assert_eq slices.equal(t[0], t[1]), t[2]
+  }
+}
+
+def int_to_letter(v: Int) -> Str {
+  Str.from_bytes([(v - 1 + 97).as_u8])
+}
+
+test "EqualFunc" {
+  for t in equal_int_tests {
+    assert_eq slices.equal_func(t[0], t[1]) { |a, b| equal(a, b) }, t[2]
+  }
+  for t in equal_float_tests {
+    assert_eq slices.equal_func(t[0], t[1]) { |a, b| equal(a, b) }, t[2]
+    assert_eq slices.equal_func(t[0], t[1]) { |a, b| equal_nan(a, b) }, t[3]
+  }
+  s1 = [1, 2, 3]
+  s2 = [2, 3, 4]
+  assert !slices.equal_func(s1, s1) { |a, b| off_by_one(a, b) }
+  assert slices.equal_func(s1, s2) { |a, b| off_by_one(a, b) }
+  s3 = ["a", "b", "c"]
+  s4 = ["A", "B", "C"]
+  assert slices.equal_func(s3, s4) { |a, b| strings.equal_fold(a, b) }
+  assert slices.equal_func(s1, s3) { |v1, v2| int_to_letter(v1) == v2 }
+}
+
+def compare_int_tests -> [([Int], [Int], Int)] {
+  [
+    ([1], [1], 0),
+    ([1], [], 1),
+    ([], [1], -1),
+    ([], [], 0),
+    ([1, 2, 3], [1, 2, 3], 0),
+    ([1, 2, 3], [1, 2, 3, 4], -1),
+    ([1, 2, 3, 4], [1, 2, 3], 1),
+    ([1, 2, 3], [1, 4, 3], -1),
+    ([1, 4, 3], [1, 2, 3], 1),
+    ([1, 4, 3], [1, 2, 3, 8, 9], 1),
+  ]
+}
+
+def compare_float_tests -> [([Float], [Float], Int)] {
+  nan = math.nan
+  [
+    ([], [], 0),
+    ([1.0], [1.0], 0),
+    ([nan], [nan], 0),
+    ([1.0, 2.0, nan], [1.0, 2.0, nan], 0),
+    ([1.0, nan, 3.0], [1.0, nan, 4.0], -1),
+    ([1.0, nan, 3.0], [1.0, 2.0, 4.0], -1),
+    ([1.0, nan, 3.0], [1.0, 2.0, nan], -1),
+    ([1.0, 2.0, 3.0], [1.0, 2.0, nan], 1),
+    ([1.0, 2.0, 3.0], [1.0, nan, 3.0], 1),
+    ([1.0, nan, 3.0, 4.0], [1.0, 2.0, nan], -1),
+  ]
+}
+
+test "Compare" {
+  for t in equal_int_tests {
+    assert_eq slices.compare(t[0], t[1]) == 0, t[2]
+  }
+  for t in equal_float_tests {
+    assert_eq slices.compare(t[0], t[1]) == 0, t[3]
+  }
+  for t in compare_int_tests {
+    assert_eq slices.compare(t[0], t[1]), t[2]
+  }
+  for t in compare_float_tests {
+    assert_eq slices.compare(t[0], t[1]), t[2]
+  }
+}
+
+# A cmp function from an equality: 0 if equal, else 1.
+def equal_to_cmp[T](v1: T, v2: T, eq: (T, T) -> Bool) -> Int {
+  eq(v1, v2) ? 0 : 1
+}
+
+test "CompareFunc" {
+  for t in equal_int_tests {
+    assert_eq slices.compare_func(t[0], t[1]) { |a, b| equal_to_cmp(a, b) { |x, y| x == y } } == 0, t[2]
+  }
+  for t in equal_float_tests {
+    assert_eq slices.compare_func(t[0], t[1]) { |a, b| equal_to_cmp(a, b) { |x, y| x == y } } == 0, t[2]
+  }
+  for t in compare_int_tests {
+    assert_eq slices.compare_func(t[0], t[1]) { |a, b| cmp.compare(a, b) }, t[2]
+  }
+  for t in compare_float_tests {
+    assert_eq slices.compare_func(t[0], t[1]) { |a, b| cmp.compare(a, b) }, t[2]
+  }
+  s1 = [1, 2, 3]
+  s2 = [2, 3, 4]
+  assert_eq slices.compare_func(s1, s2) { |a, b| equal_to_cmp(a, b) { |x, y| off_by_one(x, y) } }, 0
+  s3 = ["a", "b", "c"]
+  s4 = ["A", "B", "C"]
+  assert_eq slices.compare_func(s3, s4) { |a, b| strings.compare(a, b) }, 1
+  assert_eq slices.compare_func(s3, s4) { |a, b| strings.compare(strings.to_lower(a), strings.to_lower(b)) }, 0
+  assert_eq slices.compare_func(s1, s3) { |v1, v2| strings.compare(int_to_letter(v1), v2) }, 0
+}
+
+def index_tests -> [([Int], Int, Int)] {
+  [([], 0, -1), ([], 0, -1), ([1, 2, 3], 2, 1), ([1, 2, 2, 3], 2, 1), ([1, 2, 3, 2], 2, 1)]
+}
+
+test "Index" {
+  for t in index_tests {
+    assert_eq slices.index(t[0], t[1]), t[2]
+  }
+}
+
+test "IndexFunc" {
+  for t in index_tests {
+    v = t[1]
+    assert_eq slices.index_func(t[0]) { equal(v, it) }, t[2]
+  }
+  s1 = ["hi", "HI"]
+  assert_eq slices.index_func(s1) { equal("HI", it) }, 1
+  assert_eq slices.index_func(s1) { strings.equal_fold("HI", it) }, 0
+}
+
+test "Contains" {
+  for t in index_tests {
+    assert_eq slices.contains(t[0], t[1]), t[2] != -1
+  }
+}
+
+test "ContainsFunc" {
+  for t in index_tests {
+    v = t[1]
+    assert_eq slices.contains_func(t[0]) { equal(v, it) }, t[2] != -1
+  }
+  s1 = ["hi", "HI"]
+  assert slices.contains_func(s1) { equal("HI", it) }
+  assert !slices.contains_func(s1) { equal("hI", it) }
+  assert slices.contains_func(s1) { strings.equal_fold("hI", it) }
+}
+
+test "Insert" {
+  s = [1, 2, 3]
+  empty: [Int] = []
+  assert slices.equal(slices.insert(s, 0, empty), s)
+  tests: [([Int], Int, [Int], [Int])] = [
+    ([1, 2, 3], 0, [4], [4, 1, 2, 3]),
+    ([1, 2, 3], 1, [4], [1, 4, 2, 3]),
+    ([1, 2, 3], 3, [4], [1, 2, 3, 4]),
+    ([1, 2, 3], 2, [4, 5], [1, 2, 4, 5, 3]),
+  ]
+  for t in tests {
+    c = slices.clone(t[0])
+    assert_eq slices.insert(c, t[1], t[2]), t[3]
+  }
+}
+
+test "InsertOverlap" {
+  n_max = 10
+  a = [0; 10]
+  for n in 0..n_max {
+    for i in 0..n {
+      for x in 0..n_max {
+        for y in x..n_max {
+          for k in 0...n_max { a[k] = k }
+          want = a[0...i] + a[x...y] + a[i...n]
+          got = slices.insert(a[0...n], i, a[x...y])
+          assert got == want, "insert with overlap failed n=#{n} i=#{i} x=#{x} y=#{y}, got #{got} want #{want}"
+        }
+      }
+    }
+  }
+}
+
+test "InsertPanics" {
+  a = [0, 0, 0]
+  b = [0]
+  empty: [Int] = []
+  # There are no values.
+  assert_panics { slices.insert(a[0...1], -1, empty) }
+  assert_panics { slices.insert(a[0...1], 2, empty) }
+  # There are values.
+  assert_panics { slices.insert(a[0...1], -1, b) }
+  assert_panics { slices.insert(a[0...1], 2, b) }
+}
+
+test "Delete" {
+  tests: [([Int], Int, Int, [Int])] = [
+    ([1, 2, 3], 0, 0, [1, 2, 3]),
+    ([1, 2, 3], 0, 1, [2, 3]),
+    ([1, 2, 3], 3, 3, [1, 2, 3]),
+    ([1, 2, 3], 0, 2, [3]),
+    ([1, 2, 3], 0, 3, []),
+  ]
+  for t in tests {
+    c = slices.clone(t[0])
+    assert_eq slices.delete(c, t[1], t[2]), t[3]
+  }
+}
+
+test "DeleteFunc" {
+  tests: [([Int], (Int) -> Bool, [Int])] = [
+    ([], ->(_i: Int) -> Bool { true }, []),
+    ([1, 2, 3], ->(_i: Int) -> Bool { true }, []),
+    ([1, 2, 3], ->(_i: Int) -> Bool { false }, [1, 2, 3]),
+    ([1, 2, 3], ->(i: Int) -> Bool { i > 2 }, [1, 2]),
+    ([1, 2, 3], ->(i: Int) -> Bool { i < 2 }, [2, 3]),
+    ([10, 2, 30], ->(i: Int) -> Bool { i >= 10 }, [2]),
+  ]
+  for t in tests {
+    c = slices.clone(t[0])
+    assert_eq slices.delete_func(c, t[1]), t[2]
+  }
+}
+
+test "DeletePanics" {
+  s = [0, 1, 2, 3, 4][0...2]
+  assert_panics { slices.delete([42], -2, 1) }
+  assert_panics { slices.delete([42], 1, -1) }
+  assert_panics { slices.delete([42], 2, 3) }
+  assert_panics { slices.delete([42], 0, 2) }
+  assert_panics { slices.delete([42], 2, 2) }
+  assert_panics { slices.delete([42], 1, 0) }
+  assert_panics { slices.delete(s, 0, 4) }
+  assert_panics { slices.delete(s, 3, 3) }
+}
+
+test "Clone" {
+  s1 = [1, 2, 3]
+  s2 = slices.clone(s1)
+  assert_eq s2, s1
+  s1[0] = 4
+  assert_eq s2, [1, 2, 3]
+  assert_eq slices.clone(s1[0...0]).size, 0
+}
+
+def compact_tests -> [(Str, [Int], [Int])] {
+  [
+    ("nil", [], []),
+    ("one", [1], [1]),
+    ("sorted", [1, 2, 3], [1, 2, 3]),
+    ("2 items", [1, 1, 2], [1, 2]),
+    ("unsorted", [1, 2, 1], [1, 2, 1]),
+    ("many", [1, 2, 2, 3, 3, 4], [1, 2, 3, 4]),
+  ]
+}
+
+test "Compact" {
+  for t in compact_tests {
+    c = slices.clone(t[1])
+    assert slices.compact(c) == t[2], t[0]
+  }
+}
+
+test "CompactFunc" {
+  for t in compact_tests {
+    c = slices.clone(t[1])
+    assert slices.compact_func(c) { |a, b| equal(a, b) } == t[2], t[0]
+  }
+  s1 = ["a", "a", "A", "B", "b"]
+  c = slices.clone(s1)
+  assert_eq slices.compact_func(c) { |a, b| strings.equal_fold(a, b) }, ["a", "B"]
+}
+
+test "Grow" {
+  s1 = [1, 2, 3]
+  c = slices.clone(s1)
+  s2 = slices.grow(c, 1000)
+  assert_eq s2, s1
+  c = slices.clone(s1)
+  s3 = slices.grow(c, 2)
+  assert_eq s3, s1
+  assert_panics("cannot be negative") { slices.grow(s1, -1) }
+}
+
+test "Clip" {
+  s1 = [1, 2, 3, 4, 5, 6][0...3]
+  assert_eq s1.size, 3
+  s2 = slices.clip(s1)
+  assert_eq s2, s1
+}
+
+test "Reverse" {
+  even = [3, 1, 4, 1, 5, 9] # len = 6
+  slices.reverse(even)
+  assert_eq even, [9, 5, 1, 4, 1, 3]
+  odd = [3, 1, 4, 1, 5, 9, 2] # len = 7
+  slices.reverse(odd)
+  assert_eq odd, [2, 9, 5, 1, 4, 1, 3]
+  words = strings.fields("one two three")
+  slices.reverse(words)
+  assert_eq words, strings.fields("three two one")
+  singleton = ["one"]
+  slices.reverse(singleton)
+  assert_eq singleton, ["one"]
+  e: [Str] = []
+  slices.reverse(e)
+}
+
+# A baseline implementation of replace.
+def naive_replace[T](s: [T], i: Int, j: Int, v: [T]) -> [T] {
+  s = slices.delete(s, i, j)
+  slices.insert(s, i, v)
+}
+
+test "Replace" {
+  tests: [([Int], [Int], Int, Int)] = [
+    ([], [], 0, 0),
+    ([1, 2, 3, 4], [5], 1, 2),
+    ([1, 2, 3, 4], [5, 6, 7, 8], 1, 2),
+    ([0, 1, 2], [3, 4, 5, 6, 7], 0, 1),
+  ]
+  for t in tests {
+    ss = slices.clone(t[0])
+    vv = slices.clone(t[1])
+    want = naive_replace(ss, t[2], t[3], vv)
+    got = slices.replace(t[0], t[2], t[3], t[1])
+    assert_eq got, want
+  }
+}
+
+test "ReplacePanics" {
+  s = [0, 1, 2, 3, 4][0...2]
+  empty: [Int] = []
+  assert_panics { slices.replace([1, 2], 2, 1, [3]) }  # indexes out of order
+  assert_panics { slices.replace([1, 2], 1, 10, [3]) } # large index
+  assert_panics { slices.replace([1, 2], -1, 2, [3]) } # negative index
+  assert_panics { slices.replace(s, 0, 4, empty) }     # j > len(s)
+}
+
+test "ReplaceGrow (values)" {
+  mem = [1, 2, 3, 4, 5, 6]
+  memcopy = slices.clone(mem)
+  s = mem[0...5]
+  c = slices.clone(s)
+  original = s
+  s = slices.replace(s, 1, 3, [99, 99, 99, 99])
+  assert_eq s, [1, 99, 99, 99, 99, 4, 5]
+  assert_eq original, c
+  assert_eq mem, memcopy
+}
+
+test "ReplaceOverlap" {
+  n_max = 10
+  a = [0; 10]
+  for n in 0..n_max {
+    for i in 0..n {
+      for j in i..n {
+        for x in 0..n_max {
+          for y in x..n_max {
+            for k in 0...n_max { a[k] = k }
+            want = a[0...i] + a[x...y] + a[j...n]
+            got = slices.replace(a[0...n], i, j, a[x...y])
+            assert got == want, "replace with overlap failed n=#{n} i=#{i} j=#{j} x=#{x} y=#{y}, got #{got} want #{want}"
+          }
+        }
+      }
+    }
+  }
+}
+
+test "Concat" {
+  cases: [([[Int]], [Int])] = [
+    ([[]], []),
+    ([[1]], [1]),
+    ([[1], [2]], [1, 2]),
+    ([[1], [], [2]], [1, 2]),
+  ]
+  for c in cases {
+    assert_eq slices.concat(c[0]), c[1]
+  }
+}
+
+test "Repeat" {
+  cases: [([Int], Int, [Int])] = [
+    ([], 0, []),
+    ([], 1, []),
+    ([], math.MAX_INT, []),
+    ([0], 0, []),
+    ([0], 1, [0]),
+    ([0], 2, [0, 0]),
+    ([0], 3, [0, 0, 0]),
+    ([0], 4, [0, 0, 0, 0]),
+    ([0, 1], 0, []),
+    ([0, 1], 1, [0, 1]),
+    ([0, 1], 2, [0, 1, 0, 1]),
+    ([0, 1], 3, [0, 1, 0, 1, 0, 1]),
+    ([0, 1], 4, [0, 1, 0, 1, 0, 1, 0, 1]),
+    ([0, 1, 2], 0, []),
+    ([0, 1, 2], 1, [0, 1, 2]),
+    ([0, 1, 2], 2, [0, 1, 2, 0, 1, 2]),
+    ([0, 1, 2], 3, [0, 1, 2, 0, 1, 2, 0, 1, 2]),
+    ([0, 1, 2], 4, [0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2]),
+  ]
+  for c in cases {
+    assert_eq slices.repeat(c[0], c[1]), c[2]
+  }
+}
+
+test "RepeatPanics" {
+  e: [Int] = []
+  assert_panics("cannot be negative") { slices.repeat(e, -1) }
+  assert_panics("overflows") { slices.repeat([0, 0, 0], math.MAX_INT) }
+  assert_panics("overflows") { slices.repeat([0, 0], 1 + math.MAX_INT / 2) }
+}
+
+# --- sort_test.go ---
+
+test "SortIntSlice" {
+  data = ints
+  slices.sort(data)
+  assert slices.is_sorted(data), "got #{data}"
+}
+
+test "SortFuncIntSlice" {
+  data = ints
+  slices.sort_func(data) { |a, b| a - b }
+  assert slices.is_sorted(data), "got #{data}"
+}
+
+test "SortFloat64Slice" {
+  data = float64s
+  slices.sort(data)
+  assert slices.is_sorted(data), "got #{data}"
+}
+
+test "SortStringSlice" {
+  data = strs
+  slices.sort(data)
+  assert slices.is_sorted(data), "got #{data}"
+}
+
+test "SortLarge_Random" {
+  n = 1000000
+  r = new_lcg(1)
+  data = [0; 1000000]
+  for i in 0...n { data[i] = r.intn!(100) }
+  assert !slices.is_sorted(data), "terrible rand"
+  slices.sort(data)
+  assert slices.is_sorted(data), "sort didn't sort - 1M ints"
+}
+
+struct IntPair {
+  a: Int
+  b: Int
+}
+
+# Pairs compare on a only.
+def int_pair_cmp(x: IntPair, y: IntPair) -> Int {
+  x.a - y.a
+}
+
+# Records the initial order in b.
+def init_b(d: [IntPair]) {
+  for i in 0...d.size { d[i].b = i }
+}
+
+# Whether a-equal elements were not reordered (reversed: expect reverse
+# ordering).
+def in_order(d: [IntPair], reversed: Bool) -> Bool {
+  last_a = -1
+  last_b = 0
+  for p in d {
+    if last_a != p.a {
+      last_a = p.a
+      last_b = p.b
+      next
+    }
+    if !reversed {
+      return false if p.b <= last_b
+    } else {
+      return false if p.b >= last_b
+    }
+    last_b = p.b
+  }
+  true
+}
+
+test "Stability" {
+  n = 100000
+  m = 1000
+  data = [IntPair.new; 100000]
+  r = new_lcg(2)
+  # random distribution
+  for i in 0...n { data[i].a = r.intn!(m) }
+  assert !slices.is_sorted_func(data) { |x, y| int_pair_cmp(x, y) }, "terrible rand"
+  init_b(data)
+  slices.sort_stable_func(data) { |x, y| int_pair_cmp(x, y) }
+  assert slices.is_sorted_func(data) { |x, y| int_pair_cmp(x, y) }, "Stable didn't sort"
+  assert in_order(data, false), "Stable wasn't stable"
+  # already sorted
+  init_b(data)
+  slices.sort_stable_func(data) { |x, y| int_pair_cmp(x, y) }
+  assert slices.is_sorted_func(data) { |x, y| int_pair_cmp(x, y) }, "Stable shuffled sorted (order)"
+  assert in_order(data, false), "Stable shuffled sorted (stability)"
+  # sorted reversed
+  for i in 0...n { data[i].a = n - i }
+  init_b(data)
+  slices.sort_stable_func(data) { |x, y| int_pair_cmp(x, y) }
+  assert slices.is_sorted_func(data) { |x, y| int_pair_cmp(x, y) }, "Stable didn't sort"
+  assert in_order(data, false), "Stable wasn't stable"
+}
+
+struct S {
+  a: Int
+  b: Str
+}
+
+def cmp_s(s1: S, s2: S) -> Int {
+  cmp.compare(s1.a, s2.a)
+}
+
+test "MinMax" {
+  tests: [([Int], Int, Int)] = [
+    ([7], 7, 7),
+    ([1, 2], 1, 2),
+    ([2, 1], 1, 2),
+    ([1, 2, 3], 1, 3),
+    ([3, 2, 1], 1, 3),
+    ([2, 1, 3], 1, 3),
+    ([2, 2, 3], 2, 3),
+    ([3, 2, 3], 2, 3),
+    ([0, 2, -9], -9, 2),
+  ]
+  for t in tests {
+    assert_eq slices.min(t[0]), t[1]
+    assert_eq slices.min_func(t[0]) { |a, b| a - b }, t[1]
+    assert_eq slices.max(t[0]), t[2]
+    assert_eq slices.max_func(t[0]) { |a, b| a - b }, t[2]
+  }
+  svals = [S.new(1, "a"), S.new(2, "a"), S.new(1, "b"), S.new(2, "b")]
+  assert_eq slices.min_func(svals) { |x, y| cmp_s(x, y) }, S.new(1, "a")
+  assert_eq slices.max_func(svals) { |x, y| cmp_s(x, y) }, S.new(2, "a")
+}
+
+test "MinMaxNaNs" {
+  fs = [1.0, 999.9, 3.14, -400.4, -5.14]
+  assert_eq slices.min(fs), -400.4
+  assert_eq slices.max(fs), 999.9
+  # No matter which element of fs is replaced with a NaN, both min and max
+  # should propagate the NaN to their output.
+  for i in 0...fs.size {
+    testfs = slices.clone(fs)
+    testfs[i] = math.nan
+    assert math.is_nan(slices.min(testfs)), "min #{testfs}"
+    assert math.is_nan(slices.max(testfs)), "max #{testfs}"
+  }
+}
+
+test "MinMaxPanics" {
+  empty: [Int] = []
+  assert_panics("slices.Min: empty list") { slices.min(empty) }
+  assert_panics("slices.Max: empty list") { slices.max(empty) }
+  assert_panics("slices.MinFunc: empty list") { slices.min_func(empty) { |a, b| a - b } }
+  assert_panics("slices.MaxFunc: empty list") { slices.max_func(empty) { |a, b| a - b } }
+}
+
+test "BinarySearch" {
+  str1 = ["foo"]
+  str2 = ["ab", "ca"]
+  str3 = ["mo", "qo", "vo"]
+  str4 = ["ab", "ad", "ca", "xy"]
+  # slice with repeating elements
+  str_repeats = ["ba", "ca", "da", "da", "da", "ka", "ma", "ma", "ta"]
+  # slice with all element equal
+  str_same = ["xx", "xx", "xx"]
+  empty: [Str] = []
+  tests: [([Str], Str, Int, Bool)] = [
+    (empty, "foo", 0, false),
+    (empty, "", 0, false),
+    (str1, "foo", 0, true),
+    (str1, "bar", 0, false),
+    (str1, "zx", 1, false),
+    (str2, "aa", 0, false),
+    (str2, "ab", 0, true),
+    (str2, "ad", 1, false),
+    (str2, "ca", 1, true),
+    (str2, "ra", 2, false),
+    (str3, "bb", 0, false),
+    (str3, "mo", 0, true),
+    (str3, "nb", 1, false),
+    (str3, "qo", 1, true),
+    (str3, "tr", 2, false),
+    (str3, "vo", 2, true),
+    (str3, "xr", 3, false),
+    (str4, "aa", 0, false),
+    (str4, "ab", 0, true),
+    (str4, "ac", 1, false),
+    (str4, "ad", 1, true),
+    (str4, "ax", 2, false),
+    (str4, "ca", 2, true),
+    (str4, "cc", 3, false),
+    (str4, "dd", 3, false),
+    (str4, "xy", 3, true),
+    (str4, "zz", 4, false),
+    (str_repeats, "da", 2, true),
+    (str_repeats, "db", 5, false),
+    (str_repeats, "ma", 6, true),
+    (str_repeats, "mb", 8, false),
+    (str_same, "xx", 0, true),
+    (str_same, "ab", 0, false),
+    (str_same, "zz", 3, false),
+  ]
+  for t in tests {
+    assert_eq slices.binary_search(t[0], t[1]), (t[2], t[3])
+    assert_eq slices.binary_search_func(t[0], t[1]) { |a, b| strings.compare(a, b) }, (t[2], t[3])
+  }
+}
+
+test "BinarySearchInts" {
+  data = [20, 30, 40, 50, 60, 70, 80, 90]
+  tests = [(20, 0, true), (23, 1, false), (43, 3, false), (80, 6, true)]
+  for t in tests {
+    assert_eq slices.binary_search(data, t[0]), (t[1], t[2])
+    assert_eq slices.binary_search_func(data, t[0]) { |a, b| a - b }, (t[1], t[2])
+  }
+}
+
+test "BinarySearchFloats" {
+  data = [math.nan, -0.25, 0.0, 1.4]
+  tests = [(math.nan, 0, true), (math.inf(-1), 1, false), (-0.25, 1, true), (0.0, 2, true), (1.4, 3, true), (1.5, 4, false)]
+  for t in tests {
+    assert_eq slices.binary_search(data, t[0]), (t[1], t[2])
+  }
+}
+
+test "BinarySearchFunc" {
+  data = [1, 10, 11, 2] # sorted lexicographically
+  assert_eq slices.binary_search_func(data, "2") { |a, b| strings.compare(strconv.itoa(a), b) }, (3, true)
+}
+
+# --- iter_test.go ---
+
+def upto(size: Int) -> [Int] {
+  s: [Int] = []
+  for i in 0...size { s << i }
+  s
+}
+
+test "All" {
+  for size in 0...10 {
+    s = upto(size)
+    ei = 0
+    ev = 0
+    cnt = 0
+    for p in slices.all(s) {
+      assert p[0] == ei && p[1] == ev, "at iteration #{cnt} got #{p}"
+      ei += 1
+      ev += 1
+      cnt += 1
+    }
+    assert_eq cnt, size
+  }
+}
+
+test "Backward" {
+  for size in 0...10 {
+    s = upto(size)
+    ei = size - 1
+    ev = size - 1
+    cnt = 0
+    for p in slices.backward(s) {
+      assert p[0] == ei && p[1] == ev, "at iteration #{cnt} got #{p}"
+      ei -= 1
+      ev -= 1
+      cnt += 1
+    }
+    assert_eq cnt, size
+  }
+}
+
+test "Values" {
+  for size in 0...10 {
+    s = upto(size)
+    ev = 0
+    cnt = 0
+    for v in slices.values(s) {
+      assert_eq v, ev
+      ev += 1
+      cnt += 1
+    }
+    assert_eq cnt, size
+  }
+}
+
+# Go's testSeq: 0, 2, 4, 6, 8.
+def test_seq -> [Int] {
+  out: [Int] = []
+  i = 0
+  while i < 10 {
+    out << i
+    i += 2
+  }
+  out
+}
+
+test "AppendSeq" {
+  assert_eq slices.append_seq([1, 2], test_seq), [1, 2, 0, 2, 4, 6, 8]
+}
+
+test "Collect" {
+  assert_eq slices.collect(test_seq), [0, 2, 4, 6, 8]
+}
+
+def iter_tests -> [[Str]] {
+  [[], ["a"], ["a", "b"], ["b", "a"], strs]
+}
+
+test "ValuesAppendSeq" {
+  for prefix in iter_tests {
+    for s in iter_tests {
+      got = slices.append_seq(slices.clone(prefix), slices.values(s))
+      assert_eq got, prefix + s
+    }
+  }
+}
+
+test "ValuesCollect" {
+  for s in iter_tests {
+    assert_eq slices.collect(slices.values(s)), s
+  }
+}
+
+test "Sorted" {
+  s = slices.sorted(slices.values(ints))
+  assert slices.is_sorted(s), "got #{s}"
+}
+
+test "SortedFunc" {
+  s = slices.sorted_func(slices.values(ints)) { |a, b| a - b }
+  assert slices.is_sorted(s), "got #{s}"
+}
+
+test "SortedStableFunc" {
+  n = 1000
+  m = 100
+  data = [IntPair.new; 1000]
+  r = new_lcg(3)
+  for i in 0...n { data[i].a = r.intn!(m) }
+  init_b(data)
+  s = slices.sorted_stable_func(slices.values(data)) { |x, y| int_pair_cmp(x, y) }
+  assert slices.is_sorted_func(s) { |x, y| int_pair_cmp(x, y) }, "didn't sort"
+  assert in_order(s, false), "wasn't stable"
+  # Go's iterVal(Backward(data)): the values, last first.
+  back = slices.backward(data).map { it[1] }
+  s = slices.sorted_stable_func(back) { |x, y| int_pair_cmp(x, y) }
+  assert slices.is_sorted_func(s) { |x, y| int_pair_cmp(x, y) }, "didn't sort reverse"
+  assert in_order(s, true), "wasn't stable on reverse"
+}
+
+test "Chunk" {
+  cases: [(Str, [Int], Int, [[Int]])] = [
+    ("nil", [], 1, []),
+    ("empty", [], 1, []),
+    ("short", [1, 2], 3, [[1, 2]]),
+    ("one", [1, 2], 2, [[1, 2]]),
+    ("even", [1, 2, 3, 4], 2, [[1, 2], [3, 4]]),
+    ("odd", [1, 2, 3, 4, 5], 2, [[1, 2], [3, 4], [5]]),
+  ]
+  for tc in cases {
+    chunks = slices.chunk(tc[1], tc[2])
+    assert chunks == tc[3], "#{tc[0]}: chunk(#{tc[1]}, #{tc[2]}) = #{chunks}, want #{tc[3]}"
+    next if chunks.size == 0
+    # Appending to the end of the first chunk does not clobber the beginning
+    # of the next chunk.
+    s = slices.clone(tc[1])
+    chunks[0] << -1
+    assert s == tc[1], "#{tc[0]}: slice was clobbered: #{s}"
+    assert tc[1] == slices.clone(s), tc[0]
+  }
+}
+
+test "ChunkPanics" {
+  e: [Int] = []
+  assert_panics("cannot be less than 1") { slices.chunk(e, 0) }
+}
+
+test "ChunkRange" {
+  got: [[Int]] = []
+  for c in slices.chunk([1, 2, 3, 4, -100], 2) {
+    break if got.size == 2
+    got << c
+  }
+  assert_eq got, [[1, 2], [3, 4]]
+}

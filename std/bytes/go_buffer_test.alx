@@ -1,0 +1,467 @@
+#![test(external)]
+# Go's buffer_test.go, translated (external, as Go's is).
+#
+# Not translated, and why:
+#  - TestNewBufferShallow, TestWriteAppend's second half, TestGrow's
+#    no-allocation check: allocation counts (no counter in alx); the data
+#    each checks is checked.
+#  - TestCapWithSliceAndWrittenData: NewBuffer(make([]byte, 0, 10)) needs a
+#    slice with spare capacity, which alx doesn't have (D6).
+#  - TestNil: no nil *Buffer.
+#  - TestMixedReadsAndWrites uses a fixed pseudo-random sequence instead of
+#    math/rand's.
+#  - Benchmarks.
+
+import "bytes"
+import "io"
+import "strconv"
+import "unicode/utf8"
+
+N = 10000
+
+# The test data: 'a' + i % 26, N bytes.
+def test_bytes -> [Byte] {
+  out: [Byte] = [0; N]
+  for i in 0...N { out[i] = (97 + i % 26).as_u8 }
+  out
+}
+def test_string -> Str { Str.from_bytes(test_bytes) }
+
+# The contents of buf match s.
+#[track_caller]
+def check_buf(name: Str, buf: bytes.Buffer, want: Str) {
+  bs = buf.bytes
+  str = buf.string
+  assert buf.len == bs.size, "#{name}: buf.len == #{buf.len}, bytes.size == #{bs.size}"
+  assert buf.len == str.size, "#{name}: buf.len == #{buf.len}, string.size == #{str.size}"
+  assert buf.len == want.size, "#{name}: buf.len == #{buf.len}, want.size == #{want.size}"
+  assert Str.from_bytes(bs) == want, "#{name}: contents differ"
+}
+
+# Fills buf through n writes of fus; s is buf's initial contents. Returns the
+# final contents.
+#[track_caller]
+def fill_string(name: Str, buf: bytes.Buffer, s: Str, n: Int, fus: Str) -> Str {
+  b = buf
+  check_buf(name + " (fill 1)", b, s)
+  out = s
+  for _i in 0...n {
+    m = b.write_string!(fus)
+    assert m == fus.size, "#{name} (fill 2): m == #{m}, expected #{fus.size}"
+    out = out + fus
+    check_buf(name + " (fill 4)", b, out)
+  }
+  out
+}
+
+#[track_caller]
+def fill_bytes(name: Str, buf: bytes.Buffer, s: Str, n: Int, fub: [Byte]) -> Str {
+  b = buf
+  check_buf(name + " (fill 1)", b, s)
+  out = s
+  for _i in 0...n {
+    m = b.write!(fub)
+    assert m == fub.size, "#{name} (fill 2): m == #{m}, expected #{fub.size}"
+    out = out + Str.from_bytes(fub)
+    check_buf(name + " (fill 4)", b, out)
+  }
+  out
+}
+
+# Empties buf through reads into fub; s is buf's contents.
+#[track_caller]
+def empty(name: Str, buf: bytes.Buffer, s: Str, fub: [Byte]) {
+  b = buf
+  check_buf(name + " (empty 1)", b, s)
+  rest = s
+  loop {
+    n = b.read!(fub)
+    break if n == 0
+    rest = rest[n...rest.size]
+    check_buf(name + " (empty 3)", b, rest)
+  }
+  check_buf(name + " (empty 4)", b, "")
+}
+
+# strconv.AppendInt(b, i, 10).
+def append_int(b: [Byte], i: Int) -> [Byte] { b + strconv.itoa(i).bytes.to_a }
+
+def zeros(n: Int) -> [Byte] {
+  out: [Byte] = [0; n]
+  out
+}
+
+test "NewBuffer" {
+  check_buf("NewBuffer", bytes.new_buffer(test_bytes), test_string)
+}
+
+test "NewBufferString" {
+  check_buf("NewBufferString", bytes.new_buffer_string(test_string), test_string)
+}
+
+test "BasicOperations" {
+  buf = bytes.new_buffer([])
+  tb = test_bytes
+  ts = test_string
+  for _i in 0...5 {
+    check_buf("BasicOperations (1)", buf, "")
+    buf.reset!
+    check_buf("BasicOperations (2)", buf, "")
+    buf.truncate!(0)
+    check_buf("BasicOperations (3)", buf, "")
+    assert_eq buf.write!(tb[0...1]), 1
+    check_buf("BasicOperations (4)", buf, "a")
+    buf.write_byte!(ts[1])
+    check_buf("BasicOperations (5)", buf, "ab")
+    assert_eq buf.write!(tb[2...26]), 24
+    check_buf("BasicOperations (6)", buf, ts[0...26])
+    buf.truncate!(26)
+    check_buf("BasicOperations (7)", buf, ts[0...26])
+    buf.truncate!(20)
+    check_buf("BasicOperations (8)", buf, ts[0...20])
+    empty("BasicOperations (9)", buf, ts[0...20], zeros(5))
+    empty("BasicOperations (10)", buf, "", zeros(100))
+    buf.write_byte!(ts[1])
+    assert_eq buf.read_byte!, ts[1]
+    assert buf.read_byte!.none?, "read_byte! at the end"
+  }
+}
+
+test "LargeStringWrites" {
+  buf = bytes.new_buffer([])
+  i = 3
+  while i < 30 {
+    s = fill_string("LargeWrites (1)", buf, "", 5, test_string)
+    empty("LargeStringWrites (2)", buf, s, zeros(N / i))
+    i += 3
+  }
+  check_buf("LargeStringWrites (3)", buf, "")
+}
+
+test "LargeByteWrites" {
+  buf = bytes.new_buffer([])
+  i = 3
+  while i < 30 {
+    s = fill_bytes("LargeWrites (1)", buf, "", 5, test_bytes)
+    empty("LargeByteWrites (2)", buf, s, zeros(N / i))
+    i += 3
+  }
+  check_buf("LargeByteWrites (3)", buf, "")
+}
+
+test "LargeStringReads" {
+  buf = bytes.new_buffer([])
+  i = 3
+  while i < 30 {
+    s = fill_string("LargeReads (1)", buf, "", 5, test_string[0...N / i])
+    empty("LargeReads (2)", buf, s, zeros(N))
+    i += 3
+  }
+  check_buf("LargeStringReads (3)", buf, "")
+}
+
+test "LargeByteReads" {
+  buf = bytes.new_buffer([])
+  i = 3
+  while i < 30 {
+    s = fill_bytes("LargeReads (1)", buf, "", 5, test_bytes[0...N / i])
+    empty("LargeReads (2)", buf, s, zeros(N))
+    i += 3
+  }
+  check_buf("LargeByteReads (3)", buf, "")
+}
+
+test "MixedReadsAndWrites" {
+  buf = bytes.new_buffer([])
+  s = ""
+  seed = 12345
+  for i in 0...50 {
+    seed = (seed * 1103515245 + 12345) % 2147483648
+    wlen = seed % N
+    if i % 2 == 0 {
+      s = fill_string("MixedReadsAndWrites (1)", buf, s, 1, test_string[0...wlen])
+    } else {
+      s = fill_bytes("MixedReadsAndWrites (1)", buf, s, 1, test_bytes[0...wlen])
+    }
+    seed = (seed * 1103515245 + 12345) % 2147483648
+    n = buf.read!(zeros(seed % N))
+    s = s[n...s.size]
+  }
+  empty("MixedReadsAndWrites (2)", buf, s, zeros(buf.len))
+}
+
+test "CapWithPreallocatedSlice" {
+  assert_eq bytes.new_buffer(zeros(10)).cap, 10
+}
+
+test "ReadFrom" {
+  buf = bytes.new_buffer([])
+  i = 3
+  while i < 30 {
+    s = fill_bytes("ReadFrom (1)", buf, "", 5, test_bytes[0...N / i])
+    b = bytes.new_buffer([])
+    b.~read_from!(buf)
+    empty("ReadFrom (2)", b, s, zeros(N))
+    i += 3
+  }
+}
+
+struct PanicReader {
+  panics: Bool
+  def read!(_p: [Byte]) -> ~Int {
+    panic("oops") if panics
+    0
+  }
+}
+
+# An empty Buffer stays empty when it's grown before a read that panics.
+test "ReadFromPanicReader" {
+  buf = bytes.new_buffer([])
+  assert_eq buf.~read_from!(PanicReader.new(panics: false)), 0
+  check_buf("ReadFromPanicReader (1)", buf, "")
+  buf2 = bytes.new_buffer([])
+  assert_panics("oops") {
+    b = buf2
+    b.read_from!(PanicReader.new(panics: true)).unwrap
+  }
+  check_buf("ReadFromPanicReader (2)", buf2, "")
+}
+
+struct NegativeReader {
+  def read!(_p: [Byte]) -> ~Int { -1 }
+}
+
+test "ReadFromNegativeReader" {
+  assert_panics("bytes.Buffer: reader returned negative count from read!") {
+    b = bytes.new_buffer([])
+    b.read_from!(NegativeReader.new).unwrap
+  }
+}
+
+test "WriteTo" {
+  buf = bytes.new_buffer([])
+  i = 3
+  while i < 30 {
+    s = fill_bytes("WriteTo (1)", buf, "", 5, test_bytes[0...N / i])
+    b = bytes.new_buffer([])
+    buf.~write_to!(b)
+    empty("WriteTo (2)", b, s, zeros(N))
+    i += 3
+  }
+}
+
+test "WriteAppend" {
+  got = bytes.new_buffer([])
+  want: [Byte] = []
+  for i in 0...1000 {
+    b = append_int(got.available_buffer, i)
+    want = append_int(want, i)
+    got.write!(b)
+  }
+  assert bytes.equal(got.bytes, want), "bytes = #{got.string}"
+  got.reset!
+  for i in 0...1000 {
+    got.write!(append_int(got.available_buffer, i))
+  }
+  assert bytes.equal(got.bytes, want), "after reset!: bytes = #{got.string}"
+}
+
+test "RuneIO" {
+  n_rune = 1000
+  b: [Byte] = []
+  buf = bytes.new_buffer([])
+  for r in 0...n_rune {
+    enc = utf8.encode_rune(r.as_i32)
+    assert_eq buf.write_rune!(r.as_i32), enc.size
+    b = b + enc
+  }
+  assert bytes.equal(buf.bytes, b), "incorrect result from write_rune!"
+  # Read it back with read_rune!.
+  for r in 0...n_rune {
+    got = buf.read_rune!
+    assert_eq got, (r.as_i32, utf8.rune_len(r.as_i32))
+  }
+  # unread_rune! at the end.
+  buf.reset!
+  assert !buf.unread_rune!.ok?, "unread_rune! at the end: got no error"
+  assert buf.read_rune!.none?, "read_rune! at the end"
+  assert !buf.unread_rune!.ok?, "unread_rune! after read_rune! at the end: got no error"
+  # Not at the end.
+  buf.write!(b)
+  for r in 0...n_rune {
+    r1 = buf.read_rune!.unwrap
+    assert buf.unread_rune!.ok?, "unread_rune! of #{r}"
+    r2 = buf.read_rune!.unwrap
+    assert r1 == r2 && r1[0] == r.as_i32, "read_rune! after unread_rune! of #{r}"
+  }
+}
+
+test "WriteInvalidRune" {
+  invalid: [Rune] = [-1, utf8.MAX_RUNE + 1]
+  for r in invalid {
+    buf = bytes.new_buffer([])
+    buf.write_rune!(r)
+    check_buf("WriteInvalidRune (#{r})", buf, "�")
+  }
+}
+
+test "Next" {
+  b: [Byte] = [0, 1, 2, 3, 4]
+  tmp: [Byte] = [0; 5]
+  for i in 0..5 {
+    for j in i..5 {
+      for k in 0..6 {
+        # A buffer of length j at offset i asked for next!(k).
+        buf = bytes.new_buffer(b[0...j])
+        assert_eq buf.read!(tmp[0...i]), i
+        bb = buf.next!(k)
+        want = k > j - i ? j - i : k
+        assert bb.size == want, "in #{i},#{j}: next!(#{k}).size == #{bb.size}"
+        for l in 0...bb.size {
+          assert bb[l] == (l + i).as_u8, "in #{i},#{j}: next!(#{k})[#{l}] = #{bb[l]}"
+        }
+      }
+    }
+  }
+}
+
+# (buffer, delim, the reads, whether the last ends without delim: Go's io.EOF)
+def read_bytes_tests -> [(Str, Byte, [Str], Bool)] {
+  [
+    ("", 0, [""], true),
+    ("a\x00", 0, ["a\x00"], false),
+    ("abbbaaaba", 98, ["ab", "b", "b", "aaab"], false),
+    ("hello\x01world", 1, ["hello\x01"], false),
+    ("foo\nbar", 0, ["foo\nbar"], true),
+    ("alpha\nbeta\ngamma\n", 10, ["alpha\n", "beta\n", "gamma\n"], false),
+    ("alpha\nbeta\ngamma", 10, ["alpha\n", "beta\n", "gamma"], true),
+  ]
+}
+
+test "ReadBytes" {
+  for tc in read_bytes_tests {
+    buf = bytes.new_buffer_string(tc[0])
+    eof = false
+    for expected in tc[2] {
+      got = buf.read_bytes!(tc[1])
+      line = got || []
+      assert_eq Str.from_bytes(line), expected
+      eof = line.size == 0 || line[line.size - 1] != tc[1]
+      break if eof
+    }
+    assert_eq eof, tc[3]
+  }
+}
+
+test "ReadString" {
+  for tc in read_bytes_tests {
+    buf = bytes.new_buffer_string(tc[0])
+    eof = false
+    for expected in tc[2] {
+      line = buf.read_string!(tc[1]) || ""
+      assert_eq line, expected
+      eof = line.size == 0 || line[line.size - 1] != tc[1]
+      break if eof
+    }
+    assert_eq eof, tc[3]
+  }
+}
+
+test "Peek" {
+  tests = [
+    ("", 0, 0, "", false), ("aaa", 0, 3, "aaa", false), ("foobar", 0, 2, "fo", false),
+    ("a", 0, 2, "a", true), ("helloworld", 4, 3, "owo", false), ("helloworld", 5, 5, "world", false),
+    ("helloworld", 5, 6, "world", true), ("helloworld", 10, 1, "", true),
+  ]
+  for tc in tests {
+    buf = bytes.new_buffer_string(tc[0])
+    buf.next!(tc[1])
+    got = buf.peek(tc[2])
+    assert_eq Str.from_bytes(got), tc[3]
+    # Go's io.EOF: fewer than n bytes.
+    assert_eq got.size < tc[2], tc[4]
+    assert_eq buf.len, tc[0].size - tc[1]
+  }
+}
+
+test "Grow" {
+  tmp: [Byte] = [0; 72]
+  for grow_len in [0, 100, 1000, 10000, 100000] {
+    for start_len in [0, 100, 1000, 10000, 100000] {
+      x_bytes = bytes.repeat([120], start_len)
+      buf = bytes.new_buffer(x_bytes)
+      # Reading moves the offset, which is good to test.
+      read_bytes = buf.read!(tmp)
+      y_bytes = bytes.repeat([121], grow_len)
+      buf.grow!(grow_len)
+      assert buf.available >= grow_len, "grow!(#{grow_len}) left #{buf.available}"
+      cap = buf.cap
+      buf.write!(y_bytes)
+      assert_eq buf.cap, cap
+      assert bytes.equal(buf.bytes[0...start_len - read_bytes], x_bytes[read_bytes...x_bytes.size]), "bad initial data at #{start_len} #{grow_len}"
+      assert bytes.equal(buf.bytes[start_len - read_bytes...start_len - read_bytes + grow_len], y_bytes), "bad written data at #{start_len} #{grow_len}"
+    }
+  }
+}
+
+test "GrowOverflow" {
+  assert_panics("bytes.Buffer: too large") {
+    buf = bytes.new_buffer(zeros(1))
+    buf.grow!(0x7FFF_FFFF_FFFF_FFFF)
+  }
+}
+
+# Was a bug: used to give EOF reading an empty slice at EOF.
+test "ReadEmptyAtEOF" {
+  b = bytes.Buffer.new
+  assert_eq b.read!([]), 0
+}
+
+test "UnreadByte" {
+  b = bytes.new_buffer([])
+  # At the end.
+  assert !b.unread_byte!.ok?, "unread_byte! at the end: got no error"
+  assert b.read_byte!.none?, "read_byte! at the end"
+  assert !b.unread_byte!.ok?, "unread_byte! after read_byte! at the end: got no error"
+  # Not at the end.
+  b.write_string!("abcdefghijklmnopqrstuvwxyz")
+  # After an unsuccessful read.
+  assert_eq b.read!([]), 0
+  assert !b.unread_byte!.ok?, "unread_byte! after read!([]): got no error"
+  # After a successful read.
+  assert b.read_bytes!(109).some?, "read_bytes!"
+  b.~unread_byte!
+  assert_eq b.read_byte!, 109
+}
+
+# The buffer compacts now and then (Go's issue 5154).
+test "BufferGrowth" {
+  b = bytes.new_buffer([])
+  buf = zeros(1024)
+  b.write!(buf[0...1])
+  cap0 = 0
+  for i in 0...5 << 10 {
+    b.write!(buf)
+    b.read!(buf)
+    cap0 = b.cap if i == 0
+  }
+  cap1 = b.cap
+  # grow allows 2x capacity slop before sliding, so the threshold is 3x.
+  assert cap1 <= cap0 * 3, "buffer cap = #{cap1}; too big (grew from #{cap0})"
+}
+
+# reader_test.go's TestReaderDoubleUnreadRune (it tests Buffer).
+test "ReaderDoubleUnreadRune" {
+  buf = bytes.new_buffer("groucho".bytes.to_a)
+  assert buf.read_rune!.some?, "read_rune!"
+  buf.~unread_byte!
+  assert !buf.unread_byte!.ok?, "unread_byte!: expected an error"
+}
+
+# The errors read as Go's, in alx's names (S10).
+test "Buffer error messages" {
+  b = bytes.new_buffer([])
+  assert_eq b.unread_byte!.err.unwrap.message, "bytes.Buffer: unread_byte!: previous operation was not a successful read"
+  assert_eq b.unread_rune!.err.unwrap.message, "bytes.Buffer: unread_rune!: previous operation was not a successful read_rune!"
+  _ = io.SEEK_START
+}

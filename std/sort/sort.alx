@@ -1,12 +1,175 @@
-# Package sort: Go's sort, on top of `slices` (S2).
+# Package sort: Go's sort (S2).
 #
-# Everything sorts in place and ascending. Differences from Go:
-#   - `slice` and `slice_stable` take `less(a, b)` over the *elements*, not
-#     Go's `less(i, j)` over indexes (an element function can't see a
-#     half-sorted slice, and doesn't need reflection to swap).
-#   - No `sort.Interface`/`sort.Sort`: use `slices.sort_func` or `slice`.
-#   - `float64s` takes `[Float]` and orders NaNs first.
+#   Go                                  alx
+#   sort.Interface                      Interface (len, less(i, j), swap!(i, j))
+#   Sort(data), Stable(data)            sort(data), stable(data)
+#   IsSorted(data)                      is_sorted(data)
+#   Reverse(data) Interface             reverse(data) -> Reverse[D]
+#   IntSlice, Float64Slice, StringSlice IntSlice, Float64Slice, StringSlice
+#     (.Len .Less .Swap .Sort .Search)    (len, less, swap!, sort!, search)
+#   Ints, Float64s, Strings             ints, float64s, strings
+#   IntsAreSorted, ...                  ints_are_sorted, ...
+#   Search(n, f), Find(n, cmp)          search(n) { |i| }, find(n) { |i| }
+#   SearchInts, SearchFloat64s, ...     search_ints, search_float64s, ...
+#   Slice, SliceStable, SliceIsSorted   slice, slice_stable, slice_is_sorted
+#
+# The algorithms are Go's (pdqsort for `sort` and `slice`, insertion sort +
+# SymMerge for `stable` and `slice_stable`; std/slices/sort.tmpl), so the
+# calls to less and swap!, and where an unstable sort leaves equal elements,
+# are Go's.
+#
+# A sort.Interface is your own type with the three methods; interfaces are
+# structural. The functions take a copy of it (structs are values), so its
+# elements must live in shared storage: a slice field (`swap!` writes through
+# it), or the D36 one-element-slice pattern for other state (counters).
+#
+# Differences from Go:
+#   - `slice(xs) { |i, j| ... }`: Go's Slice(x any, less) takes any slice by
+#     reflection; here the slice is typed, and `less(i, j)` compares indexes
+#     as in Go (the block sees the slice being sorted through shared storage).
+#   - Go's named slice types are one-field structs: `IntSlice.new(xs)`,
+#     sorted with `s.sort!` (the `!` marks the write through the slice).
+#   - `reverse` returns the `Reverse[D]` wrapper type (Go returns it as an
+#     Interface value).
+#   - `float64s` takes `[Float]` and orders NaNs first (slices.sort).
 import "slices"
+
+# The `hint` of choose_pivot (Go's sortedHint).
+UNKNOWN_HINT = 0
+INCREASING_HINT = 1
+DECREASING_HINT = 2
+
+# Go's bits.Len(uint(n)) for n >= 0.
+def bits_len(n: Int) -> Int {
+  k = 0
+  while n > 0 {
+    k += 1
+    n = n >> 1
+  }
+  k
+}
+
+def next_power_of_two(length: Int) -> U64 {
+  one: U64 = 1
+  one << bits_len(length)
+}
+
+# A collection that can be sorted: the elements are referred to by integer
+# index.
+pub interface Interface {
+  # The number of elements in the collection.
+  def len -> Int
+  # Whether the element with index i must sort before the element with
+  # index j. It must describe a strict weak ordering.
+  def less(i: Int, j: Int) -> Bool
+  # Swaps the elements with indexes i and j.
+  def swap!(i: Int, j: Int)
+}
+
+# Sorts data in ascending order as determined by its less method. It makes
+# one call to data.len to determine n and O(n*log(n)) calls to data.less and
+# data.swap!. The sort is not guaranteed to be stable.
+pub def sort[D: Interface](data: D) {
+  sort_data(data)
+}
+
+def sort_data[D: Interface](data: D) {
+  n = data.len
+  return if n <= 1
+  pdqsort(data, 0, n, bits_len(n))
+}
+
+# Sorts data in ascending order as determined by its less method, keeping
+# the original order of equal elements. It makes one call to data.len,
+# O(n*log(n)) calls to data.less and O(n*log(n)*log(n)) calls to data.swap!.
+pub def stable[D: Interface](data: D) {
+  stable_sort(data, data.len)
+}
+
+# Whether data is sorted.
+pub def is_sorted[D: Interface](data: D) -> Bool {
+  n = data.len
+  i = n - 1
+  while i > 0 {
+    return false if data.less(i, i - 1)
+    i -= 1
+  }
+  true
+}
+
+# `data` in reverse order: Go's sort.Reverse.
+pub struct Reverse[D] {
+  data: D
+
+  pub def len -> Int { data.len }
+
+  # Go's reverse.Less: the embedded less with its arguments swapped.
+  pub def less(i: Int, j: Int) -> Bool { data.less(j, i) }
+
+  def swap!(i: Int, j: Int) { self.data.swap!(i, j) }
+}
+
+# The reverse order of data.
+pub def reverse[D: Interface](data: D) -> Reverse[D] {
+  Reverse.new(data: data)
+}
+
+# An Interface over [Int], in increasing order.
+pub struct IntSlice {
+  xs: [Int]
+
+  pub def len -> Int { xs.size }
+
+  pub def less(i: Int, j: Int) -> Bool { xs[i] < xs[j] }
+
+  def swap!(i: Int, j: Int) {
+    x = xs
+    x[i], x[j] = x[j], x[i]
+  }
+
+  # Sorts the slice in place: sort(x).
+  def sort! { sort_data(self) }
+
+  # search_ints(x.xs, v).
+  pub def search(v: Int) -> Int { search_ints(xs, v) }
+}
+
+# An Interface over [Float], in increasing order, with NaNs before the other
+# values.
+pub struct Float64Slice {
+  xs: [Float]
+
+  pub def len -> Int { xs.size }
+
+  pub def less(i: Int, j: Int) -> Bool { xs[i] < xs[j] || (xs[i] != xs[i] && xs[j] == xs[j]) }
+
+  def swap!(i: Int, j: Int) {
+    x = xs
+    x[i], x[j] = x[j], x[i]
+  }
+
+  def sort! { sort_data(self) }
+
+  pub def search(v: Float) -> Int { search_float64s(xs, v) }
+}
+
+# An Interface over [Str], in increasing (bytewise) order.
+pub struct StringSlice {
+  xs: [Str]
+
+  pub def len -> Int { xs.size }
+
+  pub def less(i: Int, j: Int) -> Bool { xs[i] < xs[j] }
+
+  def swap!(i: Int, j: Int) {
+    x = xs
+    x[i], x[j] = x[j], x[i]
+  }
+
+  def sort! { sort_data(self) }
+
+  pub def search(v: Str) -> Int { search_strings(xs, v) }
+}
 
 # Sorts ints ascending.
 pub def ints(xs: [Int]) {
@@ -41,7 +204,7 @@ pub def search(n: Int, f: (Int) -> Bool) -> Int {
   i = 0
   j = n
   while i < j {
-    h = i + (j - i) / 2
+    h = i + (j - i) / 2 # Go: int(uint(i+j) >> 1), no overflow
     if !f(h) {
       i = h + 1
     } else {
@@ -51,55 +214,55 @@ pub def search(n: Int, f: (Int) -> Bool) -> Int {
   i
 }
 
-# The index at which `x` is, or would be inserted, in the sorted `xs`.
-pub def search_ints(xs: [Int], x: Int) -> Int {
+# The smallest index i in 0...n at which cmp(i) <= 0, assuming cmp is
+# positive, then zero or negative; n if there is none. `found` says whether
+# cmp(i) == 0 there.
+pub def find(n: Int, cmp: (Int) -> Int) -> (Int, Bool) {
   i = 0
-  j = xs.size
+  j = n
   while i < j {
-    h = i + (j - i) / 2
-    if xs[h] < x {
+    h = i + (j - i) / 2 # Go: int(uint(i+j) >> 1), no overflow
+    if cmp(h) > 0 {
       i = h + 1
     } else {
       j = h
     }
   }
-  i
+  (i, i < n && cmp(i) == 0)
+}
+
+# The index at which `x` is, or would be inserted, in the sorted `xs`.
+pub def search_ints(xs: [Int], x: Int) -> Int {
+  search(xs.size) { |i| xs[i] >= x }
 }
 
 pub def search_strings(xs: [Str], x: Str) -> Int {
-  i = 0
-  j = xs.size
-  while i < j {
-    h = i + (j - i) / 2
-    if xs[h] < x {
-      i = h + 1
-    } else {
-      j = h
-    }
-  }
-  i
+  search(xs.size) { |i| xs[i] >= x }
 }
 
+# As Go: the first i with xs[i] >= x, so a NaN `x` is never found.
 pub def search_float64s(xs: [Float], x: Float) -> Int {
-  slices.binary_search(xs, x)[0]
+  search(xs.size) { |i| xs[i] >= x }
 }
 
-# Sorts `xs` in place; `less(a, b)` says a sorts before b. Not stable.
-pub def slice[T](xs: [T], less: (T, T) -> Bool) {
-  sort_range_less(xs, 0, xs.size, less)
+# Sorts `xs` in place; `less(i, j)` says xs[i] sorts before xs[j]. Not
+# stable.
+pub def slice[T](xs: [T], less: (Int, Int) -> Bool) {
+  n = xs.size
+  pdqsort_func(xs, 0, n, bits_len(n), less)
 }
 
 # Like `slice`, keeping equal elements in their original order.
-pub def slice_stable[T](xs: [T], less: (T, T) -> Bool) {
-  stable_sort_less(xs, less)
+pub def slice_stable[T](xs: [T], less: (Int, Int) -> Bool) {
+  stable_sort_func(xs, xs.size, less)
 }
 
-# Whether `xs` is already sorted by `less`.
-pub def slice_is_sorted[T](xs: [T], less: (T, T) -> Bool) -> Bool {
-  i = 1
-  while i < xs.size {
-    return false if less(xs[i], xs[i - 1])
-    i += 1
+# Whether `xs` is sorted by `less(i, j)`.
+pub def slice_is_sorted[T](xs: [T], less: (Int, Int) -> Bool) -> Bool {
+  i = xs.size - 1
+  while i > 0 {
+    return false if less(i, i - 1)
+    i -= 1
   }
   true
 }

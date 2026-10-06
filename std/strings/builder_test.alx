@@ -1,0 +1,195 @@
+#![test(external)]
+# Go's builder_test.go, compare_test.go and clone_test.go, translated.
+#
+# Not translated: the allocation counts (TestBuilderGrow's, TestBuilderAllocs,
+# TestBuilderGrowSizeclasses), unsafe.StringData identity (TestClone's no-alias
+# check, TestCompareStrings' unsafe aliasing: the same comparisons are made on
+# copies), the benchmarks. TestBuilderCopyPanic is inverted: alx Builder copies
+# share the buffer (D36), so writing through a copy is allowed and lands in the
+# same builder.
+
+import "strings"
+
+#[track_caller]
+def check(b: strings.Builder, want: Str) {
+  got = b.string
+  assert got == want, "string: got #{got}, want #{want} at #{caller_location}"
+  assert_eq b.len, got.size
+  assert b.cap >= got.size, "cap #{b.cap} < #{got.size}"
+}
+
+test "Builder" {
+  b = strings.Builder.new
+  check(b, "")
+  assert_eq b.write_string!("hello"), 5
+  check(b, "hello")
+  b.write_byte!(32)
+  check(b, "hello ")
+  assert_eq b.write_string!("world"), 5
+  check(b, "hello world")
+}
+
+test "BuilderString" {
+  b = strings.Builder.new
+  b.write_string!("alpha")
+  check(b, "alpha")
+  s1 = b.string
+  b.write_string!("beta")
+  check(b, "alphabeta")
+  s2 = b.string
+  b.write_string!("gamma")
+  check(b, "alphabetagamma")
+  s3 = b.string
+  # Later operations don't change the returned strings.
+  assert_eq s1, "alpha"
+  assert_eq s2, "alphabeta"
+  assert_eq s3, "alphabetagamma"
+}
+
+test "BuilderReset" {
+  b = strings.Builder.new
+  check(b, "")
+  b.write_string!("aaa")
+  s = b.string
+  check(b, "aaa")
+  b.reset!
+  check(b, "")
+  # Writing after reset! doesn't alter strings returned before.
+  b.write_string!("bbb")
+  check(b, "bbb")
+  assert_eq s, "aaa"
+}
+
+test "BuilderGrow" {
+  for grow_len in [0, 100, 1000, 10000, 100000] {
+    p: [Byte] = [97; grow_len]
+    b = strings.Builder.new
+    b.grow!(grow_len)
+    b.write!(p)
+    assert b.string == Str.from_bytes(p), "grow_len=#{grow_len}: bad data written after grow!"
+  }
+  assert_panics("negative count") {
+    a = strings.Builder.new
+    a.grow!(-1)
+  }
+}
+
+test "BuilderWrite2" {
+  s0 = "hello 世界"
+  for k in 0...4 {
+    b = strings.new_builder
+    want = ""
+    n = 0
+    for _call in 0...2 {
+      got = case k {
+        0 => b.write!(s0.bytes.to_a)
+        1 => b.write_rune!(97)
+        2 => b.write_rune!(0x4E16)
+        _ => b.write_string!(s0)
+      }
+      n = got
+      want = want + (k == 1 ? "a" : k == 2 ? "世" : s0)
+      check(b, want)
+    }
+    assert_eq n, k == 1 ? 1 : k == 2 ? 3 : s0.size
+  }
+}
+
+test "BuilderWriteByte" {
+  b = strings.Builder.new
+  b.write_byte!(97)
+  b.write_byte!(0)
+  check(b, "a\x00")
+}
+
+test "BuilderCopy shares (Go: BuilderCopyPanic)" {
+  a = strings.Builder.new
+  a.write_byte!(120)
+  b = a
+  assert_eq b.string, "x"
+  assert_eq b.len, 1
+  b.write_byte!(121)
+  assert_eq a.string, "xy"
+  b.reset!
+  assert_eq a.string, ""
+}
+
+test "BuilderWriteInvalidRune" {
+  for r in [-1, 0x110000] {
+    b = strings.Builder.new
+    b.write_rune!(r.as_i32)
+    check(b, "�")
+  }
+}
+
+# ------------------------------------------------------------ compare_test.go
+
+test "Compare" {
+  tests: [(Str, Str, Int)] = [
+    ("", "", 0), ("a", "", 1), ("", "a", -1), ("abc", "abc", 0), ("ab", "abc", -1), ("abc", "ab", 1),
+    ("x", "ab", 1), ("ab", "x", -1), ("x", "a", 1), ("b", "x", -1),
+    ("abcdefgh", "abcdefgh", 0), ("abcdefghi", "abcdefghi", 0), ("abcdefghi", "abcdefghj", -1),
+  ]
+  for t in tests {
+    for offset in 0..16 {
+      shifted_b = (strings.repeat("*", offset) + t[1])[offset...offset + t[1].size]
+      assert_eq strings.compare(t[0], shifted_b), t[2]
+    }
+  }
+}
+
+test "CompareIdenticalString" {
+  s = "Hello Gophers!"
+  assert_eq strings.compare(s, s), 0
+  assert_eq strings.compare(s, s[0...1]), 1
+}
+
+test "CompareStrings" {
+  lengths: [Int] = []
+  for i in 0..128 { lengths << i }
+  for l in [256, 512, 1024, 1333, 4095, 4096, 4097] { lengths << l }
+  n = lengths[lengths.size - 1]
+  a: [Byte] = [0; n + 1]
+  b: [Byte] = [0; n + 1]
+  last_len = 0
+  for len in lengths {
+    i = 0
+    while i < len {
+      a[i] = (1 + 31 * i % 254).as_u8
+      b[i] = (1 + 31 * i % 254).as_u8
+      i += 1
+    }
+    i = len
+    while i <= n {
+      a[i] = 8
+      b[i] = 9
+      i += 1
+    }
+    sa = Str.from_bytes(a)
+    sb = Str.from_bytes(b)
+    assert_eq strings.compare(sa[0...len], sb[0...len]), 0
+    if len > 0 {
+      assert_eq strings.compare(sa[0...len - 1], sb[0...len]), -1
+      assert_eq strings.compare(sa[0...len], sb[0...len - 1]), 1
+    }
+    sa_len = sa[0...len]
+    k = last_len
+    while k < len {
+      b[k] = a[k] - 1
+      assert_eq strings.compare(sa_len, Str.from_bytes(b[0...len])), 1
+      b[k] = a[k] + 1
+      assert_eq strings.compare(sa_len, Str.from_bytes(b[0...len])), -1
+      b[k] = a[k]
+      k += 1
+    }
+    last_len = len
+  }
+}
+
+# -------------------------------------------------------------- clone_test.go
+
+test "Clone" {
+  for input in ["", strings.clone(""), strings.repeat("a", 42)[0...0], "short", strings.repeat("a", 42)] {
+    assert_eq strings.clone(input), input
+  }
+}

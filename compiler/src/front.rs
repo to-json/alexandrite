@@ -571,7 +571,8 @@ pub fn check_program(l: &Loaded, externs: Vec<DefInfo>) -> Result<TProgram, Diag
             // An import a derive added for its own code (`alxjson`, `alxdyn`, ...):
             // the derived methods the program doesn't call aren't checked. Or one
             // `alx test` added (no span: the runner's, an external test's testing).
-            if i.alias.as_deref().is_some_and(|a| matches!(a, "alxjson" | "alxjson2" | "alxjsontext" | "alxdyn") || a.starts_with("__alx")) || i.span.hi == 0 {
+            // `import _ "pkg"` (Go's blank import) is for its initializers alone.
+            if i.alias.as_deref().is_some_and(|a| matches!(a, "_" | "alxjson" | "alxjson2" | "alxjsontext" | "alxdyn") || a.starts_with("__alx")) || i.span.hi == 0 {
                 continue;
             }
             if !crate::check::import_used(&pkg, &alias) && !in_text && !ext.contains(i.path.trim_end_matches('/')) {

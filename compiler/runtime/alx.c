@@ -1927,7 +1927,9 @@ static void *timer_main(void *arg) {
             /* Wait until the earliest deadline (or an earlier one arrives). */
             struct timespec rt;
             clock_gettime(CLOCK_REALTIME, &rt);
-            int64_t until = (int64_t)rt.tv_sec * 1000000000 + rt.tv_nsec + (g_timers->at - now);
+            int64_t base = (int64_t)rt.tv_sec * 1000000000 + rt.tv_nsec, wait = g_timers->at - now;
+            /* a sleep of ~2^63 ns: wait as long as a timespec can say */
+            int64_t until = wait > INT64_MAX - base ? INT64_MAX : base + wait;
             struct timespec dl = { (time_t)(until / 1000000000), (long)(until % 1000000000) };
             pthread_cond_timedwait(&g_tcv, &g_mu, &dl);
             continue;
@@ -1951,7 +1953,8 @@ void alx_sleep_ns(int64_t ns) {
     Parker *p = cur_pk();
     Timer *t = malloc(sizeof *t);
     if (!t) alx_panic("out of memory", "runtime");
-    t->at = mono_ns() + ns;
+    int64_t now = mono_ns();
+    t->at = ns > INT64_MAX - now ? INT64_MAX : now + ns; /* saturate: time.sleep(max Duration) */
     t->p = p;
     pthread_mutex_lock(&g_mu);
     if (!g_timer_thread) {

@@ -89,6 +89,11 @@ thread_local! {
     static UNFOLDING: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(vec![]) };
 }
 
+/// The key of `TProgram::iface_eqs` for `==` on Error values (`M::ErrEq`):
+/// each error type's `__eq` instance in tag order (`usize::MAX` for a type
+/// whose values can't be compared: never equal).
+pub const ERR_EQ: &str = "#Error";
+
 /// Record the definition of a type that refers to itself.
 pub fn define_rec(name: &str, t: Ty) {
     RECS.with(|r| r.borrow_mut().insert(name.to_string(), t));
@@ -511,6 +516,9 @@ pub enum M {
     /// `a == b` on interface values (recv a, args [b]): the same
     /// implementor, and `__eq` of the two values (`TProgram::iface_eqs`).
     IfaceEq,
+    /// `a == b` on Error values (recv a, args [b]): the same error type,
+    /// and its `__eq` of the two values (`TProgram::iface_eqs[ERR_EQ]`).
+    ErrEq,
     /// Build variant `k` of an enum: args are every slot after the tag.
     VariantNew(usize),
     /// `find { pred }` → T? (a select stage, then this terminal).

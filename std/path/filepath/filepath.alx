@@ -1,31 +1,89 @@
 # Package filepath: Go's path/filepath for Unix systems (the separator is
-# `/`). `abs`, `walk_dir` and `glob` use the os package.
+# `/`, there are no volume names).
 #
-# Differences from Go: `join` takes a [Str]; `split` returns a tuple; `rel`
-# fails with RelError; `walk_dir` takes a block (or function) returning a
-# WalkAction (Continue, SkipDir, Stop) instead of an error sentinel, and an
-# unreadable directory fails the whole walk.
+#   Go                                  alx
+#   Separator / ListSeparator (runes)   SEPARATOR / LIST_SEPARATOR (Str)
+#   Clean Base Dir Ext IsAbs            clean base dir ext is_abs
+#   Join(elem ...string)                join(elems: [Str])
+#   Split -> (dir, file)                split -> (Str, Str)
+#   SplitList / ToSlash / FromSlash     split_list / to_slash / from_slash
+#   VolumeName                          volume_name (always "")
+#   IsLocal / Localize                  local? / ~localize
+#   HasPrefix (deprecated)              has_prefix
+#   Rel -> (string, error)              ~rel -> ~Str<FilepathError>
+#   Abs                                 ~abs
+#   EvalSymlinks                        ~eval_symlinks
+#   Match / ErrBadPattern               ~match / FilepathError.ErrBadPattern
+#   Glob                                ~glob -> ~[Str]<FilepathError>
+#   WalkDir(root, fs.WalkDirFunc)       walk_dir(root) { |path, d: os.DirEntry?, err: Error?| ... }
+#   Walk(root, WalkFunc)                walk(root) { |path, info: os.FileInfo?, err: Error?| ... }
+#   SkipDir / SkipAll                   fs.FsError.SkipDir / fs.FsError.SkipAll (import "io/fs")
+#
+# Differences from Go:
+#  - `join` takes a [Str] (no variadics).
+#  - Go's error values with fixed texts are FilepathError variants with the
+#    same messages: Rel's "Rel: can't make T relative to B", Localize's
+#    "invalid path", EvalSymlinks' "EvalSymlinks: too many links", the bare
+#    ENOTDIR ("not a directory") and ErrBadPattern ("syntax error in
+#    pattern"; Go's filepath.ErrBadPattern is a value apart from path's too).
+#  - Walk and WalkDir's callbacks get the os package's FileInfo / DirEntry
+#    (alx's os types; Go's are the io/fs interfaces), none when the root
+#    can't be stat'ed (WalkDir) or a name can't be lstat'ed (Walk). The block
+#    returns `~Unit`: `fail fs.FsError.SkipDir` / `SkipAll` are Go's
+#    `return filepath.SkipDir` / `SkipAll`; any other failure stops the walk
+#    and is returned. A directory that can't be read is reported whole (Go's
+#    os.ReadDir may return the entries it read before the error).
+#  - IsLocal is `local?` (a predicate).
+#
+# Tests: Go's path_test.go, match_test.go and the Unix examples, translated
+# (filepath_test.alx, external). Not translated: the Windows and Plan 9
+# tables and tests (TestWindowsGlob, winjointests, ... — this port is
+# Unix-only), TestGlobUNC, TestDriveLetterInEvalSymlinks, TestBug3486 (walks
+# GOROOT), BenchmarkIsLocal. vec_filepath_test.alx holds vectors generated
+# from Go.
 
-import "path"
+import "io/fs"
 import "os"
+import "path"
+import "unicode/utf8"
 
 pub SEPARATOR = "/"
 pub LIST_SEPARATOR = ":"
 
-pub error RelError {
-  # The target can't be made relative to the base (one is absolute and
-  # the other isn't).
+pub error FilepathError {
+  # Rel: the target can't be made relative to the base.
   NotRelative(base: Str, target: Str)
+  # Localize: not a valid io/fs path, or one with a NUL byte.
+  InvalidPath
+  # EvalSymlinks followed more than 255 links.
+  TooManyLinks
+  # EvalSymlinks: a non-directory in the middle of the path.
+  NotDir
+  # Match, Glob: a malformed pattern.
+  ErrBadPattern
+
+  def message -> Str {
+    case self {
+      ErrBadPattern => "syntax error in pattern"
+      NotRelative(base, target) => "Rel: can't make #{target} relative to #{base}"
+      InvalidPath => "invalid path"
+      TooManyLinks => "EvalSymlinks: too many links"
+      NotDir => "not a directory"
+    }
+  }
 }
 
+# The shortest path equivalent to `p` (Go's Clean).
 pub def clean(p: Str) -> Str {
   path.clean(p)
 }
 
+# The elements joined with separators, cleaned; "" if all are empty.
 pub def join(elems: [Str]) -> Str {
   path.join(elems)
 }
 
+# `p` split after its last separator: (dir, file).
 pub def split(p: Str) -> (Str, Str) {
   path.split(p)
 }
@@ -46,8 +104,174 @@ pub def is_abs(p: Str) -> Bool {
   path.is_abs(p)
 }
 
-pub def match(pattern: Str, name: Str) -> ~Bool {
-  ~path.match(pattern, name)
+# Whether `name` matches the shell pattern (Go's filepath.Match; the syntax
+# is path.match's). Fails with ErrBadPattern for a malformed pattern. As in
+# Go, and unlike path.match, the rest of the pattern isn't checked once the
+# name fails to match.
+pub def match(pattern: Str, name: Str) -> ~Bool<FilepathError> {
+  pat = pattern
+  nm = name
+  while pat.size > 0 {
+    star, chunk, rest = scan_chunk(pat)
+    pat = rest
+    if star && chunk.size == 0 {
+      # Trailing * matches the rest of the name unless it has a /.
+      return !has_slash(nm)
+    }
+    # Look for a match at the current position.
+    t, ok, bad = match_chunk(chunk, nm)
+    # If we're the last chunk, make sure we've exhausted the name;
+    # otherwise we'd give a false result even if we could still match
+    # using the star.
+    if ok && (t.size == 0 || pat.size > 0) {
+      nm = t
+      next
+    }
+    fail FilepathError.ErrBadPattern if bad
+    if star {
+      # Look for a match skipping i+1 bytes. Cannot skip /.
+      found = false
+      i = 0
+      while i < nm.size && nm[i] != 47 {
+        t2, ok2, bad2 = match_chunk(chunk, nm[i + 1...nm.size])
+        if ok2 {
+          # If we're the last chunk, make sure we exhausted the name.
+          if pat.size == 0 && t2.size > 0 {
+            i += 1
+            next
+          }
+          nm = t2
+          found = true
+          break
+        }
+        fail FilepathError.ErrBadPattern if bad2
+        i += 1
+      }
+      next if found
+    }
+    return false
+  }
+  nm.size == 0
+}
+
+def has_slash(s: Str) -> Bool {
+  i = 0
+  while i < s.size {
+    return true if s[i] == 47
+    i += 1
+  }
+  false
+}
+
+# The leading `*`s of the pattern, the chunk up to the next `*` outside a
+# class, and the rest.
+def scan_chunk(pattern: Str) -> (Bool, Str, Str) {
+  p = pattern
+  star = false
+  while p.size > 0 && p[0] == 42 {
+    p = p[1...p.size]
+    star = true
+  }
+  inrange = false
+  i = 0
+  while i < p.size {
+    c = p[i]
+    if c == 92 {
+      # The error check is done in match_chunk.
+      i += 1 if i + 1 < p.size
+    } else if c == 91 {
+      inrange = true
+    } else if c == 93 {
+      inrange = false
+    } else if c == 42 && !inrange {
+      return (star, p[0...i], p[i...p.size])
+    }
+    i += 1
+  }
+  (star, p, "")
+}
+
+# Whether chunk matches the start of s: (rest of s, matched, bad pattern).
+# The whole chunk is always scanned, so a malformed one is reported even
+# when s doesn't match.
+def match_chunk(chunk_in: Str, s_in: Str) -> (Str, Bool, Bool) {
+  chunk = chunk_in
+  s = s_in
+  failed = false
+  while chunk.size > 0 {
+    failed = failed || s.size == 0
+    c = chunk[0]
+    if c == 91 {
+      # A character class.
+      r: Rune = 0
+      if !failed {
+        r1, n = utf8.decode_rune_in_string(s)
+        r = r1
+        s = s[n...s.size]
+      }
+      chunk = chunk[1...chunk.size]
+      negated = false
+      if chunk.size > 0 && chunk[0] == 94 {
+        negated = true
+        chunk = chunk[1...chunk.size]
+      }
+      matched = false
+      nrange = 0
+      loop {
+        if chunk.size > 0 && chunk[0] == 93 && nrange > 0 {
+          chunk = chunk[1...chunk.size]
+          break
+        }
+        lo, rest, bad = get_esc(chunk)
+        return ("", false, true) if bad
+        chunk = rest
+        hi = lo
+        if chunk[0] == 45 {
+          hi2, rest2, bad2 = get_esc(chunk[1...chunk.size])
+          return ("", false, true) if bad2
+          hi = hi2
+          chunk = rest2
+        }
+        matched = matched || (lo <= r && r <= hi)
+        nrange += 1
+      }
+      failed = failed || matched == negated
+    } else if c == 63 {
+      if !failed {
+        failed = s[0] == 47
+        _r, n2 = utf8.decode_rune_in_string(s)
+        s = s[n2...s.size]
+      }
+      chunk = chunk[1...chunk.size]
+    } else {
+      if c == 92 {
+        chunk = chunk[1...chunk.size]
+        return ("", false, true) if chunk.size == 0
+      }
+      if !failed {
+        failed = chunk[0] != s[0]
+        s = s[1...s.size]
+      }
+      chunk = chunk[1...chunk.size]
+    }
+  }
+  return ("", false, false) if failed
+  (s, true, false)
+}
+
+# One (possibly escaped) character of a class: (rune, rest, bad pattern).
+def get_esc(chunk_in: Str) -> (Rune, Str, Bool) {
+  chunk = chunk_in
+  return (0, chunk, true) if chunk.size == 0 || chunk[0] == 45 || chunk[0] == 93
+  if chunk[0] == 92 {
+    chunk = chunk[1...chunk.size]
+    return (0, chunk, true) if chunk.size == 0
+  }
+  r, n = utf8.decode_rune_in_string(chunk)
+  bad = r == 0xFFFD && n == 1
+  rest = chunk[n...chunk.size]
+  bad = true if rest.size == 0
+  (r, rest, bad)
 }
 
 # The path is already slash-separated on Unix.
@@ -60,8 +284,13 @@ pub def from_slash(p: Str) -> Str {
 }
 
 # Unix has no volume names.
-pub def volume_name(p: Str) -> Str {
+pub def volume_name(_p: Str) -> Str {
   ""
+}
+
+# Go's deprecated HasPrefix: a plain string prefix test.
+pub def has_prefix(p: Str, prefix: Str) -> Bool {
+  p.size >= prefix.size && p[0...prefix.size] == prefix
 }
 
 # A PATH-style list split at `:`; [] for "".
@@ -70,55 +299,91 @@ pub def split_list(p: Str) -> [Str] {
   p.split(LIST_SEPARATOR)
 }
 
-# A relative path that, joined to `base`, means `target` (both cleaned).
-pub def rel(base: Str, target: Str) -> ~Str<RelError> {
-  b = clean(base)
-  t = clean(target)
-  return "." if b == t
+# Whether `p` is local (Go's IsLocal): non-empty, relative, and lexically
+# inside the directory it is evaluated in (no leading `..` after cleaning).
+pub def local?(p: Str) -> Bool {
+  return false if is_abs(p) || p == ""
+  has_dots = false
+  start = 0
+  while start <= p.size {
+    i = start
+    while i < p.size && p[i] != 47 {
+      i += 1
+    }
+    part = p[start...i]
+    if part == "." || part == ".." {
+      has_dots = true
+      break
+    }
+    start = i + 1
+  }
+  q = has_dots ? clean(p) : p
+  return false if q == ".." || (q.size >= 3 && q[0...3] == "../")
+  true
+}
+
+# A slash-separated io/fs path as an OS path (Go's Localize): fails with
+# InvalidPath unless fs.valid_path? holds and the path has no NUL byte.
+pub def localize(p: Str) -> ~Str<FilepathError> {
+  fail FilepathError.InvalidPath if !fs.valid_path?(p)
+  i = 0
+  while i < p.size {
+    fail FilepathError.InvalidPath if p[i] == 0
+    i += 1
+  }
+  p
+}
+
+# A relative path that, joined to `base`, means `target` (Go's Rel): lexical
+# only. Fails if the target can't be made relative to the base: one is
+# absolute and the other isn't, or the base climbs out (`..`) further than
+# the target.
+pub def rel(base_path: Str, targ_path: Str) -> ~Str<FilepathError> {
+  b = clean(base_path)
+  t = clean(targ_path)
+  return "." if t == b
   b = "" if b == "."
-  fail RelError.NotRelative(base, target) if is_abs(b) != is_abs(t)
-  bs = b.size
-  ts = t.size
-  # The longest common prefix, element by element.
-  bl = 0
-  tl = 0
+  base_slashed = b.size > 0 && b[0] == 47
+  targ_slashed = t.size > 0 && t[0] == 47
+  fail FilepathError.NotRelative(base_path, targ_path) if base_slashed != targ_slashed
+  bl = b.size
+  tl = t.size
   b0 = 0
   bi = 0
+  t0 = 0
   ti = 0
-  while true {
-    while bi < bs && b[bi] != 47 {
+  loop {
+    while bi < bl && b[bi] != 47 {
       bi += 1
     }
-    while ti < ts && t[ti] != 47 {
+    while ti < tl && t[ti] != 47 {
       ti += 1
     }
-    break if t[tl...ti] != b[bl...bi]
-    bi += 1 if bi < bs
-    ti += 1 if ti < ts
-    bl = bi
-    tl = ti
-    b0 = bl
-    break if bl >= bs && tl >= ts
+    break if t[t0...ti] != b[b0...bi]
+    bi += 1 if bi < bl
+    ti += 1 if ti < tl
+    b0 = bi
+    t0 = ti
   }
-  fail RelError.NotRelative(base, target) if b[b0...bi] == ".."
-  if b0 != bs {
+  fail FilepathError.NotRelative(base_path, targ_path) if b[b0...bi] == ".."
+  if b0 != bl {
     # Up out of what's left of the base, then down into the target.
-    seps = 1
+    seps = 0
     i = b0
-    while i < bs {
+    while i < bl {
       seps += 1 if b[i] == 47
       i += 1
     }
     up = ".."
-    k = 1
+    k = 0
     while k < seps {
       up = up + "/.."
       k += 1
     }
-    return up + "/" + t[tl...ts] if tl != ts
-    return up
+    up = up + "/" + t[t0...tl] if t0 != tl
+    return clean(up)
   }
-  t[tl...ts]
+  t[t0...tl]
 }
 
 # ------------------------------------------------------------ with the os package
@@ -131,87 +396,272 @@ pub def abs(p: Str) -> ~Str {
   join([wd, p])
 }
 
-# What a walk_dir callback says to do next.
-pub enum WalkAction {
-  # Go on (into a directory, if the entry is one).
-  Continue
-  # Don't enter this directory; for a file, skip the rest of its directory.
-  SkipDir
-  # End the walk now; walk_dir returns normally.
-  Stop
+# The path after following every symbolic link in it (Go's EvalSymlinks),
+# cleaned. Relative paths stay relative to the working directory. Fails with
+# the os error of a missing component, NotDir, or TooManyLinks (more than 255).
+pub def eval_symlinks(p0: Str) -> ~Str {
+  p = p0
+  vol_len = 0
+  vol_len = 1 if p.size > 0 && p[0] == 47
+  vol = p[0...vol_len]
+  dest = vol
+  links_walked = 0
+  start = vol_len
+  end = vol_len
+  while start < p.size {
+    while start < p.size && p[start] == 47 {
+      start += 1
+    }
+    end = start
+    while end < p.size && p[end] != 47 {
+      end += 1
+    }
+    # On a "." or ".." component the next one starts where this ends.
+    elem = p[start...end]
+    if end == start {
+      # No more path components.
+      break
+    } else if elem == "." {
+      start = end
+      next
+    } else if elem == ".." {
+      # Back up to the previous component if possible. dest's volume part
+      # never changes.
+      r = dest.size - 1
+      while r >= vol_len && dest[r] != 47 {
+        r -= 1
+      }
+      if r < vol_len || dest[r + 1...dest.size] == ".." {
+        # Either the path has no components, or the last one is ..
+        dest = dest + "/" if dest.size > vol_len
+        dest = dest + ".."
+      } else {
+        # Discard everything since the last separator.
+        dest = dest[0...r]
+      }
+      start = end
+      next
+    }
+    # Ordinary path component. Add it to the result.
+    dest = dest + "/" if dest.size > 0 && dest[dest.size - 1] != 47
+    dest = dest + elem
+    # Resolve the symlink.
+    fi = ~os.lstat(dest)
+    if !fi.is_symlink {
+      fail FilepathError.NotDir if !fi.is_dir && end < p.size
+      start = end
+      next
+    }
+    # Found a link.
+    links_walked += 1
+    fail FilepathError.TooManyLinks if links_walked > 255
+    link = ~os.readlink(dest)
+    p = link + p[end...p.size]
+    if link.size > 0 && link[0] == 47 {
+      # Symlink to an absolute path.
+      dest = "/"
+      end = 1
+      vol = "/"
+      vol_len = 1
+    } else {
+      # Symlink to a relative path; replace the last path component in dest.
+      r = dest.size - 1
+      while r >= vol_len && dest[r] != 47 {
+        r -= 1
+      }
+      dest = r < vol_len ? vol : dest[0...r]
+      end = 0
+    }
+    start = end
+  }
+  clean(dest)
 }
 
-# Walks the tree rooted at `root` (Go's WalkDir): calls f(path, entry) for the
-# root and then for every entry below it, in lexical order, a directory before
-# its contents; f's result steers the walk. Symbolic links are not followed.
-# An unreadable directory fails the walk with its error (Go passes the error to
-# f and lets it decide).
+# Walks the tree rooted at `root` (Go's WalkDir): calls f(path, entry, err)
+# for the root and every file or directory below it, in lexical order, a
+# directory before its contents. Symbolic links are not followed.
+#  - The root can't be lstat'ed: f(root, none, err), once.
+#  - A directory can't be read: f is called a second time for it, with the
+#    error; whatever f then returns decides (succeed to go on).
+#  - f fails with fs.FsError.SkipDir: skip that directory (or, for a file,
+#    the rest of its directory); with fs.FsError.SkipAll: stop, and walk_dir
+#    succeeds; with anything else: stop, and walk_dir fails with it.
 #
-#   filepath.walk_dir("src") { |path, d|
-#     puts path if d.is_regular
-#     filepath.WalkAction.Continue
+#   ~filepath.walk_dir("src") { |p, d, err|
+#     ~err                         # (or handle it)
+#     puts p if d?.is_regular || false
 #   }
-pub def walk_dir(root: Str, f: (Str, os.DirEntry) -> WalkAction) -> ~Unit {
-  info = ~os.lstat(root)
+pub def walk_dir(root: Str, f: (Str, os.DirEntry?, Error?) -> ~Unit) -> ~Unit {
+  r = os.lstat(root)
+  res = if e = r.err {
+    f(root, none, e)
+  } else {
+    walk_dir_from(root, entry_of(root, r.unwrap), f)
+  }
+  if e = res.err {
+    fail e if !skip?(e)
+  }
+}
+
+# Walks the tree rooted at `root` (Go's Walk): like walk_dir, but f gets the
+# os.FileInfo of each file (lstat'ed: links aren't followed), and a
+# directory's error comes in the single call for it, before its contents.
+#  - The root can't be lstat'ed: f(root, none, err).
+#  - A directory can't be read: f(dir, info, err) and its contents are skipped.
+#  - A name in a directory can't be lstat'ed: f(name, none, err).
+# fs.FsError.SkipDir / SkipAll work as in walk_dir.
+pub def walk(root: Str, f: (Str, os.FileInfo?, Error?) -> ~Unit) -> ~Unit {
+  ~walk_with(root, ->(p: Str) -> ~os.FileInfo { ~os.lstat(p) }, f)
+}
+
+# walk with its lstat replaceable (Go's export_test LstatP hook).
+def walk_with(root: Str, lstat: (Str) -> ~os.FileInfo, f: (Str, os.FileInfo?, Error?) -> ~Unit) -> ~Unit {
+  r = lstat.call(root)
+  res = if e = r.err {
+    f(root, none, e)
+  } else {
+    walk_from(root, r.unwrap, lstat, f)
+  }
+  if e = res.err {
+    fail e if !skip?(e)
+  }
+}
+
+def skip?(e: Error) -> Bool {
+  case e {
+    fs.FsError.SkipDir => true
+    fs.FsError.SkipAll => true
+    _ => false
+  }
+}
+
+def skip_dir?(e: Error) -> Bool {
+  case e {
+    fs.FsError.SkipDir => true
+    _ => false
+  }
+}
+
+def entry_of(root: Str, info: os.FileInfo) -> os.DirEntry {
   kind = 4
   kind = 1 if info.is_regular
   kind = 2 if info.is_dir
   kind = 3 if info.is_symlink
-  top = os.DirEntry.new(name: base(root), dir: dir(root), kind: kind)
-  first = f(root, top)
-  return if first == WalkAction.Stop
-  return if first == WalkAction.SkipDir || !top.is_dir
-  frames: [[os.DirEntry]] = [~os.read_dir(root)]
-  next_at: [Int] = [0]
-  while frames.size > 0 {
-    k = frames.size - 1
-    i = next_at[k]
-    if i >= frames[k].size {
-      frames = frames[0...frames.size - 1]
-      next_at = next_at[0...next_at.size - 1]
-      next
+  os.DirEntry.new(name: base(root), dir: dir(root), kind: kind)
+}
+
+def walk_dir_from(p: Str, d: os.DirEntry, f: (Str, os.DirEntry?, Error?) -> ~Unit) -> ~Unit {
+  r = f(p, d, none)
+  if e = r.err {
+    return if skip_dir?(e) && d.is_dir
+    fail e
+  }
+  return if !d.is_dir
+  dirs: [os.DirEntry] = []
+  rd = os.read_dir(p)
+  if e = rd.err {
+    # Second call, to report the read_dir error.
+    r2 = f(p, d, e)
+    if e2 = r2.err {
+      return if skip_dir?(e2) && d.is_dir
+      fail e2
     }
-    next_at[k] = i + 1
-    en = frames[k][i]
-    p = en.path
-    act = f(p, en)
-    return if act == WalkAction.Stop
-    if act == WalkAction.SkipDir && !en.is_dir {
-      frames = frames[0...frames.size - 1]
-      next_at = next_at[0...next_at.size - 1]
-    } else if act == WalkAction.Continue && en.is_dir {
-      frames << ~os.read_dir(p)
-      next_at << 0
+  } else {
+    dirs = rd.unwrap
+  }
+  for d1 in dirs {
+    r3 = walk_dir_from(join([p, d1.name]), d1, f)
+    if e = r3.err {
+      break if skip_dir?(e)
+      fail e
     }
   }
 }
 
-# The names of files matching the pattern (Go's Glob), sorted by directory and
-# name. Wildcards may appear in any element of the path. An unreadable
-# directory is skipped. A malformed pattern fails.
-pub def glob(pattern: Str) -> ~[Str] {
-  out: [Str] = []
-  if !has_meta(pattern) {
-    st = os.lstat(pattern)
-    out << pattern if st.ok?
-    return out
-  }
-  d, file = split(pattern)
-  dd0 = d
-  dd0 = d[0...d.size - 1] if d.size > 1
-  dirs = [dd0]
-  if has_meta(dd0) {
-    dirs = ~glob(dd0)
-  }
-  for dd in dirs {
-    entries = os.read_dir(dd.size == 0 ? "." : dd)
-    next if entries.err?
-    for en in entries.unwrap {
-      ok = ~match(file, en.name)
-      out << (dd.size == 0 ? en.name : join([dd, en.name])) if ok
+def walk_from(p: Str, info: os.FileInfo, lstat: (Str) -> ~os.FileInfo, f: (Str, os.FileInfo?, Error?) -> ~Unit) -> ~Unit {
+  return ~f(p, info, none) if !info.is_dir
+  names: [Str] = []
+  rd = os.read_dir(p)
+  err: Error? = none
+  if e = rd.err {
+    err = e
+  } else {
+    for en in rd.unwrap {
+      names << en.name
     }
   }
-  out
+  ~f(p, info, err)
+  return if err.some?
+  for name in names {
+    filename = join([p, name])
+    st = lstat.call(filename)
+    if e = st.err {
+      r = f(filename, none, e)
+      if e2 = r.err {
+        fail e2 if !skip_dir?(e2)
+      }
+    } else {
+      fi = st.unwrap
+      r = walk_from(filename, fi, lstat, f)
+      if e = r.err {
+        fail e if !fi.is_dir || !skip_dir?(e)
+      }
+    }
+  }
+}
+
+# The names matching the pattern (Go's Glob), sorted within each directory;
+# wildcards may appear in any element. I/O errors (an unreadable directory)
+# are ignored; a malformed pattern fails with ErrBadPattern.
+pub def glob(pattern: Str) -> ~[Str]<FilepathError> {
+  ~glob_with_limit(pattern, 0)
+}
+
+def glob_with_limit(pattern: Str, depth: Int) -> ~[Str]<FilepathError> {
+  # Go's limit on recursion (CVE-2022-30632).
+  fail FilepathError.ErrBadPattern if depth == 10000
+  # Check the pattern is well-formed.
+  ~match(pattern, "")
+  if !has_meta(pattern) {
+    return [] if os.lstat(pattern).err?
+    return [pattern]
+  }
+  d, file = split(pattern)
+  d = clean_glob_path(d)
+  if !has_meta(d) {
+    return ~glob_dir(d, file, [])
+  }
+  # Prevent infinite recursion.
+  fail FilepathError.ErrBadPattern if d == pattern
+  deeper = depth + 1
+  m = ~glob_with_limit(d, deeper)
+  matches: [Str] = []
+  for dd in m {
+    matches = ~glob_dir(dd, file, matches)
+  }
+  matches
+}
+
+# A directory part of a pattern, as Go's cleanGlobPath: "" is ".", "/"
+# stays, otherwise the trailing separator goes.
+def clean_glob_path(p: Str) -> Str {
+  return "." if p == ""
+  return p if p == "/"
+  p[0...p.size - 1]
+}
+
+# The names in `d` matching `pattern`, appended to `matches`.
+def glob_dir(d: Str, pattern: Str, matches: [Str]) -> ~[Str]<FilepathError> {
+  m = matches
+  st = os.stat(d)
+  return m if st.err? || !st.unwrap.is_dir
+  rd = os.read_dir(d)
+  return m if rd.err?
+  for en in rd.unwrap {
+    ok = ~match(pattern, en.name)
+    m << join([d, en.name]) if ok
+  }
+  m
 }
 
 def has_meta(p: Str) -> Bool {

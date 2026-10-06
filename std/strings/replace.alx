@@ -1,0 +1,414 @@
+# Go's strings.Replacer (replace.go): replaces a list of strings with
+# replacements, in one pass.
+#
+#   Go                                  alx
+#   NewReplacer(oldnew ...string)       new_replacer(oldnew: [Str]) -> Replacer
+#   r.Replace(s)                        r.replace(s)
+#   r.WriteString(w, s) (int, error)    r.write_string(w, s) -> ~Int
+#
+# Replacements are performed in the order they appear in the target string,
+# without overlapping matches; the old strings are compared in argument order
+# (the first pair wins). new_replacer panics on an odd number of strings
+# ("strings.new_replacer: odd argument count"). The algorithm is Go's, picked
+# the same way: a byte map when every old and new string is one byte, a
+# byte-to-string table when every old string is one byte, Boyer-Moore for a
+# single old string of more than one byte, and the generic lookup trie
+# otherwise. A Replacer is built once, at new_replacer (Go builds it lazily
+# under a sync.Once), and never changes, so copies are interchangeable.
+#
+# Differences from Go: no variadics, so the pairs come as one slice; on a
+# write error write_string returns only the error, not the count written
+# before it.
+
+import "io"
+
+# The replacement algorithms (Go's replacer implementations).
+ALG_GENERIC = 0
+ALG_SINGLE = 1
+ALG_BYTE = 2
+ALG_BYTE_STRING = 3
+
+# A node of the generic replacer's lookup trie, in GenericReplacer.nodes
+# (indexes instead of pointers; -1 is nil). See Go's trieNode: a node is a
+# complete key if priority > 0; it has one child through prefix/next, or a
+# table of children indexed by remapped byte, or none.
+struct TrieNode {
+  value: Str
+  priority: Int
+  prefix: Str
+  next: Int
+  table: [Int]
+  has_table: Bool
+}
+
+def new_trie_node -> TrieNode {
+  TrieNode.new(value: "", priority: 0, prefix: "", next: -1, table: [], has_table: false)
+}
+
+# Go's genericReplacer: a lookup trie of the old strings.
+struct GenericReplacer {
+  nodes: [TrieNode]
+  # mapping maps key bytes to a dense index for TrieNode.table; bytes that
+  # start no key map to table_size.
+  mapping: [Int]
+  table_size: Int
+
+  def new_node! -> Int {
+    self.nodes << new_trie_node()
+    nodes.size - 1
+  }
+
+  def new_table -> [Int] {
+    t: [Int] = [-1; table_size]
+    t
+  }
+
+  def add!(t: Int, key: Str, val: Str, priority: Int) -> Unit {
+    if key == "" {
+      if nodes[t].priority == 0 {
+        self.nodes[t].value = val
+        self.nodes[t].priority = priority
+      }
+      return
+    }
+    tp = nodes[t].prefix
+    if tp != "" {
+      # Need to split the prefix among multiple nodes.
+      n = 0 # length of the longest common prefix
+      while n < tp.size && n < key.size {
+        break if tp[n] != key[n]
+        n += 1
+      }
+      if n == tp.size {
+        add!(nodes[t].next, key[n...key.size], val, priority)
+      } else if n == 0 {
+        # First byte differs, start a new lookup table here. Looking up
+        # what is currently tp[0] leads to prefix_node, and looking up key[0]
+        # leads to key_node.
+        prefix_node = nodes[t].next
+        if tp.size != 1 {
+          prefix_node = new_node!
+          self.nodes[prefix_node].prefix = tp[1...tp.size]
+          self.nodes[prefix_node].next = nodes[t].next
+        }
+        key_node = new_node!
+        tbl = new_table
+        tbl[mapping[tp[0].to_i]] = prefix_node
+        tbl[mapping[key[0].to_i]] = key_node
+        self.nodes[t].table = tbl
+        self.nodes[t].has_table = true
+        self.nodes[t].prefix = ""
+        self.nodes[t].next = -1
+        add!(key_node, key[1...key.size], val, priority)
+      } else {
+        # Insert a new node after the common section of the prefix.
+        nx = new_node!
+        self.nodes[nx].prefix = tp[n...tp.size]
+        self.nodes[nx].next = nodes[t].next
+        self.nodes[t].prefix = tp[0...n]
+        self.nodes[t].next = nx
+        add!(nx, key[n...key.size], val, priority)
+      }
+    } else if nodes[t].has_table {
+      # Insert into the existing table.
+      m = mapping[key[0].to_i]
+      if nodes[t].table[m] < 0 {
+        c = new_node!
+        self.nodes[t].table[m] = c
+      }
+      add!(nodes[t].table[m], key[1...key.size], val, priority)
+    } else {
+      self.nodes[t].prefix = key
+      nx = new_node!
+      self.nodes[t].next = nx
+      add!(nx, "", val, priority)
+    }
+  }
+
+  # The value and key length of the highest-priority key that is a prefix of
+  # s, if any; ignore_root skips the empty key.
+  def lookup(s0: Str, ignore_root: Bool) -> (Str, Int)? {
+    best_priority = 0
+    found = false
+    val = ""
+    keylen = 0
+    s = s0
+    node = 0
+    n = 0
+    while node >= 0 {
+      nd = nodes[node]
+      if nd.priority > best_priority && !(ignore_root && node == 0) {
+        best_priority = nd.priority
+        val = nd.value
+        keylen = n
+        found = true
+      }
+      break if s == ""
+      if nd.has_table {
+        index = mapping[s[0].to_i]
+        break if index == table_size
+        node = nd.table[index]
+        s = s[1...s.size]
+        n += 1
+      } else if nd.prefix != "" && has_prefix(s, nd.prefix) {
+        n += nd.prefix.size
+        s = s[nd.prefix.size...s.size]
+        node = nd.next
+      } else {
+        break
+      }
+    }
+    return none if !found
+    (val, keylen)
+  }
+
+  # The pieces Go's genericReplacer.WriteString writes for s, in order.
+  def pieces(s: Str) -> [Str] {
+    out: [Str] = []
+    n = s.size
+    last = 0
+    prev_match_empty = false
+    root = nodes[0]
+    i = 0
+    while i <= n {
+      # Fast path: s[i] is not a prefix of any pattern.
+      if i != n && root.priority == 0 {
+        index = mapping[s[i].to_i]
+        if index == table_size || root.table[index] < 0 {
+          i += 1
+          next
+        }
+      }
+      # Ignore the empty match iff the previous loop found the empty match.
+      m = lookup(s[i...n], prev_match_empty)
+      if hit = m {
+        prev_match_empty = hit[1] == 0
+        out << s[last...i]
+        out << hit[0]
+        i += hit[1]
+        last = i
+        next
+      }
+      prev_match_empty = false
+      i += 1
+    }
+    out << s[last...n] if last != n
+    out
+  }
+
+  # Go's printNode (export_test.go): the trie, one node per line.
+  def print_node(t: Int, depth: Int) -> Str {
+    nd = nodes[t]
+    s = nd.priority > 0 ? "+" : "-"
+    s += "\n"
+    if nd.prefix != "" {
+      s += repeat(".", depth) + nd.prefix
+      s += print_node(nd.next, depth + nd.prefix.size)
+    } else if nd.has_table {
+      b = 0
+      while b < 256 {
+        m = mapping[b]
+        if m != table_size && nd.table[m] >= 0 {
+          one: [Byte] = [b.as_u8]
+          s += repeat(".", depth) + Str.from_bytes(one)
+          s += print_node(nd.table[m], depth + 1)
+        }
+        b += 1
+      }
+    }
+    s
+  }
+}
+
+def make_generic_replacer(oldnew: [Str]) -> GenericReplacer {
+  used: [Int] = [0; 256]
+  i = 0
+  while i < oldnew.size {
+    for c in oldnew[i].bytes { used[c.to_i] = 1 }
+    i += 2
+  }
+  table_size = 0
+  for u in used { table_size += u }
+  mapping: [Int] = [0; 256]
+  index = 0
+  b = 0
+  while b < 256 {
+    if used[b] == 0 {
+      mapping[b] = table_size
+    } else {
+      mapping[b] = index
+      index += 1
+    }
+    b += 1
+  }
+  root = new_trie_node()
+  root.table = [-1; table_size]
+  root.has_table = true
+  g = GenericReplacer.new(nodes: [root], mapping: mapping, table_size: table_size)
+  i = 0
+  while i < oldnew.size {
+    g.add!(0, oldnew[i], oldnew[i + 1], oldnew.size - i)
+    i += 2
+  }
+  g
+}
+
+# A string replacer (Go's *strings.Replacer); see the file header.
+pub struct Replacer {
+  alg: Int
+  generic: GenericReplacer
+  finder: StringFinder
+  value: Str
+  # ALG_BYTE: the replacement of each byte.
+  byte_map: [Byte]
+  # ALG_BYTE_STRING: the replacement of each byte, where has_repl is set.
+  repl: [Str]
+  has_repl: [Bool]
+
+  # Go's algorithm name, for the tests (export_test.go's Replacer()).
+  def algorithm -> Str {
+    case alg {
+      ALG_GENERIC => "*strings.genericReplacer"
+      ALG_SINGLE => "*strings.singleStringReplacer"
+      ALG_BYTE => "*strings.byteReplacer"
+      _ => "*strings.byteStringReplacer"
+    }
+  }
+
+  # Go's PrintTrie (export_test.go), for a generic replacer.
+  def print_trie -> Str { generic.print_node(0, 0) }
+
+  # The pieces Go's WriteString writes for s, in order (the replacement
+  # bytes of the byte algorithms are written with Write in Go; here every
+  # piece goes through write_string where the writer has it).
+  def pieces(s: Str) -> [Str] {
+    if alg == ALG_GENERIC { return generic.pieces(s) }
+    out: [Str] = []
+    if alg == ALG_SINGLE {
+      i = 0
+      loop {
+        m = finder.next(s[i...s.size])
+        break if m == -1
+        out << s[i...i + m]
+        out << value
+        i += m + finder.pattern.size
+      }
+      out << s[i...s.size]
+      return out
+    }
+    last = 0
+    i = 0
+    while i < s.size {
+      b = s[i].to_i
+      if alg == ALG_BYTE {
+        if byte_map[b].to_i != b {
+          out << s[last...i] if last != i
+          last = i + 1
+          one: [Byte] = [byte_map[b]]
+          out << Str.from_bytes(one)
+        }
+      } else if has_repl[b] {
+        out << s[last...i] if last != i
+        last = i + 1
+        out << repl[b]
+      }
+      i += 1
+    }
+    out << s[last...s.size] if last != s.size
+    out
+  }
+
+  # s with all replacements performed.
+  pub def replace(s: Str) -> Str {
+    if alg == ALG_BYTE {
+      # Byte for byte, and s itself when nothing changes.
+      changed = false
+      for c in s.bytes {
+        if byte_map[c.to_i] != c {
+          changed = true
+          break
+        }
+      }
+      return s if !changed
+      out: [Byte] = [0; s.size]
+      i = 0
+      while i < s.size {
+        out[i] = byte_map[s[i].to_i]
+        i += 1
+      }
+      return Str.from_bytes(out)
+    }
+    b = Builder.new
+    for p in pieces(s) { b.put_str!(p, 0, p.size) }
+    b.to_s
+  }
+
+  # Writes s to w with all replacements performed; returns the number of
+  # bytes written.
+  pub def write_string[W](w: W, s: Str) -> ~Int {
+    n = 0
+    for p in pieces(s) {
+      if W is io.StringWriter {
+        n += w.~write_string!(p)
+      } else {
+        n += w.~write!(p.bytes.to_a)
+      }
+    }
+    n
+  }
+}
+
+# A Replacer from old, new string pairs (Go's NewReplacer(oldnew...)).
+# Panics if oldnew has an odd number of strings.
+pub def new_replacer(oldnew: [Str]) -> Replacer {
+  panic "strings.new_replacer: odd argument count" if oldnew.size % 2 == 1
+  empty_g = GenericReplacer.new(nodes: [], mapping: [], table_size: 0)
+  empty_f = StringFinder.new(pattern: "", bad_char_skip: [], good_suffix_skip: [])
+  r = Replacer.new(alg: ALG_GENERIC, generic: empty_g, finder: empty_f, value: "", byte_map: [], repl: [], has_repl: [])
+  if oldnew.size == 2 && oldnew[0].size > 1 {
+    r.alg = ALG_SINGLE
+    r.finder = make_string_finder(oldnew[0])
+    r.value = oldnew[1]
+    return r
+  }
+  all_new_bytes = true
+  i = 0
+  while i < oldnew.size {
+    if oldnew[i].size != 1 {
+      r.generic = make_generic_replacer(oldnew)
+      return r
+    }
+    all_new_bytes = false if oldnew[i + 1].size != 1
+    i += 2
+  }
+  if all_new_bytes {
+    r.alg = ALG_BYTE
+    bm: [Byte] = [0; 256]
+    b = 0
+    while b < 256 {
+      bm[b] = b.as_u8
+      b += 1
+    }
+    # The first occurrence of an old byte takes precedence over later ones.
+    i = oldnew.size - 2
+    while i >= 0 {
+      bm[oldnew[i][0].to_i] = oldnew[i + 1][0]
+      i -= 2
+    }
+    r.byte_map = bm
+    return r
+  }
+  r.alg = ALG_BYTE_STRING
+  rp: [Str] = [""; 256]
+  has: [Bool] = [false; 256]
+  i = oldnew.size - 2
+  while i >= 0 {
+    o = oldnew[i][0].to_i
+    rp[o] = oldnew[i + 1]
+    has[o] = true
+    i -= 2
+  }
+  r.repl = rp
+  r.has_repl = has
+  r
+}

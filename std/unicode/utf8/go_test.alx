@@ -1,0 +1,520 @@
+#![test(external)]
+# Go's utf8_test.go and example_test.go (package utf8_test), translated.
+# Byte strings that aren't valid UTF-8 are built with `bs([...])`.
+
+import "fmt"
+import "unicode"
+import "unicode/utf8"
+
+def bs(xs: [Int]) -> Str { Str.from_bytes(xs.map { it.as_u8 }) }
+
+struct Utf8Map {
+  r: Rune
+  str: Str
+}
+
+def um(r: Int, b: [Int]) -> Utf8Map { Utf8Map.new(r: r.to_i32, str: bs(b)) }
+
+def utf8map -> [Utf8Map] {
+  [
+    um(0x0000, [0x00]),
+    um(0x0001, [0x01]),
+    um(0x007e, [0x7e]),
+    um(0x007f, [0x7f]),
+    um(0x0080, [0xc2, 0x80]),
+    um(0x0081, [0xc2, 0x81]),
+    um(0x00bf, [0xc2, 0xbf]),
+    um(0x00c0, [0xc3, 0x80]),
+    um(0x00c1, [0xc3, 0x81]),
+    um(0x00c8, [0xc3, 0x88]),
+    um(0x00d0, [0xc3, 0x90]),
+    um(0x00e0, [0xc3, 0xa0]),
+    um(0x00f0, [0xc3, 0xb0]),
+    um(0x00f8, [0xc3, 0xb8]),
+    um(0x00ff, [0xc3, 0xbf]),
+    um(0x0100, [0xc4, 0x80]),
+    um(0x07ff, [0xdf, 0xbf]),
+    um(0x0400, [0xd0, 0x80]),
+    um(0x0800, [0xe0, 0xa0, 0x80]),
+    um(0x0801, [0xe0, 0xa0, 0x81]),
+    um(0x1000, [0xe1, 0x80, 0x80]),
+    um(0xd000, [0xed, 0x80, 0x80]),
+    um(0xd7ff, [0xed, 0x9f, 0xbf]), # last code point before surrogate half.
+    um(0xe000, [0xee, 0x80, 0x80]), # first code point after surrogate half.
+    um(0xfffe, [0xef, 0xbf, 0xbe]),
+    um(0xffff, [0xef, 0xbf, 0xbf]),
+    um(0x10000, [0xf0, 0x90, 0x80, 0x80]),
+    um(0x10001, [0xf0, 0x90, 0x80, 0x81]),
+    um(0x40000, [0xf1, 0x80, 0x80, 0x80]),
+    um(0x10fffe, [0xf4, 0x8f, 0xbf, 0xbe]),
+    um(0x10ffff, [0xf4, 0x8f, 0xbf, 0xbf]),
+    um(0xFFFD, [0xef, 0xbf, 0xbd]),
+  ]
+}
+
+def surrogate_map -> [Utf8Map] {
+  [
+    um(0xd800, [0xed, 0xa0, 0x80]), # surrogate min decodes to (RuneError, 1)
+    um(0xdfff, [0xed, 0xbf, 0xbf]), # surrogate max decodes to (RuneError, 1)
+  ]
+}
+
+def test_strings -> [Str] {
+  [
+    "",
+    "abcd",
+    "☺☻☹",
+    "日a本b語ç日ð本Ê語þ日¥本¼語i日©",
+    "日a本b語ç日ð本Ê語þ日¥本¼語i日©日a本b語ç日ð本Ê語þ日¥本¼語i日©日a本b語ç日ð本Ê語þ日¥本¼語i日©",
+    bs([0x80, 0x80, 0x80, 0x80]),
+  ]
+}
+
+# Validate the constants redefined from unicode.
+test "Constants" {
+  assert_eq utf8.MAX_RUNE, unicode.MAX_RUNE
+  assert_eq utf8.RUNE_ERROR, unicode.REPLACEMENT_CHAR
+}
+
+test "FullRune" {
+  for m in utf8map {
+    b = m.str.bytes
+    assert utf8.full_rune(b), "full_rune(#{m.str.bytes}) (#{m.r}) = false, want true"
+    assert utf8.full_rune_in_string(m.str), "full_rune_in_string(#{m.str.bytes}) = false, want true"
+    b1 = b[0...b.size - 1]
+    assert !utf8.full_rune(b1), "full_rune(#{b1}) = true, want false"
+    s1 = Str.from_bytes(b1)
+    assert !utf8.full_rune_in_string(s1), "full_rune_in_string(#{b1}) = true, want false"
+  }
+  for s in [bs([0xc0]), bs([0xc1])] {
+    assert utf8.full_rune(s.bytes), "full_rune(#{s.bytes}) = false, want true"
+    assert utf8.full_rune_in_string(s), "full_rune_in_string(#{s.bytes}) = false, want true"
+  }
+}
+
+test "EncodeRune" {
+  for m in utf8map {
+    buf: [Byte] = [0; 10]
+    n = utf8.encode_rune_into(buf, m.r)
+    assert_eq Str.from_bytes(buf[0...n]), m.str
+    assert_eq utf8.encode_rune(m.r), m.str.bytes
+  }
+}
+
+test "AppendRune" {
+  for m in utf8map {
+    empty: [Byte] = []
+    assert_eq Str.from_bytes(utf8.append_rune(empty, m.r)), m.str
+    assert_eq Str.from_bytes(utf8.append_rune("init".bytes, m.r)), "init" + m.str
+  }
+}
+
+test "DecodeRune" {
+  for m in utf8map {
+    b = m.str.bytes
+    assert_eq utf8.decode_rune(b), (m.r, b.size)
+    assert_eq utf8.decode_rune_in_string(m.str), (m.r, b.size)
+
+    # there's an extra byte that bytes left behind - make sure trailing byte works
+    b0 = (m.str + "\0").bytes
+    assert_eq utf8.decode_rune(b0), (m.r, b.size)
+    assert_eq utf8.decode_rune_in_string(m.str + "\0"), (m.r, b.size)
+
+    # make sure missing bytes fail
+    wantsize = 1
+    wantsize = 0 if wantsize >= b.size
+    assert_eq utf8.decode_rune(b[0...b.size - 1]), (utf8.RUNE_ERROR, wantsize)
+    assert_eq utf8.decode_rune_in_string(m.str[0...m.str.size - 1]), (utf8.RUNE_ERROR, wantsize)
+
+    # make sure bad sequences fail
+    bad = b.dup
+    if bad.size == 1 {
+      bad[0] = 0x80
+    } else {
+      bad[bad.size - 1] = 0x7F
+    }
+    assert_eq utf8.decode_rune(bad), (utf8.RUNE_ERROR, 1)
+    assert_eq utf8.decode_rune_in_string(Str.from_bytes(bad)), (utf8.RUNE_ERROR, 1)
+  }
+}
+
+test "DecodeSurrogateRune" {
+  for m in surrogate_map {
+    assert_eq utf8.decode_rune(m.str.bytes), (utf8.RUNE_ERROR, 1)
+    assert_eq utf8.decode_rune_in_string(m.str), (utf8.RUNE_ERROR, 1)
+  }
+}
+
+# Check that decode_rune and decode_last_rune correspond to the runes Str.runes
+# visits (Go: the equivalent range loop).
+#[track_caller]
+def check_sequence(s: Str) {
+  b = s.bytes
+  runes = s.runes
+  indexes: [Int] = []
+  si = 0
+  j = 0
+  while si < s.size {
+    r1, size1 = utf8.decode_rune(b[si...b.size])
+    r2, size2 = utf8.decode_rune_in_string(s[si...s.size])
+    assert j < runes.size, "Sequence(#{s.bytes}) decoded more runes than Str.runes"
+    assert_eq r1, runes[j]
+    assert_eq r2, runes[j]
+    assert_eq size1, size2
+    indexes << si
+    si += size1
+    j += 1
+  }
+  assert_eq j, runes.size
+  j -= 1
+  si = s.size
+  while si > 0 {
+    r1, size1 = utf8.decode_last_rune(b[0...si])
+    r2, size2 = utf8.decode_last_rune_in_string(s[0...si])
+    assert_eq size1, size2
+    assert_eq r1, runes[j]
+    assert_eq r2, runes[j]
+    si -= size1
+    assert_eq si, indexes[j]
+    j -= 1
+  }
+  assert_eq si, 0
+}
+
+test "Sequencing" {
+  for ts in test_strings {
+    for m in utf8map {
+      for s in [ts + m.str, m.str + ts, ts + m.str + ts] {
+        check_sequence(s)
+      }
+    }
+  }
+}
+
+# Check that Str.runes and rune_count_in_string agree (Go: len([]rune(s)), the
+# range loop and []rune(s)).
+test "RuntimeConversion" {
+  for ts in test_strings {
+    count = utf8.rune_count_in_string(ts)
+    runes = ts.runes
+    assert_eq runes.size, count
+    i = 0
+    off = 0
+    while off < ts.size {
+      r, n = utf8.decode_rune_in_string(ts[off...ts.size])
+      assert_eq r, runes[i]
+      off += n
+      i += 1
+    }
+  }
+}
+
+def invalid_sequence_tests -> [Str] {
+  [
+    bs([0xed, 0xa0, 0x80, 0x80]), # surrogate min
+    bs([0xed, 0xbf, 0xbf, 0x80]), # surrogate max
+    # xx
+    bs([0x91, 0x80, 0x80, 0x80]),
+    # s1
+    bs([0xC2, 0x7F, 0x80, 0x80]),
+    bs([0xC2, 0xC0, 0x80, 0x80]),
+    bs([0xDF, 0x7F, 0x80, 0x80]),
+    bs([0xDF, 0xC0, 0x80, 0x80]),
+    # s2
+    bs([0xE0, 0x9F, 0xBF, 0x80]),
+    bs([0xE0, 0xA0, 0x7F, 0x80]),
+    bs([0xE0, 0xBF, 0xC0, 0x80]),
+    bs([0xE0, 0xC0, 0x80, 0x80]),
+    # s3
+    bs([0xE1, 0x7F, 0xBF, 0x80]),
+    bs([0xE1, 0x80, 0x7F, 0x80]),
+    bs([0xE1, 0xBF, 0xC0, 0x80]),
+    bs([0xE1, 0xC0, 0x80, 0x80]),
+    # s4
+    bs([0xED, 0x7F, 0xBF, 0x80]),
+    bs([0xED, 0x80, 0x7F, 0x80]),
+    bs([0xED, 0x9F, 0xC0, 0x80]),
+    bs([0xED, 0xA0, 0x80, 0x80]),
+    # s5
+    bs([0xF0, 0x8F, 0xBF, 0xBF]),
+    bs([0xF0, 0x90, 0x7F, 0xBF]),
+    bs([0xF0, 0x90, 0x80, 0x7F]),
+    bs([0xF0, 0xBF, 0xBF, 0xC0]),
+    bs([0xF0, 0xBF, 0xC0, 0x80]),
+    bs([0xF0, 0xC0, 0x80, 0x80]),
+    # s6
+    bs([0xF1, 0x7F, 0xBF, 0xBF]),
+    bs([0xF1, 0x80, 0x7F, 0xBF]),
+    bs([0xF1, 0x80, 0x80, 0x7F]),
+    bs([0xF1, 0xBF, 0xBF, 0xC0]),
+    bs([0xF1, 0xBF, 0xC0, 0x80]),
+    bs([0xF1, 0xC0, 0x80, 0x80]),
+    # s7
+    bs([0xF4, 0x7F, 0xBF, 0xBF]),
+    bs([0xF4, 0x80, 0x7F, 0xBF]),
+    bs([0xF4, 0x80, 0x80, 0x7F]),
+    bs([0xF4, 0x8F, 0xBF, 0xC0]),
+    bs([0xF4, 0x8F, 0xC0, 0x80]),
+    bs([0xF4, 0x90, 0x80, 0x80]),
+  ]
+}
+
+test "DecodeInvalidSequence" {
+  for s in invalid_sequence_tests {
+    r1, _n1 = utf8.decode_rune(s.bytes)
+    assert_eq r1, utf8.RUNE_ERROR
+    r2, _n2 = utf8.decode_rune_in_string(s)
+    assert_eq r2, utf8.RUNE_ERROR
+    # Go: runtime.decoderune, the range loop's decoder
+    assert_eq s.runes[0], r2
+  }
+}
+
+# Check that negative runes encode as U+FFFD.
+test "NegativeRune" {
+  errorbuf: [Byte] = [0; 4]
+  errorbuf = errorbuf[0...utf8.encode_rune_into(errorbuf, utf8.RUNE_ERROR)]
+  buf: [Byte] = [0; 4]
+  buf = buf[0...utf8.encode_rune_into(buf, -1)]
+  assert_eq buf, errorbuf
+}
+
+test "EncodeRune into a short buffer panics" {
+  assert_panics("index") {
+    short: [Byte] = [0; 2]
+    utf8.encode_rune_into(short, 0x4E16)
+  }
+}
+
+test "RuneCount" {
+  runecounttests = [
+    ("abcd", 4),
+    ("☺☻☹", 3),
+    ("1,2,3,4", 7),
+    (bs([0xe2, 0x00]), 2),
+    (bs([0xe2, 0x80]), 2),
+    (bs([0x61, 0xe2, 0x80]), 3),
+  ]
+  for tt in runecounttests {
+    assert_eq utf8.rune_count_in_string(tt[0]), tt[1]
+    assert_eq utf8.rune_count(tt[0].bytes), tt[1]
+  }
+}
+
+test "RuneLen" {
+  runelentests: [(Rune, Int)] = [
+    (0, 1),
+    (0x65, 1),   # 'e'
+    (0xe9, 2),   # 'é'
+    (0x263a, 3), # '☺'
+    (utf8.RUNE_ERROR, 3),
+    (utf8.MAX_RUNE, 4),
+    (0xD800, -1),
+    (0xDFFF, -1),
+    (utf8.MAX_RUNE + 1, -1),
+    (-1, -1),
+  ]
+  for tt in runelentests {
+    assert_eq utf8.rune_len(tt[0]), tt[1]
+  }
+}
+
+def valid_tests -> [(Str, Bool)] {
+  tests = [
+    ("", true),
+    ("a", true),
+    ("abc", true),
+    ("Ж", true),
+    ("ЖЖ", true),
+    ("брэд-ЛГТМ", true),
+    ("☺☻☹", true),
+    (bs([0x61, 0x61, 0xe2]), false),
+    (bs([66, 250]), false),
+    (bs([66, 250, 67]), false),
+    ("a\uFFFDb", true),
+    (bs([0xF4, 0x8F, 0xBF, 0xBF]), true),        # U+10FFFF
+    (bs([0xF4, 0x90, 0x80, 0x80]), false),       # U+10FFFF+1; out of range
+    (bs([0xF7, 0xBF, 0xBF, 0xBF]), false),       # 0x1FFFFF; out of range
+    (bs([0xFB, 0xBF, 0xBF, 0xBF, 0xBF]), false), # 0x3FFFFFF; out of range
+    (bs([0xc0, 0x80]), false),                   # U+0000 encoded in two bytes: incorrect
+    (bs([0xed, 0xa0, 0x80]), false),             # U+D800 high surrogate (sic)
+    (bs([0xed, 0xbf, 0xbf]), false),             # U+DFFF low surrogate (sic)
+  ]
+  e2 = bs([0xe2])
+  for i in 0...100 {
+    tests << ("a" * i, true)
+    tests << ("a" * i + "Ж", true)
+    tests << ("a" * i + e2, false)
+    tests << ("a" * i + "Ж" + "b" * i, true)
+    tests << ("a" * i + e2 + "b" * i, false)
+  }
+  tests
+}
+
+test "Valid" {
+  for tt in valid_tests {
+    assert_eq utf8.valid(tt[0].bytes), tt[1]
+    assert_eq utf8.valid_string(tt[0]), tt[1]
+  }
+}
+
+test "ValidRune" {
+  validrunetests: [(Rune, Bool)] = [
+    (0, true),
+    (0x65, true),   # 'e'
+    (0xe9, true),   # 'é'
+    (0x263a, true), # '☺'
+    (utf8.RUNE_ERROR, true),
+    (utf8.MAX_RUNE, true),
+    (0xD7FF, true),
+    (0xD800, false),
+    (0xDFFF, false),
+    (0xE000, true),
+    (utf8.MAX_RUNE + 1, false),
+    (-1, false),
+  ]
+  for tt in validrunetests {
+    assert_eq utf8.valid_rune(tt[0]), tt[1]
+  }
+}
+
+bench "RuneCountTenJapaneseChars" {
+  s = "日本語日本語日本語日".bytes
+  utf8.rune_count(s)
+}
+
+bench "ValidStringTenJapaneseChars" {
+  utf8.valid_string("日本語日本語日本語日")
+}
+
+bench "EncodeJapaneseRune" {
+  buf: [Byte] = [0; 4]
+  utf8.encode_rune_into(buf, 0x672C)
+}
+
+# example_test.go
+
+example "DecodeLastRune" {
+  b = "Hello, 世界".bytes
+  while b.size > 0 {
+    r, size = utf8.decode_last_rune(b)
+    fmt.printf("%c %v\n", r, size)
+    b = b[0...b.size - size]
+  }
+} outputs "界 3\n世 3\n  1\n, 1\no 1\nl 1\nl 1\ne 1\nH 1\n"
+
+example "DecodeLastRuneInString" {
+  str = "Hello, 世界"
+  while str.size > 0 {
+    r, size = utf8.decode_last_rune_in_string(str)
+    fmt.printf("%c %v\n", r, size)
+    str = str[0...str.size - size]
+  }
+} outputs "界 3\n世 3\n  1\n, 1\no 1\nl 1\nl 1\ne 1\nH 1\n"
+
+example "DecodeRune" {
+  b = "Hello, 世界".bytes
+  while b.size > 0 {
+    r, size = utf8.decode_rune(b)
+    fmt.printf("%c %v\n", r, size)
+    b = b[size...b.size]
+  }
+} outputs "H 1\ne 1\nl 1\nl 1\no 1\n, 1\n  1\n世 3\n界 3\n"
+
+example "DecodeRuneInString" {
+  str = "Hello, 世界"
+  while str.size > 0 {
+    r, size = utf8.decode_rune_in_string(str)
+    fmt.printf("%c %v\n", r, size)
+    str = str[size...str.size]
+  }
+} outputs "H 1\ne 1\nl 1\nl 1\no 1\n, 1\n  1\n世 3\n界 3\n"
+
+example "EncodeRune" {
+  r: Rune = 0x4E16 # '世'
+  buf: [Byte] = [0; 3]
+  n = utf8.encode_rune_into(buf, r)
+  puts buf
+  puts n
+} outputs "[228 184 150]\n3\n"
+
+example "EncodeRune out of range" {
+  runes: [Rune] = [
+    # Less than 0, out of range.
+    -1,
+    # Greater than 0x10FFFF, out of range.
+    0x110000,
+    # The Unicode replacement character.
+    utf8.RUNE_ERROR,
+  ]
+  for i in 0...runes.size {
+    buf: [Byte] = [0; 3]
+    size = utf8.encode_rune_into(buf, runes[i])
+    fmt.printf("%d: %v %s %d\n", i, buf, Str.from_bytes(buf), size)
+  }
+} outputs "0: [239 191 189] � 3\n1: [239 191 189] � 3\n2: [239 191 189] � 3\n"
+
+example "FullRune" {
+  buf: [Byte] = [228, 184, 150] # 世
+  puts utf8.full_rune(buf)
+  puts utf8.full_rune(buf[0...2])
+} outputs "true\nfalse\n"
+
+example "FullRuneInString" {
+  str = "世"
+  puts utf8.full_rune_in_string(str)
+  puts utf8.full_rune_in_string(str[0...2])
+} outputs "true\nfalse\n"
+
+example "RuneCount" {
+  buf = "Hello, 世界".bytes
+  puts "bytes = #{buf.size}"
+  puts "runes = #{utf8.rune_count(buf)}"
+} outputs "bytes = 13\nrunes = 9\n"
+
+example "RuneCountInString" {
+  str = "Hello, 世界"
+  puts "bytes = #{str.size}"
+  puts "runes = #{utf8.rune_count_in_string(str)}"
+} outputs "bytes = 13\nrunes = 9\n"
+
+example "RuneLen" {
+  puts utf8.rune_len(0x61)   # 'a'
+  puts utf8.rune_len(0x754C) # '界'
+} outputs "1\n3\n"
+
+example "RuneStart" {
+  buf = "a界".bytes
+  puts utf8.rune_start(buf[0])
+  puts utf8.rune_start(buf[1])
+  puts utf8.rune_start(buf[2])
+} outputs "true\ntrue\nfalse\n"
+
+example "Valid" {
+  valid = "Hello, 世界".bytes
+  invalid: [Byte] = [0xff, 0xfe, 0xfd]
+  puts utf8.valid(valid)
+  puts utf8.valid(invalid)
+} outputs "true\nfalse\n"
+
+example "ValidRune" {
+  valid: Rune = 0x61 # 'a'
+  invalid: Rune = 0xfffffff
+  puts utf8.valid_rune(valid)
+  puts utf8.valid_rune(invalid)
+} outputs "true\nfalse\n"
+
+example "ValidString" {
+  valid = "Hello, 世界"
+  invalid = bs([0xff, 0xfe, 0xfd])
+  puts utf8.valid_string(valid)
+  puts utf8.valid_string(invalid)
+} outputs "true\nfalse\n"
+
+example "AppendRune" {
+  empty: [Byte] = []
+  buf1 = utf8.append_rune(empty, 0x10000)
+  buf2 = utf8.append_rune("init".bytes, 0x10000)
+  puts Str.from_bytes(buf1)
+  puts Str.from_bytes(buf2)
+} outputs "𐀀\ninit𐀀\n"

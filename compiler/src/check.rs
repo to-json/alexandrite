@@ -1881,11 +1881,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     }
                 }
             }
-            if let TK::M(_, _, _, Some(b)) = &e.kind {
-                for s in &b.body {
-                    crate::prove::stmt_exprs(s, &mut |x| reads(x, out));
-                }
-            }
+            // (each_child visits blocks' and Seqs' statements too.)
             crate::prove::each_child(e, &mut |x| reads(x, out));
         }
         for s in &body {

@@ -869,11 +869,7 @@ fn loop_extent(g: &Graph, key: usize) -> (u32, u32) {
 fn span_extent(e: &TExpr, lo: &mut u32, hi: &mut u32) {
     *lo = (*lo).min(e.span.lo);
     *hi = (*hi).max(e.span.hi);
-    if let TK::M(_, _, _, Some(b)) = &e.kind {
-        for s in &b.body {
-            crate::prove::stmt_exprs(s, &mut |x| span_extent(x, lo, hi));
-        }
-    }
+    // (each_child visits blocks' statements too.)
     crate::prove::each_child(e, &mut |c| span_extent(c, lo, hi));
 }
 
@@ -892,20 +888,26 @@ fn expr_spans(e: &TExpr, l: LocalId, out: &mut Vec<crate::diag::Span>) {
         TK::Local(x) | TK::Assign(x, _) | TK::IndexAssign(x, ..) | TK::PlaceAssign(x, ..) if *x == l => out.push(e.span),
         _ => {}
     }
-    if let TK::M(_, _, _, Some(b)) = &e.kind {
-        if b.params.contains(&l) {
-            out.push(b.span);
+    // A block's or a Seq's statements go through local_spans (multiple
+    // assignment); `each_child` would visit them again, doubling the work
+    // at every level of nesting.
+    match &e.kind {
+        TK::M(_, r, args, Some(b)) => {
+            r.iter().map(|r| &**r).chain(args).for_each(|c| expr_spans(c, l, out));
+            if b.params.contains(&l) {
+                out.push(b.span);
+            }
+            for s in &b.body {
+                local_spans(s, l, out);
+            }
         }
-        for s in &b.body {
-            local_spans(s, l, out);
+        TK::Seq(ss) => {
+            for s in ss {
+                local_spans(s, l, out);
+            }
         }
+        _ => crate::prove::each_child(e, &mut |c| expr_spans(c, l, out)),
     }
-    if let TK::Seq(ss) = &e.kind {
-        for s in ss {
-            local_spans(s, l, out);
-        }
-    }
-    crate::prove::each_child(e, &mut |c| expr_spans(c, l, out));
 }
 
 /// `alx explain mem`: every allocation site of the program's own code,

@@ -4434,10 +4434,17 @@ impl<'a> Lw<'a> {
                         let out = self.tmp(self.lty(&e.ty));
                         self.emit(LS::Set(out, val));
                         let b = blk.unwrap();
-                        let body = self.sub(|lw| {
+                        let mut body = self.sub(|lw| {
                             let v = lw.inline_block(b, &[err], &[], None);
                             lw.emit(LS::Set(out, v));
                         });
+                        // A block that ends in `fail` / `return` / a panic has
+                        // no value: nothing to store after the jump (the C and
+                        // Rust backends reject a Unit stored into the result).
+                        let n = body.len();
+                        if n >= 2 && matches!(body[n - 2], LS::Return(_) | LS::Die(_) | LS::Panic(..) | LS::Break(_) | LS::Continue(_)) {
+                            body.pop();
+                        }
                         self.emit(LS::If(LE::Not(Box::new(ok)), body, vec![]));
                         LE::Var(out)
                     }

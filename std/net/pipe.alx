@@ -17,39 +17,37 @@ pub struct PipeAddr {
 }
 
 # A deadline for one direction of a pipe (Go's pipeDeadline): `cancel` is
-# closed when it passes.
+# closed when it passes. The timer task holds only the channel and its flag
+# (runtime handles), not the Mutex (port-issues #237: a task's view of a
+# Mutex dies with the region that holds it).
 struct PipeDeadline {
   st: Mutex[PipeDlState]
 
   def set(t: time.Time) {
-    me = st
     dur = t.is_zero ? 0 : time.until(t).ns
-    # The gen of a timer to start (0: none).
-    g = st.lock { |s|
+    # The gen of a timer to start (0: none), and what it closes.
+    g, c, flag = st.lock { |s|
       s.gen += 1
       s.at = t.is_zero ? 0 : t.unix_nano
       start = 0
+      cur = s.flag.load
       if t.is_zero || dur > 0 {
-        if s.closed {
+        # Re-arm: an older timer closes the channel only while the flag
+        # holds its gen.
+        if cur == -1 || !s.flag.compare_and_swap(cur, s.gen) {
           s.cancel = Chan[Bool].new
-          s.closed = false
+          s.flag = Atomic.new(s.gen)
         }
         start = s.gen if dur > 0
-      } elsif !s.closed {
+      } elsif cur != -1 && s.flag.compare_and_swap(cur, -1) {
         s.cancel.close
-        s.closed = true
       }
-      start
+      (start, s.cancel, s.flag)
     }
     if g > 0 {
       spawn {
         alx_sleep_ns(dur)
-        me.lock { |s2|
-          if s2.gen == g && !s2.closed {
-            s2.cancel.close
-            s2.closed = true
-          }
-        }
+        c.close if flag.compare_and_swap(g, -1)
       }
     }
   }
@@ -62,13 +60,14 @@ struct PipeDeadline {
 
 struct PipeDlState {
   cancel: Chan[Bool]
-  closed: Bool
+  # The gen of the timer that may close `cancel`, or -1 once it is closed.
+  flag: Atomic[Int]
   gen: Int
   # The deadline (Unix ns; 0: none), for tests' fake servers.
   at: Int
 }
 
-def make_pipe_deadline -> PipeDeadline { PipeDeadline.new(st: Mutex.new(PipeDlState.new(cancel: Chan[Bool].new, closed: false, gen: 0, at: 0))) }
+def make_pipe_deadline -> PipeDeadline { PipeDeadline.new(st: Mutex.new(PipeDlState.new(cancel: Chan[Bool].new, flag: Atomic.new(0), gen: 0, at: 0))) }
 
 def closed_chan?(c: Chan[Bool]) -> Bool {
   r = false

@@ -66,24 +66,34 @@ pub struct Parser<'a> {
     gjobs: Vec<crate::derive_gob::GobJob>,
     /// derive(Xml) jobs (see derive_xml.rs).
     xjobs: Vec<crate::derive_xml::XmlJob>,
+    /// The file's own name for `os/exec` (`import "os/exec"`), which command
+    /// literals use when no local hides it.
+    cmd_pkg: Option<String>,
+    /// A command literal that needed the parser's own `os/exec` import
+    /// (`CMD_PKG`): the first one's span.
+    cmd_own: Option<Span>,
 }
 
 type PResult<T> = Result<T, Diag>;
 
-/// The local name of the `os/exec` import that command literals use.
+/// The local name of the `os/exec` import that command literals use when the
+/// file doesn't import it itself.
 const CMD_PKG: &str = "alxexec";
 
 pub fn parse(file: u32, toks: &[Token], next_id: &mut NodeId) -> PResult<Module> {
-    let mut p = Parser { toks, pos: 0, next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], cur_asn1: Default::default(), jobs: vec![], cur_data_name: None, djobs: vec![], xjobs: vec![], cur_transparent: false, gjobs: vec![] };
+    let mut p = Parser::new(toks, next_id, vec![HashSet::new()]);
+    // A file that imports os/exec itself: its command literals use that import.
+    p.cmd_pkg = (0..toks.len()).find_map(|k| {
+        let line_start = k == 0 || matches!(toks[k - 1].tok, Tok::Newline | Tok::Op(";"));
+        match (&toks[k].tok, toks.get(k + 1).map(|t| &t.tok), toks.get(k + 2).map(|t| &t.tok)) {
+            (Tok::Ident(kw), Some(Tok::Str(p)), _) if line_start && kw == "import" && p == "os/exec" => Some(default_import_name(p)),
+            (Tok::Ident(kw), Some(Tok::Ident(a)), Some(Tok::Str(p))) if line_start && kw == "import" && p == "os/exec" => Some(a.clone()),
+            _ => None,
+        }
+    });
     let mut m = p.module(file)?;
     // Command literals call into os/exec (also from inside `#{...}`).
-    let has_cmd = toks.iter().any(|t| match &t.tok {
-        Tok::Cmd(_) => true,
-        Tok::Interp(ps) => ps.iter().any(|x| matches!(x, IPiece::Code(c, _) if c.contains('`'))),
-        _ => false,
-    });
-    if has_cmd {
-        let span = toks.iter().find(|t| matches!(t.tok, Tok::Cmd(_))).map_or(toks[0].span, |t| t.span);
+    if let Some(span) = p.cmd_own {
         m.imports.push(Import { alias: Some(CMD_PKG.into()), path: "os/exec".into(), span });
     }
     Ok(m)
@@ -93,7 +103,7 @@ pub fn parse(file: u32, toks: &[Token], next_id: &mut NodeId) -> PResult<Module>
 /// text (`format`'s composite values: check.rs `fmt_text`). `locals` are the
 /// names in scope.
 pub fn parse_expr(toks: &[Token], next_id: &mut NodeId, locals: &[String]) -> PResult<Expr> {
-    let mut p = Parser { toks, pos: 0, next_id, scopes: vec![locals.iter().cloned().collect()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], cur_asn1: Default::default(), jobs: vec![], cur_data_name: None, djobs: vec![], xjobs: vec![], cur_transparent: false, gjobs: vec![] };
+    let mut p = Parser::new(toks, next_id, vec![locals.iter().cloned().collect()]);
     let e = p.expr()?;
     p.skip_newlines();
     if !matches!(p.peek(), Tok::Eof) {
@@ -103,6 +113,27 @@ pub fn parse_expr(toks: &[Token], next_id: &mut NodeId, locals: &[String]) -> PR
 }
 
 impl<'a> Parser<'a> {
+    fn new(toks: &'a [Token], next_id: &'a mut NodeId, scopes: Vec<HashSet<String>>) -> Self {
+        Parser {
+            toks,
+            pos: 0,
+            next_id,
+            scopes,
+            in_cond: false,
+            usings: vec![],
+            extern_mode: false,
+            cur_derives: vec![],
+            cur_asn1: Default::default(),
+            jobs: vec![],
+            cur_data_name: None,
+            djobs: vec![],
+            xjobs: vec![],
+            cur_transparent: false,
+            gjobs: vec![],
+            cmd_pkg: None,
+            cmd_own: None,
+        }
+    }
     fn peek(&self) -> &Tok {
         &self.toks[self.pos].tok
     }
@@ -173,13 +204,15 @@ impl<'a> Parser<'a> {
     /// The expression in an embedded piece of source (`#{...}`).
     fn code_expr(&mut self, src: &str, base: u32, sp: Span, what: &str) -> PResult<Expr> {
         let toks = crate::lexer::lex_at(sp.file, src, base)?;
-        let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: self.scopes.clone(), in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], cur_asn1: Default::default(), jobs: vec![], cur_data_name: None, djobs: vec![], xjobs: vec![], cur_transparent: false, gjobs: vec![] };
+        let mut sub = Parser::new(&toks, self.next_id, self.scopes.clone());
+        sub.cmd_pkg = self.cmd_pkg.clone();
         sub.skip_newlines();
         let e = sub.expr()?;
         sub.skip_newlines();
         if !matches!(sub.peek(), Tok::Eof) {
             return Err(Diag::new(sub.span(), format!("unexpected {} in {what}", describe(sub.peek()))));
         }
+        self.cmd_own = self.cmd_own.or(sub.cmd_own);
         Ok(e)
     }
 
@@ -217,11 +250,11 @@ impl<'a> Parser<'a> {
                 Tok::Kw(Kw::Require) => {
                     return Err(Diag::new(self.span(), "`require` is now `import \"path\"` (a package directory)"));
                 }
-                Tok::Ident(kw) if kw == "refine" && matches!(self.peek_at(1), Tok::Const(_)) => {
+                Tok::Ident(kw) if kw == "refine" && matches!(self.peek_at(1), Tok::Const(_)) && !self.is_local("refine") => {
                     let r = self.refine_def(&mut m.defs)?;
                     m.refines.push(r);
                 }
-                Tok::Ident(kw) if kw == "import" && matches!(self.peek_at(1), Tok::Str(_) | Tok::Ident(_)) => {
+                Tok::Ident(kw) if kw == "import" && !matches!(self.peek_at(1), Tok::Op(_) | Tok::Newline | Tok::Eof) && !self.is_local("import") => {
                     let sp = self.bump().span;
                     let alias = match self.peek().clone() {
                         Tok::Ident(a) => {
@@ -277,7 +310,7 @@ impl<'a> Parser<'a> {
                     let def = Def { public: false, using: self.usings.clone(), name: name.clone(), span, tparams: vec![], name_span, params: param.into_iter().collect(), ret: None, fallible: true, errs: None, pure: false, track_caller: false, ffi: None, body };
                     m.tests.push(TestDecl { kind, name, span, outputs, def });
                 }
-                Tok::Ident(kw) if kw == "pub" => {
+                Tok::Ident(kw) if kw == "pub" && !matches!(self.peek_at(1), Tok::Op(_) | Tok::Newline | Tok::Eof) && !self.is_local("pub") => {
                     // `pub def`, `pub struct`, `pub enum`, `pub error`, `pub interface`, `pub NAME = ...`
                     self.bump();
                     let before = (m.defs.len(), m.structs.len(), m.enums.len(), m.ifaces.len(), m.consts.len());
@@ -361,7 +394,7 @@ impl<'a> Parser<'a> {
                 }
                 Tok::Attr(_) if self.attrs_precede_type() => self.type_attrs()?,
                 Tok::Attr(_) | Tok::Kw(Kw::Def) | Tok::Kw(Kw::Fn) => m.defs.push(self.def()?),
-                Tok::Ident(kw) if kw == "extern" && matches!(self.peek_at(1), Tok::Kw(Kw::Def)) => m.defs.push(self.extern_def()?),
+                Tok::Ident(kw) if kw == "extern" && matches!(self.peek_at(1), Tok::Kw(Kw::Def)) && !self.is_local("extern") => m.defs.push(self.extern_def()?),
                 Tok::Kw(Kw::Struct) => {
                     let s = self.struct_def(&mut m.defs)?;
                     m.structs.push(s);
@@ -370,7 +403,7 @@ impl<'a> Parser<'a> {
                     let e = self.enum_def(&mut m.defs)?;
                     m.enums.push(e);
                 }
-                Tok::Ident(kw) if kw == "error" && matches!(self.peek_at(1), Tok::Const(_)) => {
+                Tok::Ident(kw) if kw == "error" && matches!(self.peek_at(1), Tok::Const(_)) && !self.is_local("error") => {
                     let mut e = self.enum_def(&mut m.defs)?;
                     e.error = true;
                     m.enums.push(e);
@@ -577,7 +610,7 @@ impl<'a> Parser<'a> {
             for t in &mut toks {
                 t.span = job.span;
             }
-            let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], cur_asn1: Default::default(), jobs: vec![], cur_data_name: None, djobs: vec![], xjobs: vec![], cur_transparent: false, gjobs: vec![] };
+            let mut sub = Parser::new(&toks, self.next_id, vec![HashSet::new()]);
             sub.skip_newlines();
             let mut defs = vec![];
             sub.struct_def(&mut defs).map_err(|d| Diag::new(job.span, format!("derive({}) on `{}` made code that doesn't parse: {}\n{text}", job.derive, job.name, d.msg)))?;
@@ -614,7 +647,7 @@ impl<'a> Parser<'a> {
             for t in &mut toks {
                 t.span = job.span;
             }
-            let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], cur_asn1: Default::default(), jobs: vec![], cur_data_name: None, djobs: vec![], xjobs: vec![], cur_transparent: false, gjobs: vec![] };
+            let mut sub = Parser::new(&toks, self.next_id, vec![HashSet::new()]);
             sub.skip_newlines();
             let mut defs = vec![];
             sub.struct_def(&mut defs).map_err(|d| Diag::new(job.span, format!("derive(Xml) on `{}` made code that doesn't parse: {}\n{text}", job.name, d.msg)))?;
@@ -656,7 +689,7 @@ impl<'a> Parser<'a> {
             for t in &mut toks {
                 t.span = job.span;
             }
-            let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], cur_asn1: Default::default(), jobs: vec![], cur_data_name: None, djobs: vec![], cur_transparent: false, gjobs: vec![], xjobs: vec![] };
+            let mut sub = Parser::new(&toks, self.next_id, vec![HashSet::new()]);
             sub.skip_newlines();
             let mut defs = vec![];
             sub.struct_def(&mut defs).map_err(|d| Diag::new(job.span, format!("derive(Gob) on `{}` made code that doesn't parse: {}\n{text}", job.name, d.msg)))?;
@@ -722,7 +755,7 @@ impl<'a> Parser<'a> {
             for t in &mut toks {
                 t.span = job.span;
             }
-            let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], cur_asn1: Default::default(), jobs: vec![], cur_data_name: None, djobs: vec![], xjobs: vec![], cur_transparent: false, gjobs: vec![] };
+            let mut sub = Parser::new(&toks, self.next_id, vec![HashSet::new()]);
             sub.skip_newlines();
             let mut defs = vec![];
             sub.struct_def(&mut defs).map_err(|d| Diag::new(job.span, format!("derive(Data) on `{}` made code that doesn't parse: {}\n{text}", job.name, d.msg)))?;
@@ -803,7 +836,8 @@ impl<'a> Parser<'a> {
         let name = match self.bump().tok {
             Tok::Ident(n) => n,
             // A keyword names a method (Ruby's `def next`): `e.next` can't be read as one.
-            Tok::Kw(k) if owner.is_some() => kw_name(k),
+            Tok::Kw(k) if owner.is_some() => kw_name(k).to_string(),
+            Tok::Kw(k) => return Err(reserved(name_span, k, "a function")),
             // Operators, inside a struct: `def +(o)`, `def ==(o)`, `def <=>(o)`, `def [](i)`.
             Tok::Op(op @ ("+" | "-" | "*" | "/" | "%" | "==" | "<=>")) if owner.is_some() => op.to_string(),
             Tok::Op("[") if owner.is_some() && self.eat_op("]") => "[]".to_string(),
@@ -1226,7 +1260,7 @@ impl<'a> Parser<'a> {
             let fname = match self.bump().tok {
                 Tok::Ident(n) => n,
                 // A keyword names a field too (Go's `next`): read it as `self.next`.
-                Tok::Kw(k) if matches!(self.peek(), Tok::Op(":")) => kw_name(k),
+                Tok::Kw(k) if matches!(self.peek(), Tok::Op(":")) => kw_name(k).to_string(),
                 t => return Err(Diag::new(fsp, format!("expected a field name, found {}", describe(&t)))),
             };
             self.expect_op(":")?;
@@ -1467,8 +1501,14 @@ impl<'a> Parser<'a> {
                     }
                 })
             }
-            Tok::Ident(n) if n == "fail" && !self.is_local("fail") && !matches!(self.peek_at(1), Tok::Op("(") | Tok::Op("=")) => {
+            Tok::Kw(Kw::Fail) => {
                 self.bump();
+                if self.is_op("=") {
+                    return Err(reserved(start, Kw::Fail, "a variable"));
+                }
+                if self.at_stmt_end() {
+                    return Err(fail_needs_value(start));
+                }
                 StmtKind::Fail(self.expr()?)
             }
             Tok::Kw(Kw::Def) | Tok::Kw(Kw::Fn) | Tok::Attr(_) => return Err(Diag::new(start, "methods can only be defined at the top level")),
@@ -1536,6 +1576,7 @@ impl<'a> Parser<'a> {
                     }
                 }
                 self.expect_op("=")?;
+                self.skip_line_continuation();
                 let mut values = vec![self.expr()?];
                 while self.eat_op(",") {
                     values.push(self.expr()?);
@@ -1559,6 +1600,7 @@ impl<'a> Parser<'a> {
                         targets.push(t);
                     }
                     self.expect_op("=")?;
+                    self.skip_line_continuation();
                     let mut values = vec![self.expr()?];
                     while self.eat_op(",") {
                         values.push(self.expr()?);
@@ -1815,6 +1857,7 @@ impl<'a> Parser<'a> {
                 let n = n.clone();
                 self.declare(&n);
             }
+            self.skip_line_continuation();
             let rhs = self.expr()?;
             let sp = lhs.span.to(rhs.span);
             return Ok(self.mk(ExprKind::Assign(Box::new(lhs), Box::new(rhs)), sp));
@@ -1838,6 +1881,7 @@ impl<'a> Parser<'a> {
         ] {
             if self.is_op(tok) {
                 self.bump();
+                self.skip_line_continuation();
                 let rhs = self.expr()?;
                 let sp = lhs.span.to(rhs.span);
                 return Ok(self.mk(ExprKind::OpAssign(op, Box::new(lhs), Box::new(rhs)), sp));
@@ -1923,13 +1967,7 @@ impl<'a> Parser<'a> {
     /// Does a jump (`return`, `fail`, `break`, `next`) start here?
     fn at_jump(&self) -> bool {
         match self.peek() {
-            Tok::Kw(Kw::Return) | Tok::Kw(Kw::Break) | Tok::Kw(Kw::Next) => true,
-            // (`fail` takes an error; without one it may be a def's name.)
-            Tok::Ident(n) => {
-                n == "fail"
-                    && !self.is_local("fail")
-                    && !matches!(self.peek_at(1), Tok::Op("(") | Tok::Op("=") | Tok::Op(";") | Tok::Op("}") | Tok::Op(")") | Tok::Op(",") | Tok::Op("]") | Tok::Newline | Tok::Eof)
-            }
+            Tok::Kw(Kw::Return | Kw::Break | Kw::Next | Kw::Fail) => true,
             _ => false,
         }
     }
@@ -1943,7 +1981,12 @@ impl<'a> Parser<'a> {
             Tok::Kw(Kw::Next) => StmtKind::Next,
             Tok::Kw(Kw::Break) => StmtKind::Break(if ends(self) { None } else { Some(self.ternary()?) }),
             Tok::Kw(Kw::Return) => StmtKind::Return(if ends(self) { None } else { Some(self.ternary()?) }),
-            _ => StmtKind::Fail(self.ternary()?),
+            _ => {
+                if ends(self) {
+                    return Err(fail_needs_value(start));
+                }
+                StmtKind::Fail(self.ternary()?)
+            }
         };
         Ok(Stmt { kind, span: start.to(self.prev_span()) })
     }
@@ -2083,10 +2126,10 @@ impl<'a> Parser<'a> {
                     if !(self.is_op(".") && !matches!(self.peek_at(1), Tok::Op("~"))) {
                         break;
                     }
-                    e = self.postfix_step(e)?.expect("a `.` step");
-                    let had_args = matches!(&e.kind, ExprKind::Call { args, block, block_sym, .. } if !args.is_empty() || block.is_some() || block_sym.is_some())
-                        || matches!(self.toks[self.pos - 1].tok, Tok::Op(")"));
-                    if had_args {
+                    self.bump();
+                    let (step, parens) = self.dot_step(e, ".")?;
+                    e = step;
+                    if parens || matches!(&e.kind, ExprKind::Call { block: Some(_), .. }) {
                         break;
                     }
                 }
@@ -2116,47 +2159,90 @@ impl<'a> Parser<'a> {
         self.postfix_from(e)
     }
 
-    /// One `.name(args)` step, if one follows.
-    /// After `.~`: the call.
-    fn postfix_step_named(&mut self, e: Expr) -> PResult<Expr> {
-        self.bump(); // `~`
-        let name_span = self.span();
-        let name = match self.bump().tok {
-            Tok::Ident(n) => n,
-            Tok::Kw(k) => kw_name(k),
-            t => return Err(Diag::new(name_span, format!("expected a method name after `.~`, found {}", describe(&t)))),
-        };
-        let (args, block_sym) = if self.is_op("(") && !self.space_before() { self.call_args()? } else { (vec![], None) };
-        let block = self.maybe_block()?;
-        let sp = e.span.to(self.prev_span());
-        Ok(self.mk(ExprKind::Call { recv: Some(Box::new(e)), name, name_span, args, block, block_sym }, sp))
-    }
-
-    fn postfix_step(&mut self, e: Expr) -> PResult<Option<Expr>> {
-        if !self.is_op(".") {
-            return Ok(None);
-        }
-        self.bump();
+    /// The one parser of a method step, after a `.`, `.~` or `?.` (`after`):
+    /// `name`, `name(args)`, a block, and after `.` also `pkg.Type[T, ...]`
+    /// (a package's generic type applied). Returns the step and whether it
+    /// had parenthesized arguments.
+    fn dot_step(&mut self, e: Expr, after: &str) -> PResult<(Expr, bool)> {
         self.skip_line_continuation();
         let name_span = self.span();
         let name = match self.bump().tok {
-            Tok::Ident(n) | Tok::Const(n) => n,
-            Tok::Kw(k) => kw_name(k),
-            t => return Err(Diag::new(name_span, format!("expected a method name after `.`, found {}", describe(&t)))),
+            Tok::Ident(n) => n,
+            Tok::Const(n) if after == "." => n,
+            Tok::Kw(k) => kw_name(k).to_string(),
+            t => return Err(Diag::new(name_span, format!("expected a method name after `{after}`, found {}", describe(&t)))),
         };
-        let (args, block_sym) = if self.is_op("(") && !self.space_before() { self.call_args()? } else { (vec![], None) };
+        // `geom.Stack[Int].new`: a package's generic type applied.
+        let pkg = match &e.kind {
+            ExprKind::Name(a) => Some(a.clone()),
+            ExprKind::Call { recv: None, name: a, args, block: None, .. } if args.is_empty() => Some(a.clone()),
+            _ => None,
+        };
+        let mut type_err = None;
+        if let Some(pkg) = pkg.filter(|_| after == "." && name.chars().next().is_some_and(|c| c.is_uppercase()) && self.is_op("[") && !self.space_before()) {
+            let save = self.pos;
+            self.bump();
+            match self.type_args_then_dot(false) {
+                Ok(Some(targs)) => return Ok((self.mk(ExprKind::TypeApp(format!("{pkg}.{name}"), targs), e.span.to(self.prev_span())), false)),
+                Ok(None) => {}
+                Err(d) => type_err = Some(d),
+            }
+            self.pos = save;
+        }
+        let parens = self.is_op("(") && !self.space_before();
+        let (args, block_sym) = if parens { self.call_args()? } else { (vec![], None) };
         let block = self.maybe_block()?;
         let sp = e.span.to(self.prev_span());
-        Ok(Some(self.mk(ExprKind::Call { recv: Some(Box::new(e)), name, name_span, args, block, block_sym }, sp)))
+        let call = self.mk(ExprKind::Call { recv: Some(Box::new(e)), name, name_span, args, block, block_sym }, sp);
+        if let Some(d) = type_err {
+            // Not a type after all: an index (`pkg.TABLE[i]`), or else the
+            // type's own error, which says more than the index's would.
+            return self.index_step(call).map(|x| (x, false)).map_err(|_| d);
+        }
+        Ok((call, parens))
+    }
+
+    /// After `Name[` (cursor past the `[`): type arguments, `]`, and a `.`
+    /// (with, if `named`, a name after it): Some(args) if they all fit, None
+    /// if the brackets close but no `.` follows, Err on a type that doesn't
+    /// parse. The caller rewinds unless it gets Some.
+    fn type_args_then_dot(&mut self, named: bool) -> PResult<Option<Vec<TypeExpr>>> {
+        let mut targs = vec![];
+        loop {
+            targs.push(self.type_expr()?);
+            if !self.eat_op(",") {
+                if !self.eat_op("]") {
+                    return Err(Diag::new(self.span(), format!("expected `,` or `]` after a type argument, found {}", describe(self.peek()))));
+                }
+                let ok = self.is_op(".") && (!named || matches!(self.peek_at(1), Tok::Const(_) | Tok::Ident(_)));
+                return Ok(ok.then_some(targs));
+            }
+        }
+    }
+
+    /// A newline followed by a line that starts with `.` or `?.` continues
+    /// the expression: `xs\n  .map { it * 2 }`. Moves past the newlines if so.
+    fn leading_dot(&mut self) -> bool {
+        let mut k = 0;
+        while matches!(self.peek_at(k), Tok::Newline) {
+            k += 1;
+        }
+        if k > 0 && matches!(self.peek_at(k), Tok::Op(".") | Tok::Op("?.")) {
+            self.pos += k;
+            return true;
+        }
+        false
     }
 
     fn postfix_from(&mut self, mut e: Expr) -> PResult<Expr> {
         loop {
+            self.leading_dot();
             if self.is_op(".") && matches!(self.peek_at(1), Tok::Op("~")) {
                 // `x.~m(y)`: propagate this call's error.
                 let tsp = self.toks[self.pos + 1].span;
                 self.bump();
-                let call = self.postfix_step_named(e)?;
+                self.bump();
+                let (call, _) = self.dot_step(e, ".~")?;
                 let sp = tsp.to(call.span);
                 e = self.mk(ExprKind::Try(Box::new(call)), sp);
                 continue;
@@ -2164,59 +2250,14 @@ impl<'a> Parser<'a> {
             if self.is_op("?.") {
                 // Optional chaining: the call happens only if the receiver is present.
                 self.bump();
-                self.skip_line_continuation();
-                let name_span = self.span();
-                let name = match self.bump().tok {
-                    Tok::Ident(n) => n,
-                    Tok::Kw(k) => kw_name(k),
-                    t => return Err(Diag::new(name_span, format!("expected a method name after `?.`, found {}", describe(&t)))),
-                };
-                let (args, block_sym) = if self.is_op("(") && !self.space_before() { self.call_args()? } else { (vec![], None) };
-                let block = self.maybe_block()?;
-                let sp = e.span.to(self.prev_span());
-                let call = self.mk(ExprKind::Call { recv: Some(Box::new(e)), name, name_span, args, block, block_sym }, sp);
+                let (call, _) = self.dot_step(e, "?.")?;
+                let sp = call.span;
                 e = self.mk(ExprKind::OptCall(Box::new(call)), sp);
                 continue;
             }
             if self.is_op(".") {
                 self.bump();
-                self.skip_line_continuation();
-                let name_span = self.span();
-                let name = match self.bump().tok {
-                    Tok::Ident(n) => n,
-                    Tok::Const(n) => n,
-                    Tok::Kw(k) => kw_name(k),
-                    t => return Err(Diag::new(name_span, format!("expected a method name after `.`, found {}", describe(&t)))),
-                };
-                // `geom.Stack[Int].new`: a package's generic type applied.
-                let pkg = match &e.kind {
-                    ExprKind::Name(a) => Some(a.clone()),
-                    ExprKind::Call { recv: None, name: a, args, block: None, .. } if args.is_empty() => Some(a.clone()),
-                    _ => None,
-                };
-                if let Some(pkg) = pkg.filter(|_| name.chars().next().is_some_and(|c| c.is_uppercase()) && self.is_op("[") && !self.space_before()) {
-                    let save = self.pos;
-                    self.bump();
-                    let mut targs = vec![];
-                    let ok = loop {
-                        match self.type_expr() {
-                            Ok(t) => targs.push(t),
-                            Err(_) => break false,
-                        }
-                        if !self.eat_op(",") {
-                            break self.eat_op("]") && self.is_op(".");
-                        }
-                    };
-                    if ok {
-                        e = self.mk(ExprKind::TypeApp(format!("{pkg}.{name}"), targs), e.span.to(self.prev_span()));
-                        continue;
-                    }
-                    self.pos = save;
-                }
-                let (args, block_sym) = if self.is_op("(") && !self.space_before() { self.call_args()? } else { (vec![], None) };
-                let block = self.maybe_block()?;
-                let sp = e.span.to(self.prev_span());
-                e = self.mk(ExprKind::Call { recv: Some(Box::new(e)), name, name_span, args, block, block_sym }, sp);
+                e = self.dot_step(e, ".")?.0;
                 continue;
             }
             if self.is_op("[") && !self.space_before() {
@@ -2269,7 +2310,7 @@ impl<'a> Parser<'a> {
                 sym = Some((name, sp.to(t.span)));
             } else if let (Some(name), Tok::Op(":")) = (match self.peek().clone() {
                 Tok::Ident(n) => Some(n),
-                Tok::Kw(k) => Some(kw_name(k)),
+                Tok::Kw(k) => Some(kw_name(k).to_string()),
                 _ => None,
             }, self.peek_at(1).clone()) {
                 // `name: value` (a keyword may name a field: `next: n`)
@@ -2395,7 +2436,16 @@ impl<'a> Parser<'a> {
                     groups.push(g);
                     kinds.push(self.mk(ExprKind::Int(k), sp));
                 }
-                let recv = self.mk(ExprKind::Name(CMD_PKG.into()), sp);
+                // The file's own `import "os/exec"` unless a local hides its
+                // name; else the parser adds one (see `parse`).
+                let pkg = match self.cmd_pkg.clone().filter(|a| !self.is_local(a)) {
+                    Some(a) => a,
+                    None => {
+                        self.cmd_own = self.cmd_own.or(Some(sp));
+                        CMD_PKG.into()
+                    }
+                };
+                let recv = self.mk(ExprKind::Name(pkg), sp);
                 let ga = self.mk(ExprKind::Array(groups), sp);
                 let ka = self.mk(ExprKind::Array(kinds), sp);
                 self.mk(ExprKind::Call { recv: Some(Box::new(recv)), name: "from_literal".into(), name_span: sp, args: vec![ga, ka], block: None, block_sym: None }, sp)
@@ -2416,21 +2466,19 @@ impl<'a> Parser<'a> {
                 // `Stack[Int].new`: a generic type applied, if what follows fits.
                 let save = self.pos;
                 self.bump();
-                let mut args = vec![];
-                let ok = loop {
-                    match self.type_expr() {
-                        Ok(t) => args.push(t),
-                        Err(_) => break false,
+                match self.type_args_then_dot(true) {
+                    Ok(Some(args)) => self.mk(ExprKind::TypeApp(c, args), sp.to(self.prev_span())),
+                    Ok(None) => {
+                        self.pos = save;
+                        self.mk(ExprKind::Const(c), sp)
                     }
-                    if !self.eat_op(",") {
-                        break self.eat_op("]") && self.is_op(".") && matches!(self.peek_at(1), Tok::Const(_) | Tok::Ident(_));
+                    Err(d) => {
+                        // Not a type after all: an index (`TABLE[i]`), or else
+                        // the type's own error (`Stack[Int;].new`).
+                        self.pos = save;
+                        let k = self.mk(ExprKind::Const(c), sp);
+                        self.index_step(k).map_err(|_| d)?
                     }
-                };
-                if ok {
-                    self.mk(ExprKind::TypeApp(c, args), sp.to(self.prev_span()))
-                } else {
-                    self.pos = save;
-                    self.mk(ExprKind::Const(c), sp)
                 }
             }
             Tok::Const(c) => self.mk(ExprKind::Const(c), sp),
@@ -2461,12 +2509,10 @@ impl<'a> Parser<'a> {
                 e.span = sp.to(self.prev_span());
                 e
             }
-            Tok::Ident(kw) if kw == "spawn" && !self.is_local("spawn") && !matches!(self.peek(), Tok::Op("(")) => {
+            Tok::Kw(Kw::Spawn) if !self.is_op("=") => {
                 // `spawn { ... }`, or `spawn f(x)` = `spawn { f(x) }`
                 if self.is_op("{") {
                     let bsp = self.span();
-                    self.bump();
-                    self.pos -= 1;
                     let body = self.braced_stmts()?;
                     let id = self.id();
                     let block = Block { id, params: vec![], body, span: bsp.to(self.prev_span()) };
@@ -2622,9 +2668,9 @@ impl<'a> Parser<'a> {
                 self.expect_op("]")?;
                 self.mk(ExprKind::Array(items), sp.to(self.prev_span()))
             }
-            // (A `fail` here may be a def of that name: the checker explains
-            // an undefined one.)
-            Tok::Kw(k @ (Kw::Return | Kw::Break | Kw::Next)) => return Err(jump_here(sp, &kw_name(k))),
+            Tok::Kw(k @ (Kw::Fail | Kw::Spawn)) if self.is_op("=") => return Err(reserved(sp, k, "a variable")),
+            Tok::Kw(Kw::Fail) if self.at_stmt_end() || self.is_op(")") || self.is_op(",") => return Err(fail_needs_value(sp)),
+            Tok::Kw(k @ (Kw::Return | Kw::Break | Kw::Next | Kw::Fail)) => return Err(jump_here(sp, kw_name(k))),
             Tok::Ident(name) => {
                 if self.is_local(&name) {
                     // `f(x)` on a local: calling a lambda.
@@ -2685,7 +2731,6 @@ pub fn is_place(e: &Expr) -> bool {
     }
 }
 
-/// A keyword's spelling, for keywords used as method names (`e.next`).
 /// Prefix of the temporaries `opt || jump` binds (check.rs names them in errors).
 pub const OR_JUMP_TMP: &str = "__or_jump";
 
@@ -2695,8 +2740,45 @@ fn jump_here(sp: Span, kw: &str) -> Diag {
         .note(format!("as part of an expression it can only follow `||` (`v = opt || {kw}`) or be a whole `case` arm (`X => {kw}`) (S8)"))
 }
 
-fn kw_name(k: Kw) -> String {
-    format!("{k:?}").to_lowercase()
+/// `fail` with nothing after it.
+fn fail_needs_value(sp: Span) -> Diag {
+    Diag::new(sp, "`fail` needs an error value: `fail ParseErr.Bad(pos: 0)`, `fail e`")
+}
+
+/// A keyword used as a name it can't be (a local, a parameter, a function).
+fn reserved(sp: Span, k: Kw, what: &str) -> Diag {
+    Diag::new(sp, format!("`{}` is a keyword and can't name {what}", kw_name(k))).note("only a method may be named after a keyword (`def fail` inside a struct, `t.fail`)")
+}
+
+/// A keyword's spelling, for keywords used as method names (`e.next`, `t.fail`).
+fn kw_name(k: Kw) -> &'static str {
+    match k {
+        Kw::Def => "def",
+        Kw::If => "if",
+        Kw::Unless => "unless",
+        Kw::Else => "else",
+        Kw::Elsif => "elsif",
+        Kw::While => "while",
+        Kw::Next => "next",
+        Kw::Break => "break",
+        Kw::Return => "return",
+        Kw::True => "true",
+        Kw::False => "false",
+        Kw::Nil => "nil",
+        Kw::Try => "try",
+        Kw::Require => "require",
+        Kw::Struct => "struct",
+        Kw::Enum => "enum",
+        Kw::Interface => "interface",
+        Kw::Fn => "fn",
+        Kw::For => "for",
+        Kw::In => "in",
+        Kw::Case => "case",
+        Kw::Defer => "defer",
+        Kw::Fail => "fail",
+        Kw::Spawn => "spawn",
+        Kw::None => "none",
+    }
 }
 
 pub fn describe(t: &Tok) -> String {
@@ -2711,7 +2793,7 @@ pub fn describe(t: &Tok) -> String {
         Tok::Sym(s) => format!("`:{s}`"),
         Tok::Attr(a) => format!("`#[{a}]`"),
         Tok::Directive(n, _) => format!("`#![{n}]`"),
-        Tok::Kw(k) => format!("`{}`", format!("{k:?}").to_lowercase()),
+        Tok::Kw(k) => format!("the keyword `{}`", kw_name(*k)),
         Tok::Op(o) => format!("`{o}`"),
         Tok::Newline => "end of line".into(),
         Tok::Eof => "end of file".into(),

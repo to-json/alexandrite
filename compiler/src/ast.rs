@@ -527,8 +527,9 @@ pub enum ExprKind {
     /// `x = e`, `a[i] = e`, `p.f = e`, `a[i].f = e`: the target is a Name, an
     /// Index, or a field (a Call with no arguments) over a place.
     Assign(Box<Expr>, Box<Expr>),
-    /// `x += e` etc.: desugared by the parser to Assign(x, Binary(op, x, e)),
-    /// but remembered for the counter rule.
+    /// `x += e` etc.: kept as written; the checker (check.rs, `OpAssign`
+    /// arms) evaluates the place once and applies the operator in place
+    /// (map entries through `map_assign`).
     OpAssign(BinOp, Box<Expr>, Box<Expr>),
     Try(Box<Expr>),
     Array(Vec<Expr>),

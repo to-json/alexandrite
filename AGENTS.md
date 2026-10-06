@@ -37,6 +37,9 @@ import "os/exec"
 x = 42                               # Int (= I64). Also I8..I64, U8..U64, Byte (= U8), Rune (= I32)
 f = 2.5                              # Float (= F64)
 s = "héllo #{x}"                     # Str: immutable UTF-8 bytes; #{} interpolates
+doc = <<~EOS                         # heredoc: indent stripped, raw text, #{} interpolates (\#{ stays literal)
+  x is #{x}
+EOS
 s.size; s[0]; s[1...3]               # byte length; a Byte; a substring by bytes (... excludes the end)
 s.runes; s.bytes; Str.from_bytes(bs) # [Rune], [Byte], and back
 b = 7.as_u8                          # truncating conversion (Go's uint8(x)); .to_u8 checks instead
@@ -52,6 +55,9 @@ fixed: [U32; 4] = [0; 4]             # fixed-size array
 m: Map[Str, Int] = {"a" => 1}        # insertion-ordered map
 copy(dst, src)                       # Go's copy
 xs.map { it * 2 }.select { it > 2 }  # Enumerable; `it` is the block's single parameter
+big = xs                             # a line starting with `.` / `?.` continues the chain;
+  .map { it * 10 }                   #   so does a line after a binary operator or `=`
+  .select { it > 15 }
 xs.each { |v| puts v }
 
 # Optionals and errors ------------------------------------------------------
@@ -69,8 +75,8 @@ pub error ParseErr {                 # an error type: an enum with a message
   }
 }
 def parse(t: Str) -> ~Int<ParseErr> { # ~T is (T, error) in Go; <ParseErr> declares the error set
-  fail ParseErr.Bad(pos: 0) if t == ""
-  t.size
+  fail ParseErr.Bad(pos: 0) if t == ""     # fail/spawn/return/break/next/defer are keywords: only
+  t.size                                   #   methods and fields may take those names (`t.fail`)
 }
 def first(k: Str) -> ~Int {
   n = find(k) || fail ParseErr.Bad(pos: 1)   # opt || jump (S8): also || return v, || break, || next

@@ -1,0 +1,457 @@
+#![test(external)]
+# Go's io/io_test.go, translated (package io_test).
+#
+# Not translated / changed:
+#  - zeroErrReader, largeWriter{err}, wantedAndErrReader, dataAndErrorBuffer:
+#    a read or write can't return data together with an error in alx (see
+#    io.alx's header); the tests keep the half alx can express.
+#  - TestCopyNEOF: CopyN at an early end fails with UnexpectedEof (Go: the
+#    short count with EOF).
+#  - TestNopCloserWriterToForwarding: NopCloser always has write_to here
+#    (decided per type at compile time); the test checks that it forwards.
+#  - BenchmarkCopyN*: benchmarks.
+
+import "bytes"
+import "io"
+import "os"
+
+def sr(s: Str) -> bytes.Reader { bytes.new_reader(s.bytes.to_a) }
+
+def errmsg[T](r: ~T) -> Str {
+  if e = r.err {
+    return e.message
+  }
+  ""
+}
+
+# A bytes.Buffer with read_from! / write_to! that note their calls.
+struct State {
+  buf: bytes.Buffer
+  read_from_called: Bool
+  write_to_called: Bool
+}
+
+struct RFBuffer {
+  st: [State]
+
+  pub def write!(p: [Byte]) -> ~Int { self.st[0].buf.write!(p) }
+  pub def read_from![R](r: R) -> ~Int {
+    self.st[0].read_from_called = true
+    data = ~io.read_all(r)
+    self.st[0].buf.write!(data)
+  }
+  pub def to_s -> Str { st[0].buf.to_s }
+}
+
+struct WTBuffer {
+  st: [State]
+
+  pub def read!(p: [Byte]) -> ~Int { self.st[0].buf.read!(p) }
+  pub def write_to![W](w: W) -> ~Int {
+    self.st[0].write_to_called = true
+    data = st[0].buf.bytes
+    out = w
+    ~io.write_all(out, data)
+    self.st[0].buf.reset!
+    data.size
+  }
+}
+
+# Both: copy must prefer the source's write_to!.
+struct BothBuffer {
+  st: [State]
+
+  pub def read!(p: [Byte]) -> ~Int { self.st[0].buf.read!(p) }
+  pub def write!(p: [Byte]) -> ~Int { self.st[0].buf.write!(p) }
+  pub def write_to![W](w: W) -> ~Int {
+    self.st[0].write_to_called = true
+    data = st[0].buf.bytes
+    out = w
+    ~io.write_all(out, data)
+    self.st[0].buf.reset!
+    data.size
+  }
+  pub def read_from![R](r: R) -> ~Int {
+    self.st[0].read_from_called = true
+    data = ~io.read_all(r)
+    self.st[0].buf.write!(data)
+  }
+}
+
+def new_state(s: Str) -> [State] {
+  [State.new(buf: bytes.new_buffer_string(s), read_from_called: false, write_to_called: false)]
+}
+
+test "TestCopy" {
+  rb = bytes.new_buffer_string("hello, world.")
+  wb = bytes.new_buffer_string("")
+  io.copy(wb, rb).unwrap
+  assert_eq wb.to_s, "hello, world."
+}
+
+test "TestCopyNegative" {
+  rb = bytes.new_buffer_string("hello")
+  wb = bytes.new_buffer_string("")
+  lr = io.limit_reader(rb, -1)
+  io.copy(wb, lr).unwrap
+  assert_eq wb.to_s, ""
+  assert_eq io.copy_n(wb, rb, -1).unwrap, 0
+  assert_eq wb.to_s, ""
+}
+
+test "TestCopyBuffer" {
+  rb = bytes.new_buffer_string("hello, world.")
+  wb = bytes.new_buffer_string("")
+  tiny: [Byte] = [0; 1]
+  io.copy_buffer(wb, rb, tiny).unwrap
+  assert_eq wb.to_s, "hello, world."
+}
+
+test "TestCopyBufferNil" {
+  rb = bytes.new_buffer_string("hello, world.")
+  wb = bytes.new_buffer_string("")
+  io.copy_buffer(wb, rb, none).unwrap
+  assert_eq wb.to_s, "hello, world."
+}
+
+test "CopyBuffer with an empty buffer panics" {
+  assert_panics("empty buffer in CopyBuffer") {
+    e: [Byte] = []
+    io.copy_buffer(bytes.new_buffer_string(""), sr("x"), e).unwrap
+  }
+}
+
+test "TestCopyReadFrom" {
+  rb = bytes.new_buffer_string("hello, world.")
+  wb = RFBuffer.new(st: new_state(""))
+  io.copy(wb, rb).unwrap
+  assert_eq wb.to_s, "hello, world."
+  assert wb.st[0].read_from_called, "read_from! not used"
+}
+
+test "TestCopyWriteTo" {
+  rb = WTBuffer.new(st: new_state("hello, world."))
+  wb = bytes.new_buffer_string("")
+  io.copy(wb, rb).unwrap
+  assert_eq wb.to_s, "hello, world."
+  assert rb.st[0].write_to_called, "write_to! not used"
+}
+
+test "TestCopyPriority" {
+  rb = BothBuffer.new(st: new_state("hello, world."))
+  wb = BothBuffer.new(st: new_state(""))
+  io.copy(wb, rb).unwrap
+  assert_eq wb.st[0].buf.to_s, "hello, world."
+  assert rb.st[0].write_to_called, "WriteTo was not prioritized over ReadFrom"
+  assert !wb.st[0].read_from_called, "ReadFrom used"
+}
+
+struct ErrWriter {
+  msg: Str
+  pub def write!(p: [Byte]) -> ~Int {
+    fail msg
+  }
+}
+
+test "TestCopyReadErrWriteErr" {
+  # (Go's reader returns a byte and an error; here it returns the byte, and
+  # the write error stops the copy.)
+  r = io.copy(ErrWriter.new(msg: "writeError"), sr("x"))
+  assert_eq errmsg(r), "writeError"
+}
+
+test "TestCopyN" {
+  rb = bytes.new_buffer_string("hello, world.")
+  wb = bytes.new_buffer_string("")
+  io.copy_n(wb, rb, 5).unwrap
+  assert_eq wb.to_s, "hello"
+}
+
+test "TestCopyNReadFrom" {
+  rb = bytes.new_buffer_string("hello")
+  wb = RFBuffer.new(st: new_state(""))
+  io.copy_n(wb, rb, 5).unwrap
+  assert_eq wb.to_s, "hello"
+}
+
+test "TestCopyNWriteTo" {
+  rb = WTBuffer.new(st: new_state("hello, world."))
+  wb = bytes.new_buffer_string("")
+  io.copy_n(wb, rb, 5).unwrap
+  assert_eq wb.to_s, "hello"
+}
+
+struct NoReadFrom {
+  w: bytes.Buffer
+  pub def write!(p: [Byte]) -> ~Int { self.w.write!(p) }
+}
+
+struct Endless {
+  pub def read!(p: [Byte]) -> ~Int { p.size }
+}
+
+test "TestCopyNEOF" {
+  b = bytes.new_buffer_string("")
+  assert_eq io.copy_n(NoReadFrom.new(w: b), sr("foo"), 3).unwrap, 3
+  assert_eq errmsg(io.copy_n(NoReadFrom.new(w: b), sr("foo"), 4)), "unexpected EOF"
+  rf = RFBuffer.new(st: new_state(""))
+  assert_eq io.copy_n(rf, sr("foo"), 3).unwrap, 3
+  assert_eq errmsg(io.copy_n(rf, sr("foo"), 4)), "unexpected EOF"
+  assert_eq io.copy_n(rf, Endless.new, 5).unwrap, 5
+  assert_eq io.copy_n(NoReadFrom.new(w: b), Endless.new, 5).unwrap, 5
+  assert_eq b.len, 11
+  assert_eq b.to_s[0...6], "foofoo"
+}
+
+# Go's dataAndErrorBuffer with a non-EOF error: once drained, the next read
+# fails (Go returns the last data together with the error).
+struct FailWhenEmpty {
+  buf: bytes.Buffer
+  pub def read!(p: [Byte]) -> ~Int {
+    fail "fake error" if buf.len == 0
+    self.buf.read!(p)
+  }
+  pub def write!(p: [Byte]) -> ~Int { self.buf.write!(p) }
+}
+
+def check_read_at_least[RW](rb: RW, fake: Bool) -> ~Unit {
+  rw = rb
+  rw.~write!("0123".bytes.to_a)
+  buf: [Byte] = [0; 2]
+  assert_eq io.read_at_least(rw, buf, 2).unwrap, 2
+  assert_eq errmsg(io.read_at_least(rw, buf, 4)), "short buffer"
+  assert_eq io.read_at_least(rw, buf, 1).unwrap, 2
+  if fake {
+    assert_eq errmsg(io.read_at_least(rw, buf, 2)), "fake error"
+  } else {
+    assert_eq io.read_at_least(rw, buf, 2).unwrap, 0
+  }
+  rw.~write!("4".bytes.to_a)
+  if fake {
+    assert_eq errmsg(io.read_at_least(rw, buf, 2)), "fake error"
+  } else {
+    assert_eq errmsg(io.read_at_least(rw, buf, 2)), "unexpected EOF"
+  }
+  assert_eq buf[0], 52
+}
+
+test "TestReadAtLeast" {
+  check_read_at_least(bytes.new_buffer_string(""), false).unwrap
+}
+
+test "TestReadAtLeastWithDataAndError" {
+  check_read_at_least(FailWhenEmpty.new(buf: bytes.new_buffer_string("")), true).unwrap
+}
+
+test "TestTeeReader" {
+  src = "hello, world".bytes.to_a
+  dst: [Byte] = [0; 12]
+  rb = bytes.new_buffer(src)
+  wb = bytes.new_buffer_string("")
+  r = io.tee_reader(rb, wb)
+  io.read_exact(r, dst).unwrap
+  assert_eq dst, src
+  assert_eq wb.bytes, src
+  assert_eq r.read!(dst).unwrap, 0
+  rb2 = bytes.new_buffer(src)
+  pr, pw = io.pipe
+  pr.close!.unwrap
+  r2 = io.tee_reader(rb2, pw)
+  assert_eq errmsg(io.read_exact(r2, dst)), "io: read/write on closed pipe"
+}
+
+struct SRCase {
+  data: Str
+  off: Int
+  n: Int
+  buf_len: Int
+  at: Int
+  exp: Str
+}
+
+test "TestSectionReader_ReadAt" {
+  dat = "a long sample data, 1234567890"
+  l = dat.size
+  tests = [
+    SRCase.new(data: "", off: 0, n: 10, buf_len: 2, at: 0, exp: ""),
+    SRCase.new(data: dat, off: 0, n: l, buf_len: 0, at: 0, exp: ""),
+    SRCase.new(data: dat, off: l, n: 1, buf_len: 1, at: 0, exp: ""),
+    SRCase.new(data: dat, off: 0, n: l + 2, buf_len: l, at: 0, exp: dat),
+    SRCase.new(data: dat, off: 0, n: l, buf_len: l / 2, at: 0, exp: dat[0...(l / 2)]),
+    SRCase.new(data: dat, off: 0, n: l, buf_len: l, at: 0, exp: dat),
+    SRCase.new(data: dat, off: 0, n: l, buf_len: l / 2, at: 2, exp: dat[2...(2 + l / 2)]),
+    SRCase.new(data: dat, off: 3, n: l, buf_len: l / 2, at: 2, exp: dat[5...(5 + l / 2)]),
+    SRCase.new(data: dat, off: 3, n: l / 2, buf_len: l / 2 - 2, at: 2, exp: dat[5...(5 + l / 2 - 2)]),
+    SRCase.new(data: dat, off: 3, n: l / 2, buf_len: l / 2 + 2, at: 2, exp: dat[5...(5 + l / 2 - 2)]),
+    SRCase.new(data: dat, off: 0, n: 0, buf_len: 0, at: -1, exp: ""),
+    SRCase.new(data: dat, off: 0, n: 0, buf_len: 0, at: 1, exp: ""),
+  ]
+  for tt in tests {
+    r = sr(tt.data)
+    s = io.new_section_reader(r, tt.off, tt.n)
+    buf: [Byte] = [0; tt.buf_len]
+    n = s.read_at(buf, tt.at).unwrap
+    assert_eq Str.from_bytes(buf[0...n]), tt.exp
+    _r, off, nn = s.outer
+    assert_eq off, tt.off
+    assert_eq nn, tt.n
+  }
+}
+
+test "TestSectionReader_Seek" {
+  br = sr("foo")
+  s = io.new_section_reader(br, 0, 3)
+  for whence in [io.SEEK_START, io.SEEK_CURRENT, io.SEEK_END] {
+    offset = -3
+    while offset <= 4 {
+      b = br.seek!(offset, whence)
+      x = s.seek!(offset, whence)
+      assert_eq b.ok?, x.ok?
+      if b.ok? {
+        assert_eq b.unwrap, x.unwrap
+      }
+      offset += 1
+    }
+  }
+  assert_eq s.seek!(100, io.SEEK_START).unwrap, 100
+  buf: [Byte] = [0; 10]
+  assert_eq s.read!(buf).unwrap, 0
+}
+
+test "TestSectionReader_Size" {
+  for d in ["a long sample data, 1234567890", ""] {
+    s = io.new_section_reader(sr(d), 0, d.size)
+    assert_eq s.size, d.size
+  }
+}
+
+test "TestSectionReader_Max" {
+  max = 9223372036854775807
+  s = io.new_section_reader(sr("abcdef"), 3, max)
+  buf: [Byte] = [0; 3]
+  assert_eq s.read!(buf).unwrap, 3
+  assert_eq Str.from_bytes(buf), "def"
+  assert_eq s.read!(buf).unwrap, 0
+  _r, off, n = s.outer
+  assert_eq off, 3
+  assert_eq n, max
+}
+
+struct LargeWriter {
+  pub def write!(p: [Byte]) -> ~Int { p.size + 1 }
+}
+
+test "TestCopyLargeWriter" {
+  rb = bytes.new_buffer_string("hello, world.")
+  assert_eq errmsg(io.copy(LargeWriter.new, rb)), "invalid write result"
+  rb2 = bytes.new_buffer_string("hello, world.")
+  assert_eq errmsg(io.copy(ErrWriter.new(msg: "largeWriterError"), rb2)), "largeWriterError"
+}
+
+test "TestNopCloserWriterToForwarding" {
+  wt = WTBuffer.new(st: new_state("abc"))
+  nc = io.nop_closer(wt)
+  out = bytes.new_buffer_string("")
+  assert_eq nc.write_to!(out).unwrap, 3
+  assert wt.st[0].write_to_called, "write_to! not forwarded"
+  nc2 = io.nop_closer(sr("xyz"))
+  assert_eq nc2.write_to!(out).unwrap, 3
+  assert_eq out.to_s, "abcxyz"
+  nc2.close!.unwrap
+}
+
+def temp_file(dir: Str, name: Str) -> os.File {
+  os.create_temp(dir, name).unwrap
+}
+
+test "TestOffsetWriter_Seek" {
+  dir = os.mkdir_temp("", "io_test").unwrap
+  defer { os.remove_all(dir).unwrap }
+  f = temp_file(dir, "TestOffsetWriter_Seek")
+  defer { f.close!.unwrap }
+  w = io.new_offset_writer(f, 0)
+  for whence in [-3, -2, -1, 3, 4, 5] {
+    assert_eq errmsg(w.seek!(0, whence)), "Seek: invalid whence"
+  }
+  for whence in [io.SEEK_START, io.SEEK_CURRENT] {
+    for offset in [-3, -2, -1] {
+      assert_eq errmsg(w.seek!(offset, whence)), "Seek: invalid offset"
+    }
+  }
+  cases = [
+    (io.SEEK_START, 1, 1), (io.SEEK_START, 2, 2), (io.SEEK_START, 3, 3),
+    (io.SEEK_CURRENT, 1, 4), (io.SEEK_CURRENT, 2, 6), (io.SEEK_CURRENT, 3, 9),
+  ]
+  for c in cases {
+    assert_eq w.seek!(c[1], c[0]).unwrap, c[2]
+  }
+}
+
+test "TestOffsetWriter_WriteAt" {
+  content = "0123456789ABCDEF"
+  dir = os.mkdir_temp("", "io_test").unwrap
+  defer { os.remove_all(dir).unwrap }
+  for off in [0, 1] {
+    for at in [0, 1] {
+      f = temp_file(dir, "off_#{off}_at_#{at}")
+      tasks: [Task[Int]] = []
+      step = 0
+      for value in content.bytes {
+        st = step
+        fc = f.dup
+        tasks << spawn {
+          w = io.new_offset_writer(fc, off)
+          w.write_at([value], at + st).unwrap
+        }
+        step += 1
+      }
+      written = 0
+      for t in tasks { written += t.wait.unwrap }
+      buf: [Byte] = [0; content.size + 1]
+      n = f.read_at(buf, off + at).unwrap
+      assert_eq n, content.size
+      assert_eq written, content.size
+      assert_eq Str.from_bytes(buf[0...content.size]), content
+      f.close!.unwrap
+    }
+  }
+}
+
+test "TestWriteAt_PositionPriorToBase" {
+  dir = os.mkdir_temp("", "io_test").unwrap
+  defer { os.remove_all(dir).unwrap }
+  f = temp_file(dir, "TestOffsetWriter_WriteAt")
+  defer { f.close!.unwrap }
+  w = io.new_offset_writer(f, 10)
+  assert w.write_at("hello".bytes.to_a, -1).err?, "error expected"
+}
+
+def check_content(f: os.File, content: Str) {
+  buf: [Byte] = [0; content.size + 1]
+  n = f.read_at(buf, 0).unwrap
+  assert_eq n, content.size
+  assert_eq Str.from_bytes(buf[0...n]), content
+}
+
+test "TestOffsetWriter_Write" {
+  content = "0123456789ABCDEF"
+  dir = os.mkdir_temp("", "io_test").unwrap
+  defer { os.remove_all(dir).unwrap }
+  f = temp_file(dir, "TestOffsetWriter_Write_Write")
+  w = io.new_offset_writer(f, 0)
+  for value in content.bytes {
+    w.write!([value]).unwrap
+  }
+  check_content(f, content)
+  f2 = temp_file(dir, "TestOffsetWriter_Write_Copy")
+  w2 = io.new_offset_writer(f2, 0)
+  io.copy(w2, f).unwrap
+  check_content(f2, content)
+  f3 = temp_file(dir, "TestOffsetWriter_Write_Of_Copy_WriteTo")
+  w3 = io.new_offset_writer(f3, 0)
+  io.copy(w3, sr(content)).unwrap
+  check_content(f3, content)
+  f.close!.unwrap
+  f2.close!.unwrap
+  f3.close!.unwrap
+}

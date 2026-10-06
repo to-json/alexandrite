@@ -59,9 +59,21 @@ fn overlay_shadows_disk_but_never_adds() {
     std::fs::write(&f, "x = 1 + \"a\"\n").unwrap();
     let (j, _) = run(&f, &[(&f, "puts 1\n")], &[]);
     assert_eq!(ndiag(&j), 0, "{j}");
-    // Unknown file: the overlay does not create it.
+    // A file that is neither on disk nor the focused file is not created by an overlay.
+    let h = d.join("ghost");
+    std::fs::create_dir_all(&h).unwrap();
+    let main = h.join("main.alx");
+    std::fs::write(&main, "import \"ghostpkg\"\nputs 1\n").unwrap();
+    let ghost = h.join("ghostpkg").join("g.alx");
+    let (j, _) = run(&main, &[(&ghost, "pub def f -> Int { 1 }\n")], &[]);
+    assert_eq!(ndiag(&j), 1, "{j}");
+    // Unknown focused file: the editor's unsaved buffer, supplied by the overlay itself.
     let g = d.join("nope.alx");
     let (j, code) = run(&g, &[(&g, "puts 1\n")], &[]);
+    assert_eq!(code, 0);
+    assert_eq!(ndiag(&j), 0, "{j}");
+    // No overlay and no file: cannot read.
+    let (j, code) = run(&g, &[], &[]);
     assert_eq!(code, 0);
     assert!(j.contains("\"phase\":\"load\"") && j.contains("cannot read"), "{j}");
 }
@@ -96,4 +108,16 @@ fn overlay_on_std_file_with_std_dir() {
     let (j, _) = run(&main, &[(&target, &text)], &[("ALX_STD_DIR", &std_dir)]);
     assert_eq!(ndiag(&j), 1, "{j}");
     assert!(j.contains(&quote(&target.to_string_lossy())), "real std path: {j}");
+}
+
+#[test]
+fn overlay_supplies_a_new_unsaved_focused_file() {
+    let d = tmp("newbuf");
+    let f = d.join("new.alx"); // never written to disk
+    let (j, code) = run(&f, &[(&f, "x: Int = \"a\"\nputs x\n")], &[]);
+    assert_eq!(code, 0, "{j}");
+    assert_eq!(ndiag(&j), 1, "{j}");
+    assert!(!j.contains("cannot read"), "{j}");
+    let (j, _) = run(&f, &[(&f, "puts 1\n")], &[]);
+    assert_eq!(ndiag(&j), 0, "{j}");
 }

@@ -226,10 +226,11 @@ pub fn guarded(focused: &Path, body: impl FnOnce() -> String) -> (String, i32) {
 pub fn check_json(file: &Path, overlays: &HashMap<PathBuf, String>, force: Force) -> (String, i32) {
     let file = norm(file);
     guarded(&file, || {
-        // An overlay shadows a file that exists on disk; it never adds one.
+        // An overlay shadows a file that exists on disk; it never adds one,
+        // except the focused file itself (an editor's new, unsaved buffer).
         let read = |p: &Path| -> std::io::Result<String> {
             if let Some(t) = overlays.get(&norm(p)) {
-                if p.is_file() {
+                if p.is_file() || norm(p) == file {
                     return Ok(t.clone());
                 }
             }

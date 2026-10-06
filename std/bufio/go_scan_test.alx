@@ -1,0 +1,452 @@
+#![test(external)]
+# Go's scan_test.go (package bufio_test), translated. Not translated:
+# TestBadReader (a reader returning 0 is at its end here, so endless empty
+# reads can't happen and ErrNoProgress doesn't exist).
+
+import "bufio"
+import "bytes"
+import "io"
+import "strings"
+import "unicode"
+import "unicode/utf8"
+
+SMALL_MAX_TOKEN_SIZE = 256
+
+# (sreader is in go_bufio_test.alx, the same test package.)
+
+# Test white space table matches the Unicode definition.
+test "Space" {
+  r: Rune = 0
+  while r <= 0x10FFFF {
+    assert bufio.is_space(r) == unicode.is_space(r), format("white space property disagrees: %U should be %t", r, unicode.is_space(r))
+    r += 1
+  }
+}
+
+def scan_tests -> [Str] {
+  [
+    "",
+    "a",
+    "¼",
+    "☹",
+    Str.from_bytes([0x81]),
+    "�",
+    "abcdefgh",
+    "abc def\n\t\tgh    ",
+    "abc¼☹" + Str.from_bytes([0x81]) + "�日本語" + Str.from_bytes([0x82]) + "abc",
+  ]
+}
+
+test "ScanByte" {
+  for t in scan_tests() {
+    s = bufio.new_scanner(sreader(t))
+    s.split!(bufio.scan_bytes)
+    i = 0
+    while s.scan! {
+      b = s.bytes
+      assert b.size == 1 && b[0] == t[i], format("%q: %d: got %v", t, i, b)
+      i += 1
+    }
+    assert_eq i, t.size
+    assert s.err.none?, "error"
+  }
+}
+
+# The rune splitter returns the same sequence of runes (not bytes) as a
+# string's runes.
+test "ScanRune" {
+  for t in scan_tests() {
+    s = bufio.new_scanner(sreader(t))
+    s.split!(bufio.scan_runes)
+    rune_count = 0
+    for expect in t.runes {
+      break if !s.scan!
+      rune_count += 1
+      got, _w = utf8.decode_rune(s.bytes)
+      assert_eq got, expect
+    }
+    assert !s.scan!, format("%q: scan ran too long, got %q", t, s.text)
+    assert_eq rune_count, utf8.rune_count_in_string(t)
+    assert s.err.none?, "error"
+  }
+}
+
+def word_scan_tests -> [Str] {
+  ["", " ", "\n", "a", " a ", "abc def", " abc def ", " abc\tdef\nghi\rjkl\fmno\vpqr\u0085stu \n"]
+}
+
+# The word splitter returns the same data as strings.fields.
+test "ScanWords" {
+  for t in word_scan_tests() {
+    s = bufio.new_scanner(sreader(t))
+    s.split!(bufio.scan_words)
+    words = strings.fields(t)
+    word_count = 0
+    while word_count < words.size {
+      break if !s.scan!
+      assert_eq s.text, words[word_count]
+      word_count += 1
+    }
+    assert !s.scan!, format("%q: scan ran too long, got %q", t, s.text)
+    assert_eq word_count, words.size
+    assert s.err.none?, "error"
+  }
+}
+
+# A reader that returns only a few bytes at a time, to test the incremental
+# reads in scan!.
+struct SlowReader[R] {
+  max: Int
+  st: [R]
+
+  def read!(p: [Byte]) -> ~Int {
+    q = p
+    q = p[0...max] if p.size > max
+    self.st[0].~read!(q)
+  }
+}
+
+def slow_reader[R](max: Int, r: R) -> SlowReader[R] {
+  SlowReader[R].new(max: max, st: [r])
+}
+
+# A predictable but non-trivial line of text of length n, including the
+# terminal newline and an occasional carriage return. Without add_newline,
+# no \r and \n.
+def gen_line(line_num: Int, n0: Int, add_newline: Bool) -> [Byte] {
+  buf: [Byte] = []
+  n = n0
+  do_cr = line_num % 5 == 0
+  n -= 1 if do_cr
+  i = 0
+  while i < n - 1 {
+    # Stop early for \n.
+    c = (97 + line_num + i).as_u8
+    c = 78 if c == 10 || c == 13
+    buf << c
+    i += 1
+  }
+  if add_newline {
+    buf << 13 if do_cr
+    buf << 10
+  }
+  buf
+}
+
+# The line splitter, with some carriage returns but no long lines.
+test "ScanLongLines" {
+  # Lots of line lengths up to but not exceeding SMALL_MAX_TOKEN_SIZE.
+  buf = bytes.new_buffer([])
+  j = 0
+  i = 0
+  while i < 2 * SMALL_MAX_TOKEN_SIZE {
+    buf.write!(gen_line(i, j, true))
+    if j < SMALL_MAX_TOKEN_SIZE {
+      j += 1
+    } else {
+      j -= 1
+    }
+    i += 1
+  }
+  s = bufio.new_scanner(slow_reader(1, buf))
+  s.split!(bufio.scan_lines)
+  bufio.max_token_size(s, SMALL_MAX_TOKEN_SIZE)
+  j = 0
+  line_num = 0
+  while s.scan! {
+    line = Str.from_bytes(gen_line(line_num, j, false))
+    if j < SMALL_MAX_TOKEN_SIZE {
+      j += 1
+    } else {
+      j -= 1
+    }
+    assert s.text == line, format("%d: bad line: %d %d", line_num, s.bytes.size, line.size)
+    line_num += 1
+  }
+  assert s.err.none?, "error"
+}
+
+# The line splitter errors out on a long line.
+test "ScanLineTooLong" {
+  buf = bytes.new_buffer([])
+  j = 0
+  i = 0
+  while i < 2 * SMALL_MAX_TOKEN_SIZE {
+    buf.write!(gen_line(i, j, true))
+    j += 1
+    i += 1
+  }
+  s = bufio.new_scanner(slow_reader(3, buf))
+  s.split!(bufio.scan_lines)
+  bufio.max_token_size(s, SMALL_MAX_TOKEN_SIZE)
+  j = 0
+  line_num = 0
+  while s.scan! {
+    line = gen_line(line_num, j, false)
+    if j < SMALL_MAX_TOKEN_SIZE {
+      j += 1
+    } else {
+      j -= 1
+    }
+    assert s.bytes == line, format("%d: bad line: %d %d", line_num, s.bytes.size, line.size)
+    line_num += 1
+  }
+  e = s.err.unwrap
+  case e {
+    bufio.BufioError.TooLong => assert_eq e.message, "bufio.Scanner: token too long"
+    _ => assert false, "expected ErrTooLong; got #{e.message}"
+  }
+}
+
+# The line splitter handles a final line without a newline.
+#[track_caller]
+def test_no_newline(text: Str, lines: [Str]) {
+  s = bufio.new_scanner(slow_reader(7, sreader(text)))
+  s.split!(bufio.scan_lines)
+  line_num = 0
+  while s.scan! {
+    assert_eq s.text, lines[line_num]
+    line_num += 1
+  }
+  assert_eq line_num, lines.size
+  assert s.err.none?, "error"
+}
+
+test "ScanLineNoNewline" {
+  test_no_newline("abcdefghijklmn\nopqrstuvwxyz", ["abcdefghijklmn", "opqrstuvwxyz"])
+}
+
+# A final line with a carriage return but no newline.
+test "ScanLineReturnButNoNewline" {
+  test_no_newline("abcdefghijklmn\nopqrstuvwxyz\r", ["abcdefghijklmn", "opqrstuvwxyz"])
+}
+
+# A final empty line.
+test "ScanLineEmptyFinalLine" {
+  test_no_newline("abcdefghijklmn\nopqrstuvwxyz\n\n", ["abcdefghijklmn", "opqrstuvwxyz", ""])
+}
+
+# A final empty line with a carriage return but no newline.
+test "ScanLineEmptyFinalLineWithCR" {
+  test_no_newline("abcdefghijklmn\nopqrstuvwxyz\n\r", ["abcdefghijklmn", "opqrstuvwxyz", ""])
+}
+
+error TestErr {
+  Test
+
+  def message -> Str {
+    "testError"
+  }
+}
+
+# The right error comes back when the split function fails.
+test "SplitError" {
+  # A split function that delivers a little data, then a predictable error.
+  num_splits = [0]
+  ok_count = 7
+  error_split = ->(data: [Byte], at_eof: Bool) -> ~(Int, [Byte]?, Bool) {
+    panic "didn't get enough data" if at_eof
+    fail TestErr.Test if num_splits[0] >= ok_count
+    num_splits[0] = num_splits[0] + 1
+    (1, data[0...1], false)
+  }
+  text = "abcdefghijklmnopqrstuvwxyz"
+  s = bufio.new_scanner(slow_reader(1, sreader(text)))
+  s.split!(error_split)
+  i = 0
+  while s.scan! {
+    assert s.bytes.size == 1 && text[i] == s.bytes[0], format("#%d: expected %q got %v", i, text[i...i + 1], s.bytes)
+    i += 1
+  }
+  # Check correct termination location and error.
+  assert_eq i, ok_count
+  assert_eq s.err.unwrap.message, "testError"
+}
+
+# An EOF is overridden by a user-generated scan error.
+test "ErrAtEOF" {
+  s = bufio.new_scanner(sreader("1 2 33"))
+  # This splitter fails on the last entry, after the end was seen.
+  split = ->(data: [Byte], at_eof: Bool) -> ~(Int, [Byte]?, Bool) {
+    advance, token, final = ~bufio.scan_words(data, at_eof)
+    if t = token {
+      if t.size > 1 {
+        panic "not testing EOF" if bufio.err_or_eof(s) != "EOF"
+        fail TestErr.Test
+      }
+    }
+    (advance, token, final)
+  }
+  s.split!(split)
+  while s.scan! {
+  }
+  assert_eq s.err.unwrap.message, "testError"
+}
+
+# Issue 5268.
+struct AlwaysError {
+  def read!(_p: [Byte]) -> ~Int {
+    fail io.StreamError.UnexpectedEof
+  }
+}
+
+test "NonEOFWithEmptyRead" {
+  scanner = bufio.new_scanner(AlwaysError.new())
+  while scanner.scan! {
+    assert false, "read should fail"
+  }
+  e = scanner.err.unwrap
+  case e {
+    io.StreamError.UnexpectedEof => assert_eq e.message, "unexpected EOF"
+    _ => assert false, "unexpected error: #{e.message}"
+  }
+}
+
+test "ScanWordsExcessiveWhiteSpace" {
+  word = "ipsum"
+  s = " " * (4 * SMALL_MAX_TOKEN_SIZE) + word
+  scanner = bufio.new_scanner(sreader(s))
+  bufio.max_token_size(scanner, SMALL_MAX_TOKEN_SIZE)
+  scanner.split!(bufio.scan_words)
+  assert scanner.scan!, "scan failed"
+  assert_eq scanner.text, word
+}
+
+# Empty tokens, including at the end of a line or of the input, are found
+# (issue 8672: could miss the final empty token).
+def comma_split(data: [Byte], _at_eof: Bool) -> ~(Int, [Byte]?, Bool) {
+  i = 0
+  while i < data.size {
+    return (i + 1, data[0...i], false) if data[i] == 44
+    i += 1
+  }
+  (0, data, true)
+}
+
+#[track_caller]
+def test_empty_tokens(text: Str, values: [Str]) {
+  s = bufio.new_scanner(sreader(text))
+  s.split!(comma_split)
+  i = 0
+  while s.scan! {
+    assert i < values.size, "got #{i + 1} fields, expected #{values.size}"
+    assert_eq s.text, values[i]
+    i += 1
+  }
+  assert_eq i, values.size
+  assert s.err.none?, "error"
+}
+
+test "EmptyTokens" {
+  test_empty_tokens("1,2,3,", ["1", "2", "3", ""])
+}
+
+test "WithNoEmptyTokens" {
+  test_empty_tokens("1,2,3", ["1", "2", "3"])
+}
+
+def loop_at_eof_split(data: [Byte], _at_eof: Bool) -> ~(Int, [Byte]?, Bool) {
+  return (1, data[0...1], false) if data.size > 0
+  (0, data, false)
+}
+
+test "DontLoopForever" {
+  s = bufio.new_scanner(sreader("abc"))
+  s.split!(loop_at_eof_split)
+  # Expect a panic.
+  assert_panics("empty tokens") {
+    count = 0
+    while s.scan! {
+      panic "looping" if count > 1000
+      count += 1
+    }
+  }
+}
+
+test "BlankLines" {
+  s = bufio.new_scanner(sreader("\n" * 1000))
+  count = 0
+  while s.scan! {
+    assert count <= 2000, "looping"
+    count += 1
+  }
+  assert s.err.none?, "error"
+}
+
+# The looping-at-EOF check doesn't trigger for merely empty tokens.
+test "EmptyLinesOK" {
+  c = [10000]
+  split = ->(data: [Byte], _at_eof: Bool) -> ~(Int, [Byte]?, Bool) {
+    if c[0] > 0 {
+      c[0] = c[0] - 1
+      return (1, data[0...1], false)
+    }
+    (0, none, false)
+  }
+  s = bufio.new_scanner(sreader("\n" * 10000))
+  s.split!(split)
+  while s.scan! {
+  }
+  assert s.err.none?, "error"
+  assert_eq c[0], 0
+}
+
+# A huge token can be read if a big enough buffer is provided.
+test "HugeBuffer" {
+  text = "x" * (2 * bufio.MAX_SCAN_TOKEN_SIZE)
+  s = bufio.new_scanner(sreader(text + "\n"))
+  b: [Byte] = [0; 100]
+  s.buffer!(b, 3 * bufio.MAX_SCAN_TOKEN_SIZE)
+  while s.scan! {
+    assert s.text == text, "scan got incorrect token of length #{s.text.size}"
+  }
+  assert s.err.none?, "error"
+}
+
+# Returns an invalid -1 at the end, as though it were wrapping the read
+# system call.
+struct NegativeEOFReader {
+  st: [Int]
+
+  def read!(p: [Byte]) -> ~Int {
+    if st[0] > 0 {
+      c = st[0]
+      c = p.size if c > p.size
+      i = 0
+      while i < c {
+        p[i] = 97
+        i += 1
+      }
+      p[c - 1] = 10
+      self.st[0] = st[0] - c
+      return c
+    }
+    -1
+  }
+}
+
+# The scanner doesn't panic and fails with BadReadCount on a reader that
+# returns a negative count (issue 38053).
+test "NegativeEOFReader" {
+  scanner = bufio.new_scanner(NegativeEOFReader.new(st: [10]))
+  c = 0
+  while scanner.scan! {
+    c += 1
+    assert c <= 1, "read too many lines"
+  }
+  assert_eq scanner.err.unwrap.message, "bufio.Scanner: Read returned impossible count"
+}
+
+# Returns an invalid count larger than the number of bytes requested.
+struct LargeReader {
+  def read!(p: [Byte]) -> ~Int {
+    p.size + 1
+  }
+}
+
+test "LargeReader" {
+  scanner = bufio.new_scanner(LargeReader.new())
+  while scanner.scan! {
+  }
+  assert_eq scanner.err.unwrap.message, "bufio.Scanner: Read returned impossible count"
+}

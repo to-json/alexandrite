@@ -1955,7 +1955,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 *e = e2;
                 let t = e.ty.clone();
                 let rt = self.ret.clone();
-                if !matches!(rt, Ty::Unit) && !self.unify(&t, &rt) {
+                if !matches!(self.resolve(&rt), Ty::Unit) && !self.unify(&t, &rt) {
                     return Err(Diag::new(e.span, format!("`{}` returns {}, but its last expression is {}", self.fn_name, self.resolve(&rt).show(), self.resolve(&t).show())));
                 }
             } else {

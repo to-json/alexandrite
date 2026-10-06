@@ -10,23 +10,46 @@
 #    (clone, join, repeat, replace*, map, to_lower, to_upper, to_valid_utf8,
 #    runes) never alias their input.
 #  - Invalid UTF-8 decodes as U+FFFD with width 1, as in Go.
-#  - Case mapping and equal_fold go through strings' tables (ASCII, Latin-1,
-#    Latin Extended-A, Greek, Cyrillic) at the cost of one Str round trip.
+#  - Case mapping (to_upper, to_lower, to_title, title) and equal_fold use
+#    std/unicode's tables: all of Unicode, simple case mapping, as Go's do.
 #  - Builtin methods win over method sugar, so a name that is also a builtin
 #    array method (`map`, `repeat`...) is called qualified: `bytes.map(f, b)`.
-#  - Buffer (Go's bytes.Buffer) is a handle on shared state: copies of a Buffer
-#    are the same buffer (D36); see the Buffer section for the zero value. It
-#    follows the io shape of GO-VS-RUBY F3: end of
-#    data is not an error. `read!` returns 0 at EOF (and for an empty p);
-#    `read_byte!`, `read_rune!`, `read_string!`, `read_bytes!` return none at
-#    EOF. `read_string!(delim)` returns the text through the delimiter, or the
-#    remainder if there is none (Go returns it with io.EOF); none only when
-#    nothing was left. `cap` is the length (no capacity primitive yet) and
-#    `grow!` only validates n.
-#  - Reader (Go's bytes.Reader, reader.alx): new_reader(b); read!, read_at,
-#    seek!, read_byte!, read_rune!, write_to!; the same end-of-data shape.
+#  - Buffer (Go's bytes.Buffer, buffer.alx) and Reader (Go's bytes.Reader,
+#    reader.alx) have their own headers.
+#
+#   Go                                        alx
+#   Clone / Equal / Compare                   clone / equal / compare
+#   Contains / ContainsAny / ContainsRune / ContainsFunc   contains / contains_any / contains_rune / contains_func
+#   Count / HasPrefix / HasSuffix             count / has_prefix / has_suffix
+#   Index / IndexByte / IndexRune / IndexAny / IndexFunc   index / index_byte / index_rune / index_any / index_func
+#   LastIndex / LastIndexByte / LastIndexAny / LastIndexFunc   last_index / ... / last_index_func
+#   Cut / CutLast (before, after, found)      cut / cut_last -> ([Byte], [Byte])?
+#   CutPrefix / CutSuffix (rest, found)       cut_prefix / cut_suffix -> [Byte]?
+#   EqualFold                                 equal_fold
+#   Split / SplitN / SplitAfter / SplitAfterN split / split_n / split_after / split_after_n
+#   Fields / FieldsFunc                       fields / fields_func
+#   Lines / SplitSeq / SplitAfterSeq          lines / split_seq / split_after_seq -> [[Byte]]
+#   FieldsSeq / FieldsFuncSeq                 fields_seq / fields_func_seq -> [[Byte]]
+#   Join / Repeat / Runes                     join / repeat / runes
+#   Replace / ReplaceAll / Map                replace / replace_all / map(mapping, s)
+#   ToUpper / ToLower / ToTitle / Title       to_upper / to_lower / to_title / title
+#   ToValidUTF8                               to_valid_utf8
+#   Trim / TrimLeft / TrimRight / TrimSpace   trim / trim_left / trim_right / trim_space
+#   TrimFunc / TrimLeftFunc / TrimRightFunc   trim_func / trim_left_func / trim_right_func
+#   TrimPrefix / TrimSuffix                   trim_prefix / trim_suffix
+#
+# Differences from Go:
+#  - Go's iterator functions (Lines, SplitSeq, SplitAfterSeq, FieldsSeq,
+#    FieldsFuncSeq) return the same pieces as a slice: alx has no iter.Seq.
+#  - No nil: functions Go documents as returning nil (Trim of an empty slice,
+#    the after of a failed cut) return an empty slice; cut* return none.
+#  - repeat panics with "bytes: Repeat: len out of range" for a result over
+#    2^48 bytes, where Go's runtime says "makeslice: len out of range".
+#  - Not yet: ToUpperSpecial / ToLowerSpecial / ToTitleSpecial (std/unicode
+#    has no SpecialCase tables).
 
 import "strings"
+import "unicode"
 
 BAD = 0xFFFD * 8 + 1
 
@@ -337,10 +360,55 @@ pub def cut_suffix(b: [Byte], suffix: [Byte]) -> [Byte]? {
   b[0...b.size - suffix.size]
 }
 
-# Whether a and b are equal under simple Unicode case folding (strings' table
-# coverage).
+# Like cut, around the last instance of sep.
+pub def cut_last(b: [Byte], sep: [Byte]) -> ([Byte], [Byte])? {
+  i = last_index(b, sep)
+  return none if i < 0
+  (b[0...i], b[i + sep.size...b.size])
+}
+
+# Whether a and b, read as UTF-8, are equal under simple Unicode case folding
+# (invalid bytes read as U+FFFD).
 pub def equal_fold(a: [Byte], b: [Byte]) -> Bool {
-  strings.equal_fold(Str.from_bytes(a), Str.from_bytes(b))
+  i = 0
+  j = 0
+  while i < a.size && j < b.size {
+    sr = 0
+    tr = 0
+    if a[i] < 0x80 {
+      sr = a[i].to_i
+      i += 1
+    } else {
+      v = dec(a, i)
+      sr = v >> 3
+      i += v & 7
+    }
+    if b[j] < 0x80 {
+      tr = b[j].to_i
+      j += 1
+    } else {
+      v = dec(b, j)
+      tr = v >> 3
+      j += v & 7
+    }
+    next if tr == sr
+    if tr < sr {
+      t = tr
+      tr = sr
+      sr = t
+    }
+    if tr < 0x80 {
+      next if sr >= 0x41 && sr <= 0x5A && tr == sr + 32
+      return false
+    }
+    r = unicode.simple_fold(sr.as_i32).to_i
+    while r != sr && r < tr {
+      r = unicode.simple_fold(r.as_i32).to_i
+    }
+    next if r == tr
+    return false
+  }
+  i == a.size && j == b.size
 }
 
 # ---------------------------------------------------------------- splitting
@@ -429,6 +497,29 @@ pub def fields(s: [Byte]) -> [[Byte]] {
   out
 }
 
+# Go's iterator forms (iter.Seq), as slices: alx has no iter.Seq, and the
+# pieces are the same subslices the iterators yield.
+
+# The newline-terminated lines of s (each keeps its "\n"; a last line without
+# one is included; no empty final line).
+pub def lines(s: [Byte]) -> [[Byte]] {
+  out: [[Byte]] = []
+  n = s.size
+  start = 0
+  while start < n {
+    j = index_byte(s[start...n], 10)
+    e = j < 0 ? n : start + j + 1
+    out << s[start...e]
+    start = e
+  }
+  out
+}
+
+pub def split_seq(s: [Byte], sep: [Byte]) -> [[Byte]] { split(s, sep) }
+pub def split_after_seq(s: [Byte], sep: [Byte]) -> [[Byte]] { split_after(s, sep) }
+pub def fields_seq(s: [Byte]) -> [[Byte]] { fields(s) }
+pub def fields_func_seq(s: [Byte], f: (Rune) -> Bool) -> [[Byte]] { fields_func(s, f) }
+
 # A new slice: the elements of s with sep between them.
 pub def join(s: [[Byte]], sep: [Byte]) -> [Byte] {
   out = empty_bytes
@@ -441,14 +532,27 @@ pub def join(s: [[Byte]], sep: [Byte]) -> [Byte] {
   out
 }
 
-# b repeated count times (a new slice). Panics if count is negative.
+# The largest slice `repeat` makes (Go's runtime limit on an allocation).
+MAX_ALLOC = 1 << 48
+
+# b repeated count times (a new slice). Panics if count is negative or the
+# result would be too large.
 pub def repeat(b: [Byte], count: Int) -> [Byte] {
-  assert count >= 0 # negative count panics (Go)
-  out = empty_bytes
-  i = 0
-  while i < count {
-    out = app(out, b, 0, b.size)
-    i += 1
+  return empty_bytes if count == 0
+  panic("bytes: negative Repeat count") if count < 0
+  n = b.size
+  return empty_bytes if n == 0
+  panic("bytes: Repeat output length overflow") if count > 0x7FFF_FFFF_FFFF_FFFF / n
+  total = n * count
+  panic("bytes: Repeat: len out of range") if total > MAX_ALLOC
+  out: [Byte] = [0; total]
+  copy(out, b)
+  done = n
+  while done < total {
+    k = done
+    k = total - done if k > total - done
+    copy(out[done...done + k], out[0...k])
+    done += k
   }
   out
 }
@@ -533,14 +637,84 @@ pub def to_valid_utf8(s: [Byte], replacement: [Byte]) -> [Byte] {
 
 # ------------------------------------------------------------------- case
 
-# Upper-case copy of s (strings' coverage note applies).
-pub def to_upper(s: [Byte]) -> [Byte] {
-  clone(strings.to_upper(Str.from_bytes(s)).bytes.to_a)
+CASE_UP = 0
+CASE_LO = 1
+CASE_TI = 2
+
+# A copy of s with every rune mapped by unicode.to_upper / to_lower /
+# to_title (which); invalid UTF-8 becomes U+FFFD, as in Go's Map.
+def map_case(s: [Byte], which: Int) -> [Byte] {
+  out = empty_bytes
+  n = s.size
+  i = 0
+  while i < n {
+    b = s[i]
+    if b < 0x80 {
+      c = b
+      if which == CASE_LO {
+        c = b + 32 if b >= 0x41 && b <= 0x5A
+      } else {
+        c = b - 32 if b >= 0x61 && b <= 0x7A
+      }
+      out << c
+      i += 1
+    } else {
+      v = dec(s, i)
+      r = (v >> 3).as_i32
+      m = r
+      if which == CASE_UP {
+        m = unicode.to_upper(r)
+      } else if which == CASE_LO {
+        m = unicode.to_lower(r)
+      } else {
+        m = unicode.to_title(r)
+      }
+      out = put_rune(out, m.to_i)
+      i += v & 7
+    }
+  }
+  out
 }
 
-# Lower-case copy of s.
-pub def to_lower(s: [Byte]) -> [Byte] {
-  clone(strings.to_lower(Str.from_bytes(s)).bytes.to_a)
+# A copy of s with every rune upper-cased (Unicode simple case mapping).
+pub def to_upper(s: [Byte]) -> [Byte] { map_case(s, CASE_UP) }
+
+# A copy of s with every rune lower-cased.
+pub def to_lower(s: [Byte]) -> [Byte] { map_case(s, CASE_LO) }
+
+# A copy of s with every rune mapped to its title case.
+pub def to_title(s: [Byte]) -> [Byte] { map_case(s, CASE_TI) }
+
+# Whether r separates words for `title` (Go's isSeparator).
+def is_separator(r: Rune) -> Bool {
+  if r <= 0x7F {
+    return false if r >= 0x30 && r <= 0x39
+    return false if r >= 0x61 && r <= 0x7A
+    return false if r >= 0x41 && r <= 0x5A
+    return false if r == 0x5F
+    return true
+  }
+  return false if unicode.is_letter(r) || unicode.is_digit(r)
+  unicode.is_space(r)
+}
+
+# A copy of s with the first letter of each word mapped to title case
+# (deprecated in Go: it doesn't handle Unicode punctuation properly).
+pub def title(s: [Byte]) -> [Byte] {
+  out = empty_bytes
+  prev: Rune = 32
+  n = s.size
+  i = 0
+  while i < n {
+    v = dec(s, i)
+    r = (v >> 3).as_i32
+    m = r
+    m = unicode.to_title(r) if is_separator(prev)
+    prev = r
+    out = put_rune(out, m.to_i)
+    i += v & 7
+  }
+  out
 }
 
 # ------------------------------------------------------------------ trimming
@@ -610,186 +784,4 @@ pub def trim_space(s: [Byte]) -> [Byte] {
     e -= v & 7
   }
   s[i...e]
-}
-
-# -------------------------------------------------------------------- Buffer
-# A growable byte buffer with a read offset (Go's bytes.Buffer). Writes append;
-# reads consume from the front.
-#
-# State sharing (GO-VS-RUBY D36): the buffer's bytes and read offset live in a
-# one-element slice `st`, so every copy of a Buffer (a function argument, an
-# io.Reader / io.Writer value, a struct field) is the same buffer, like Go's
-# *bytes.Buffer. Mutating methods keep their `!` (the checker wants it for any
-# write through `self`) and need a variable receiver, but the variable may be
-# a copy.
-# The zero value `Buffer.new` has no state yet: it reads as empty, and its
-# first write creates the state. Copies taken BEFORE that first write don't
-# share it, so make the buffer with `new_buffer` / `new_buffer_string` (or
-# write once) before handing out copies.
-struct BufState {
-  buf: [Byte]
-  off: Int
-}
-
-pub struct Buffer {
-  st: [BufState]
-
-  # (Writers create the state of a zero-value Buffer inline, `if st.size == 0`:
-  # a helper `!` call per write would add a cell to the region each time.)
-
-  # Appends p; returns len(p).
-  pub def write!(p: [Byte]) -> Int {
-    if st.size == 0 { self.st = [BufState.new(buf: [], off: 0)] }
-    n = p.size
-    i = 0
-    while i < n {
-      self.st[0].buf << p[i]
-      i += 1
-    }
-    n
-  }
-  # Appends s; returns the number of bytes written.
-  pub def write_string!(s: Str) -> Int {
-    if st.size == 0 { self.st = [BufState.new(buf: [], off: 0)] }
-    n = s.size
-    i = 0
-    while i < n {
-      self.st[0].buf << s[i]
-      i += 1
-    }
-    n
-  }
-  pub def write_byte!(c: Byte) {
-    if st.size == 0 { self.st = [BufState.new(buf: [], off: 0)] }
-    self.st[0].buf << c
-  }
-  # Appends r as UTF-8 (invalid values become U+FFFD); returns bytes written.
-  pub def write_rune!(r: Rune) -> Int {
-    if st.size == 0 { self.st = [BufState.new(buf: [], off: 0)] }
-    before = st[0].buf.size
-    self.st[0].buf = put_rune(st[0].buf, r.to_i)
-    st[0].buf.size - before
-  }
-
-  # Unread bytes.
-  pub def size -> Int { st.size == 0 ? 0 : st[0].buf.size - st[0].off }
-  pub def len -> Int { st.size == 0 ? 0 : st[0].buf.size - st[0].off }
-  # Capacity: the length (no capacity primitive yet).
-  pub def cap -> Int { st.size == 0 ? 0 : st[0].buf.size }
-  # The unread portion, aliasing the buffer; valid until the next write.
-  pub def bytes -> [Byte] {
-    return empty_bytes if st.size == 0
-    st[0].buf[st[0].off...st[0].buf.size]
-  }
-  pub def to_s -> Str { Str.from_bytes(bytes) }
-  pub def string -> Str { Str.from_bytes(bytes) }
-
-  pub def reset! {
-    if st.size > 0 {
-      self.st[0].buf = []
-      self.st[0].off = 0
-    }
-  }
-  # Keeps only the first n unread bytes. Panics unless 0 <= n <= size.
-  pub def truncate!(n: Int) {
-    assert n >= 0 && n <= size, "truncate out of range"
-    if st.size > 0 {
-      if n == 0 {
-        self.st[0].buf = []
-        self.st[0].off = 0
-      } else {
-        self.st[0].buf = st[0].buf[0...st[0].off + n]
-      }
-    }
-  }
-  pub def grow!(n: Int) {
-    assert n >= 0, "negative count"
-  }
-
-  # Reads up to p.size bytes into p; returns the count, 0 at EOF (or if p is
-  # empty).
-  pub def read!(p: [Byte]) -> Int {
-    return 0 if st.size == 0
-    off = st[0].off
-    avail = st[0].buf.size - off
-    n = p.size < avail ? p.size : avail
-    return 0 if n == 0
-    copy(p[0...n], st[0].buf[off...off + n])
-    if off + n == st[0].buf.size {
-      self.st[0].buf = []
-      self.st[0].off = 0
-    } else {
-      self.st[0].off = off + n
-    }
-    n
-  }
-  # The next n unread bytes (fewer at the end), aliasing the buffer, and
-  # consumes them.
-  pub def next!(n: Int) -> [Byte] {
-    assert n >= 0, "negative count"
-    return empty_bytes if st.size == 0
-    off = st[0].off
-    avail = st[0].buf.size - off
-    m = n < avail ? n : avail
-    out = st[0].buf[off...off + m]
-    self.st[0].off = off + m
-    out
-  }
-  pub def read_byte! -> Byte? {
-    return none if st.size == 0
-    off = st[0].off
-    return none if off >= st[0].buf.size
-    c = st[0].buf[off]
-    self.st[0].off = off + 1
-    c
-  }
-  # The next rune and its width in bytes; none at EOF. Invalid UTF-8 reads as
-  # (U+FFFD, 1).
-  pub def read_rune! -> (Rune, Int)? {
-    return none if st.size == 0
-    off = st[0].off
-    return none if off >= st[0].buf.size
-    v = dec(st[0].buf, off)
-    self.st[0].off = off + (v & 7)
-    ((v >> 3).as_i32, v & 7)
-  }
-  # Reads through the first delim (included), or to the end if there is none;
-  # none if nothing was left.
-  pub def read_bytes!(delim: Byte) -> [Byte]? {
-    return none if st.size == 0
-    off = st[0].off
-    n = st[0].buf.size
-    return none if off >= n
-    i = off
-    while i < n && st[0].buf[i] != delim {
-      i += 1
-    }
-    e = i < n ? i + 1 : i
-    out = clone(st[0].buf[off...e])
-    self.st[0].off = e
-    out
-  }
-  pub def read_string!(delim: Byte) -> Str? {
-    return none if st.size == 0
-    off = st[0].off
-    n = st[0].buf.size
-    return none if off >= n
-    i = off
-    while i < n && st[0].buf[i] != delim {
-      i += 1
-    }
-    e = i < n ? i + 1 : i
-    out = Str.from_bytes(st[0].buf[off...e])
-    self.st[0].off = e
-    out
-  }
-}
-
-# A Buffer holding a copy of b, ready to read and write; copies share it.
-pub def new_buffer(b: [Byte]) -> Buffer {
-  Buffer.new(st: [BufState.new(buf: clone(b), off: 0)])
-}
-
-pub def new_buffer_string(s: Str) -> Buffer {
-  Buffer.new(st: [BufState.new(buf: s.bytes.to_a, off: 0)])
 }

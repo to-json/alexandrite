@@ -1,0 +1,155 @@
+#![test(external)]
+# Go's os/error_test.go and error_unix_test.go, translated. Go's sentinel
+# errors are FsFailure codes here: fs.ErrExist / ErrNotExist / ErrClosed /
+# ErrInvalid are os.ERR_EXIST / ERR_NOT_EXIST / ERR_CLOSED / ERR_INVALID,
+# and fs.ErrPermission is EACCES (the same text, "permission denied").
+# errors.Is(err, fs.ErrX) is io/fs's is_x(err).
+
+import "os"
+import "io/fs"
+
+
+# An errno by name, from an error the system reports.
+def errno_of(name: Str) -> Int {
+  case name {
+    "EEXIST" => os.mkdir("/", 0o777).err.unwrap.errno
+    "ENOENT" => os.stat("/no/such/file/at/all").err.unwrap.errno
+    "ENOTEMPTY" => not_empty_errno
+    "EACCES" => eacces_errno
+    "EPERM" => eperm_errno
+    _ => 0
+  }
+}
+
+def not_empty_errno -> Int {
+  d = os.mkdir_temp("", "alx-err").unwrap
+  os.mkdir(d + "/x", 0o777).unwrap
+  e = os.remove(d).err.unwrap.errno
+  os.remove_all(d).unwrap
+  e
+}
+
+# EACCES and EPERM: macOS's and Linux's numbers agree (13, 1).
+def eacces_errno -> Int { 13 }
+def eperm_errno -> Int { 1 }
+
+def check_error_predicate(pred_name: Str, pred: (Error) -> Bool, e: Error, target: (Error) -> Bool) -> Str {
+  return "#{pred_name} does not work as expected for #{e}" if !pred.call(e)
+  return "errors.Is(#{e}, target) = false, want true" if !target.call(e)
+  ""
+}
+
+test "ErrIsExist" {
+  f = os.create_temp("", "_Go_ErrIsExist").unwrap
+  r = os.open_file(f.name, os.O_RDWR | os.O_CREATE | os.O_EXCL, 0o600)
+  assert r.err?, "Open should have failed"
+  s = check_error_predicate("os.IsExist", ->(e: Error) -> Bool { os.is_exist(e) }, r.err.unwrap, ->(e: Error) -> Bool { fs.is_exist(e) })
+  f.close!.unwrap
+  os.remove(f.name).unwrap
+  assert_eq s, ""
+}
+
+def test_err_not_exist(name: Str) -> Str {
+  original_wd = os.getwd.unwrap
+  r = os.open(name)
+  return "Open should have failed" if r.ok?
+  s = check_error_predicate("os.IsNotExist", ->(e: Error) -> Bool { os.is_not_exist(e) }, r.err.unwrap, ->(e: Error) -> Bool { fs.is_not_exist(e) })
+  return s if s != ""
+  c = os.chdir(name)
+  if c.ok? {
+    os.chdir(original_wd).unwrap
+    return "Chdir should have failed, restored original working directory"
+  }
+  check_error_predicate("os.IsNotExist", ->(e: Error) -> Bool { os.is_not_exist(e) }, c.err.unwrap, ->(e: Error) -> Bool { fs.is_not_exist(e) })
+}
+
+test "ErrIsNotExist" { |t|
+  name = t.temp_dir + "/NotExists"
+  assert_eq test_err_not_exist(name), ""
+  assert_eq test_err_not_exist(name + "/NotExists2"), ""
+}
+
+# (error, is exist, is not exist); Go's nil error has no counterpart.
+def is_exist_tests -> [(os.FsError, Bool, Bool)] {
+  [
+    (os.fs_error("", "", os.ERR_INVALID), false, false),
+    (os.fs_error("", "", eacces_errno), false, false),
+    (os.fs_error("", "", os.ERR_EXIST), true, false),
+    (os.fs_error("", "", os.ERR_NOT_EXIST), false, true),
+    (os.fs_error("", "", os.ERR_CLOSED), false, false),
+    (os.link_error("", "", "", os.ERR_INVALID), false, false),
+    (os.link_error("", "", "", eacces_errno), false, false),
+    (os.link_error("", "", "", os.ERR_EXIST), true, false),
+    (os.link_error("", "", "", os.ERR_NOT_EXIST), false, true),
+    (os.link_error("", "", "", os.ERR_CLOSED), false, false),
+    (os.new_syscall_error("x", os.ERR_NOT_EXIST), false, true),
+    (os.new_syscall_error("x", os.ERR_EXIST), true, false),
+    # error_unix_test.go's
+    (os.fs_error("", "", errno_of("EEXIST")), true, false),
+    (os.fs_error("", "", errno_of("ENOTEMPTY")), true, false),
+    (os.link_error("", "", "", errno_of("EEXIST")), true, false),
+    (os.link_error("", "", "", errno_of("ENOTEMPTY")), true, false),
+    (os.new_syscall_error("x", errno_of("EEXIST")), true, false),
+    (os.new_syscall_error("x", errno_of("ENOTEMPTY")), true, false),
+  ]
+}
+
+test "IsExist" {
+  for tt in is_exist_tests {
+    e = tt[0]
+    assert os.is_exist(e) == tt[1], "os.IsExist(#{e}) = #{os.is_exist(e)}, want #{tt[1]}"
+    assert fs.is_exist(e) == tt[1], "errors.Is(#{e}, fs.ErrExist) = #{fs.is_exist(e)}, want #{tt[1]}"
+    assert os.is_not_exist(e) == tt[2], "os.IsNotExist(#{e}) = #{os.is_not_exist(e)}, want #{tt[2]}"
+    assert fs.is_not_exist(e) == tt[2], "errors.Is(#{e}, fs.ErrNotExist) = #{fs.is_not_exist(e)}, want #{tt[2]}"
+  }
+}
+
+def is_permission_tests -> [(os.FsError, Bool)] {
+  [
+    (os.fs_error("", "", eacces_errno), true),
+    (os.new_syscall_error("x", eacces_errno), true),
+    # error_unix_test.go's
+    (os.fs_error("", "", eacces_errno), true),
+    (os.fs_error("", "", eperm_errno), true),
+    (os.fs_error("", "", errno_of("EEXIST")), false),
+    (os.link_error("", "", "", eacces_errno), true),
+    (os.link_error("", "", "", eperm_errno), true),
+    (os.link_error("", "", "", errno_of("EEXIST")), false),
+    (os.new_syscall_error("x", eacces_errno), true),
+    (os.new_syscall_error("x", eperm_errno), true),
+    (os.new_syscall_error("x", errno_of("EEXIST")), false),
+  ]
+}
+
+test "IsPermission" {
+  for tt in is_permission_tests {
+    e = tt[0]
+    assert os.is_permission(e) == tt[1], "os.IsPermission(#{e}) = #{os.is_permission(e)}; want #{tt[1]}"
+    assert fs.is_permission(e) == tt[1], "errors.Is(#{e}, fs.ErrPermission) = #{fs.is_permission(e)}; want #{tt[1]}"
+  }
+}
+
+test "ErrPathNUL" {
+  nul = Str.from_bytes([0])
+  r = os.create_temp("", "_Go_ErrPathNUL" + nul)
+  assert r.err?, "TempFile should have failed"
+  f = os.create_temp("", "_Go_ErrPathNUL").unwrap
+  f2 = os.open_file(f.name, os.O_RDWR, 0o600).unwrap
+  f2.close!.unwrap
+  r2 = os.open_file(f.name + nul, os.O_RDWR, 0o600)
+  assert r2.err?, "Open should have failed"
+  f.close!.unwrap
+  os.remove(f.name).unwrap
+}
+
+test "PathErrorUnwrap" {
+  pe = os.fs_error("", "", os.ERR_INVALID)
+  assert os.is_invalid(pe), "errors.Is failed, wanted success"
+}
+
+# Go's TestErrorIsMethods checks that IsPermission ignores an error's own Is
+# method: alx errors have none (IsPermission looks at the FsError only), so
+# a non-FsError is never a permission error.
+test "ErrorIsMethods" {
+  assert !os.is_permission(fs.FsError.Permission), "os.IsPermission of another package's error"
+}

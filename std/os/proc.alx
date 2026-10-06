@@ -1,0 +1,200 @@
+# Processes: Process, ProcessState, start_process / find_process, ids, exit.
+
+# How a finished process ended, and what it used (Go's ProcessState; os/exec
+# returns these too).
+pub struct ProcessState {
+  pid: Int
+  exit_code: Int # Go's ExitCode: -1 if a signal killed it
+  signal: Int    # the signal that killed it, 0 if it exited
+  user_ns: Int   # Go's UserTime: CPU time in user mode
+  sys_ns: Int    # Go's SystemTime: CPU time in the kernel
+  max_rss: Int   # peak resident set size, bytes (Go's SysUsage().Maxrss)
+  wall_ns: Int   # from spawn to exit (os/exec measures it; 0 from Process.wait)
+
+  pub def success -> Bool { exit_code == 0 }
+  # Go's Exited: ended by exiting (not a signal).
+  pub def exited -> Bool { signal == 0 }
+  pub def user_time -> Int { user_ns }
+  pub def system_time -> Int { sys_ns }
+
+  # Go's ProcessState.String: "exit status 1", "signal: killed".
+  pub def to_s -> Str {
+    return "exit status #{exit_code}" if signal == 0
+    "signal: #{signal_name(signal)}"
+  }
+}
+
+# Go's syscall.Signal.String for the common signals.
+pub def signal_name(s: Int) -> Str {
+  return "bus error" if s == c("SIGBUS")
+  return "broken pipe" if s == c("SIGPIPE")
+  return "user defined signal 1" if s == c("SIGUSR1")
+  return "user defined signal 2" if s == c("SIGUSR2")
+  return "child exited" if s == c("SIGCHLD")
+  return "stopped (signal)" if s == c("SIGSTOP")
+  return "stopped" if s == c("SIGTSTP")
+  return "continued" if s == c("SIGCONT")
+  case s {
+    1 => "hangup"
+    2 => "interrupt"
+    3 => "quit"
+    4 => "illegal instruction"
+    5 => "trace/breakpoint trap"
+    6 => "abort trap"
+    8 => "floating point exception"
+    9 => "killed"
+    11 => "segmentation fault"
+    13 => "broken pipe"
+    14 => "alarm clock"
+    15 => "terminated"
+    _ => "signal #{s}"
+  }
+}
+
+# Go's os.Interrupt and os.Kill, as signal numbers.
+pub INTERRUPT = 2
+pub KILL = 9
+
+# A process started by start_process (or found by find_process). Copies
+# share its state (D36): after one copy's wait, signals to any copy fail
+# with ErrProcessDone.
+pub struct Process {
+  pid: Int
+  st: Atomic[Int] # 0 running, 1 waited for (done), 2 released
+
+  # Sends a signal (a number: INTERRUPT, KILL, signal.sigterm.number).
+  pub def signal(sig: Int) -> ~Unit<FsError> {
+    # Go's pidReleased (-1) and pidUnset (0) sentinels.
+    fail ferr("", ERR_PROCESS_RELEASED) if pid == -1 || st.load == 2
+    fail ferr("", ERR_PROCESS_UNSET) if pid == 0
+    fail ferr("", ERR_PROCESS_DONE) if st.load == 1
+    r = c_kill(pid.to_i32, sig.to_i32)
+    if r != 0 {
+      code = C.errno
+      fail ferr("", ERR_PROCESS_DONE) if code == c("ESRCH")
+      fail ferr("", code)
+    }
+  }
+
+  # Go's Kill: SIGKILL.
+  pub def kill -> ~Unit<FsError> { self.~signal(KILL) }
+
+  # Waits for it to exit (Go's Wait). In a task this parks the task, not
+  # its worker (port-issues #154).
+  pub def wait! -> ~ProcessState<FsError> {
+    fail ferr("", c("EINVAL")) if st.load == 2
+    b = zeros(40)
+    r = alx_sys_wait(pid, b)
+    fail ferr("wait", -r) if r < 0
+    st.store(1)
+    killed = get64(b, 0) == 1
+    code = get64(b, 1)
+    ProcessState.new(pid: pid, exit_code: killed ? -1 : code, signal: killed ? code : 0, user_ns: get64(b, 2), sys_ns: get64(b, 3), max_rss: get64(b, 4), wall_ns: 0)
+  }
+
+  # Go's Release: the Process can't be used any more.
+  pub def release! -> ~Unit<FsError> {
+    st.store(2)
+  }
+}
+
+# A Process for a pid this program started some other way (os/exec).
+pub def new_process(pid: Int) -> Process {
+  Process.new(pid: pid, st: Atomic.new(0))
+}
+
+# Go's FindProcess: always succeeds on Unix; signals then tell whether the
+# process exists.
+pub def find_process(pid: Int) -> ~Process<FsError> {
+  new_process(pid)
+}
+
+# Go's ProcAttr: the working directory ("" = ours), the environment (none =
+# ours) and the child's first files (stdin, stdout, stderr: none is the
+# null device; at most three).
+pub struct ProcAttr {
+  dir: Str
+  env: [Str]?
+  files: [File?]
+}
+
+# Go's StartProcess: runs the program at `name` (a path: no $PATH search,
+# relative to attr.dir) with arguments argv (argv[0] is its name for itself).
+pub def start_process(name: Str, argv: [Str], attr: ProcAttr) -> ~Process<FsError> {
+  fail ferr("fork/exec " + name, c("E2BIG")) if attr.files.size > 3
+  prog = name
+  # execve semantics: a relative name (even without a slash) is relative to
+  # the child's directory.
+  if prog.size == 0 || prog[0] != 47 {
+    prog = attr.dir.size > 0 ? join_path(attr.dir, prog) : "./" + prog
+  }
+  av = argv.size == 0 ? [name] : argv
+  fds: [Int] = [-1, -1, -1]
+  nulls: [Int] = []
+  k = 0
+  while k < 3 {
+    fd = -1
+    if k < attr.files.size {
+      if f = attr.files[k] {
+        fd = f.fd
+      }
+    }
+    if fd < 0 {
+      fd = alx_sys_open(DEV_NULL, (k == 0 ? c("O_RDONLY") : c("O_WRONLY")).to_i32, 0).to_i
+      nulls << fd
+    }
+    fds[k] = fd
+    k += 1
+  }
+  envc = -1
+  eb: [Byte] = []
+  if e = attr.env {
+    envc = e.size
+    eb = nul_blob(e)
+  }
+  eb << 0
+  args = [prog] + av[1...av.size]
+  pid = alx_sys_spawn(nul_blob(args), args.size, eb, envc, attr.dir, fds[0], fds[1], fds[2])
+  for fd in nulls { alx_fd_close(fd) }
+  fail ferr("fork/exec " + name, -pid) if pid < 0
+  new_process(pid)
+}
+
+def nul_blob(xs: [Str]) -> [Byte] {
+  b: [Byte] = []
+  for a in xs {
+    for x in a.bytes { b << x }
+    b << 0
+  }
+  b
+}
+
+# Ends the program at once with this status (deferred calls don't run).
+pub def exit(code: Int) {
+  c_exit(code.to_i32)
+}
+
+pub def getpid -> Int { c_getpid.to_i }
+pub def getppid -> Int { c_getppid.to_i }
+pub def getuid -> Int { c_getuid.to_i }
+pub def getgid -> Int { c_getgid.to_i }
+pub def geteuid -> Int { c_geteuid.to_i }
+pub def getegid -> Int { c_getegid.to_i }
+pub def getpagesize -> Int { c_getpagesize.to_i }
+
+# Go's Getgroups: the supplementary group ids.
+pub def getgroups -> ~[Int]<FsError> {
+  n = c_getgroups(0, zeros(4)).to_i
+  fail ferr("getgroups", C.errno) if n < 0
+  b = zeros(4 * (n + 1))
+  m = c_getgroups((n + 1).to_i32, b).to_i
+  fail ferr("getgroups", C.errno) if m < 0
+  out: [Int] = []
+  i = 0
+  while i < m {
+    v = b[4 * i].to_i | (b[4 * i + 1].to_i << 8) | (b[4 * i + 2].to_i << 16) | (b[4 * i + 3].to_i << 24)
+    out << v
+    i += 1
+  }
+  out
+}

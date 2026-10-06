@@ -486,8 +486,20 @@ mod rt {
     }
     fn stat_fill(m: &std::fs::Metadata, out: *mut u8) {
         use std::os::unix::fs::MetadataExt;
-        let v: [i64; 6] = [m.mode() as i64, m.size() as i64, m.mtime() * 1_000_000_000 + m.mtime_nsec(), m.atime() * 1_000_000_000 + m.atime_nsec(), m.ino() as i64, m.nlink() as i64];
-        unsafe { std::ptr::copy_nonoverlapping(v.as_ptr() as *const u8, out, 48) };
+        let v: [i64; 11] = [
+            m.mode() as i64,
+            m.size() as i64,
+            m.mtime() * 1_000_000_000 + m.mtime_nsec(),
+            m.atime() * 1_000_000_000 + m.atime_nsec(),
+            m.ino() as i64,
+            m.nlink() as i64,
+            m.dev() as i64,
+            m.uid() as i64,
+            m.gid() as i64,
+            m.rdev() as i64,
+            m.ctime() * 1_000_000_000 + m.ctime_nsec(),
+        ];
+        unsafe { std::ptr::copy_nonoverlapping(v.as_ptr() as *const u8, out, 88) };
     }
     fn neg_errno(e: &std::io::Error) -> i64 {
         -(e.raw_os_error().unwrap_or(5) as i64)
@@ -517,6 +529,31 @@ mod rt {
     struct DirH {
         it: std::fs::ReadDir,
         cur: std::ffi::CString,
+    }
+    pub unsafe fn shim_alx_sys_dir_fdopen(fd: i64) -> i64 {
+        use std::os::fd::FromRawFd;
+        let f = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd as i32) });
+        match f.metadata() {
+            Ok(m) if !m.is_dir() => return -sysc("ENOTDIR") as i64,
+            Err(e) => return neg_errno(&e),
+            _ => {}
+        }
+        // The directory's path: F_GETPATH on macOS, /proc elsewhere.
+        let p: std::path::PathBuf = if cfg!(target_os = "macos") {
+            let mut buf = [0u8; 1024];
+            if unsafe { libc_fcntl(fd as i32, 50, buf.as_mut_ptr()) } < 0 {
+                return neg_errno(&std::io::Error::last_os_error());
+            }
+            let n = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            use std::os::unix::ffi::OsStrExt;
+            std::ffi::OsStr::from_bytes(&buf[..n]).into()
+        } else {
+            format!("/proc/self/fd/{fd}").into()
+        };
+        match std::fs::read_dir(p) {
+            Ok(it) => Box::into_raw(Box::new(DirH { it, cur: std::ffi::CString::default() })) as usize as i64,
+            Err(e) => neg_errno(&e),
+        }
     }
     pub unsafe fn shim_alx_sys_dir_open(path: *const std::ffi::c_char) -> i64 {
         match std::fs::read_dir(cpath(path)) {
@@ -733,6 +770,66 @@ mod rt {
     }
     pub unsafe fn shim_alx_fd_close(fd: i64) -> i64 {
         if unsafe { close(fd as i32) } == 0 { 0 } else { neg_errno(&std::io::Error::last_os_error()) }
+    }
+    unsafe extern "C" {
+        fn read(fd: i32, buf: *mut u8, n: usize) -> isize;
+    }
+    // Blocking reads and writes (port-issues #166): tasks are OS threads
+    // here, so blocking is fine; EAGAIN on a non-blocking fd waits.
+    pub unsafe fn shim_alx_sys_read(fd: i64, buf: *mut u8, n: i64) -> i64 {
+        loop {
+            let r = unsafe { read(fd as i32, buf, n.max(0) as usize) };
+            if r >= 0 {
+                return r as i64;
+            }
+            let e = std::io::Error::last_os_error();
+            match e.kind() {
+                std::io::ErrorKind::Interrupted => {}
+                std::io::ErrorKind::WouldBlock => {
+                    let w = unsafe { shim_alx_fd_wait(fd, 1) };
+                    if w < 0 {
+                        return w;
+                    }
+                }
+                _ => return neg_errno(&e),
+            }
+        }
+    }
+    pub unsafe fn shim_alx_sys_executable(out: *mut u8, n: i64) -> i64 {
+        use std::os::unix::ffi::OsStrExt;
+        match std::env::current_exe() {
+            Ok(p) => {
+                let b = p.as_os_str().as_bytes();
+                if b.len() as i64 >= n {
+                    return -sysc("ENAMETOOLONG") as i64;
+                }
+                unsafe {
+                    std::ptr::copy_nonoverlapping(b.as_ptr(), out, b.len());
+                    *out.add(b.len()) = 0;
+                }
+                b.len() as i64
+            }
+            Err(e) => neg_errno(&e),
+        }
+    }
+    pub unsafe fn shim_alx_sys_write(fd: i64, buf: *mut u8, n: i64) -> i64 {
+        loop {
+            let r = unsafe { write(fd as i32, buf, n.max(0) as usize) };
+            if r >= 0 {
+                return r as i64;
+            }
+            let e = std::io::Error::last_os_error();
+            match e.kind() {
+                std::io::ErrorKind::Interrupted => {}
+                std::io::ErrorKind::WouldBlock => {
+                    let w = unsafe { shim_alx_fd_wait(fd, 2) };
+                    if w < 0 {
+                        return w;
+                    }
+                }
+                _ => return neg_errno(&e),
+            }
+        }
     }
     fn net_err(e: &std::io::Error) -> i64 {
         match e.raw_os_error() {

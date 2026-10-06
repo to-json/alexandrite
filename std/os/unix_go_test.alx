@@ -1,0 +1,371 @@
+#![test(external)]
+# Go's os/os_unix_test.go, pipe_test.go, exec_unix_test.go,
+# getwd_unix_test.go and executable_test.go, translated. Untranslated tests
+# are listed in os.alx's header.
+
+import "os"
+import "io"
+import "bufio"
+import "time"
+import "testing"
+import "strings"
+
+extern def c_umask(mask: I32) -> I32 = "umask"
+
+def check_uid_gid(t: testing.T, path: Str, uid: Int, gid: Int) {
+  dir = os.lstat(path).unwrap
+  t.error("Lstat #{path}: uid #{dir.uid} want #{uid}") if dir.uid != uid
+  t.error("Lstat #{path}: gid #{dir.gid} want #{gid}") if dir.gid != gid
+}
+
+test "Chown" { |t|
+  f = new_file(t)
+  dir = f.stat.unwrap
+  gid = os.getgid
+  os.chown(f.name, -1, gid).unwrap
+  check_uid_gid(t, f.name, dir.uid, gid)
+  for g in os.getgroups.unwrap {
+    os.chown(f.name, -1, g).unwrap
+    check_uid_gid(t, f.name, dir.uid, g)
+    f.chown!(-1, gid).unwrap
+    check_uid_gid(t, f.name, dir.uid, gid)
+  }
+}
+
+test "FileChown" { |t|
+  f = new_file(t)
+  dir = f.stat.unwrap
+  gid = os.getgid
+  f.chown!(-1, gid).unwrap
+  check_uid_gid(t, f.name, dir.uid, gid)
+  for g in os.getgroups.unwrap {
+    f.chown!(-1, g).unwrap
+    check_uid_gid(t, f.name, dir.uid, g)
+    f.chown!(-1, gid).unwrap
+    check_uid_gid(t, f.name, dir.uid, gid)
+  }
+}
+
+test "Lchown" { |t|
+  f = new_file(t)
+  dir = f.stat.unwrap
+  linkname = f.name + "2"
+  os.symlink(f.name, linkname).unwrap
+  gid = os.getgid
+  os.lchown(linkname, -1, gid).unwrap
+  check_uid_gid(t, linkname, dir.uid, gid)
+  for g in os.getgroups.unwrap {
+    os.lchown(linkname, -1, g).unwrap
+    check_uid_gid(t, linkname, dir.uid, g)
+    # Check that link target's gid is unchanged.
+    check_uid_gid(t, f.name, dir.uid, dir.gid)
+    os.lchown(linkname, -1, gid).unwrap
+  }
+  os.remove(linkname).unwrap
+}
+
+test "MkdirStickyUmask" { |t|
+  dir = t.temp_dir
+  old = c_umask(0o077)
+  control = dir + "/control"
+  os.mkdir(control, 0o755).unwrap
+  cfi = os.stat(control).unwrap
+  p = dir + "/dir1"
+  r = os.mkdir(p, os.MODE_STICKY | 0o755)
+  c_umask(old)
+  r.unwrap
+  fi = os.stat(p).unwrap
+  assert_eq fi.mode, cfi.mode | os.MODE_STICKY
+}
+
+# Go's newFileTest(t, true): a blocking read on a NewFile of a raw pipe,
+# answered 100 ms later. (The non-blocking variant needs read deadlines.)
+test "NewFileBlock" {
+  r, w = os.pipe.unwrap
+  file = os.new_file(r.fd, "notapipe").unwrap
+  ww = w
+  timer = spawn {
+    time.sleep(time.millisecond * 100)
+    f = ww
+    f.write!("a".bytes.to_a).unwrap
+    0
+  }
+  b: [Byte] = [0; 1]
+  assert_eq file.read!(b).unwrap, 1
+  timer.wait.unwrap
+  file.close!.unwrap
+  w.close!.unwrap
+}
+
+test "NewFileInvalid" {
+  assert os.new_file(-1, "invalid") == none, "NewFile(-1) got a File want none"
+}
+
+test "Issue60181" { |t|
+  t.chdir(t.temp_dir)
+  want = "hello gopher"
+  a = os.create_temp(".", "a").unwrap
+  a.write_string!(want[0...5]).unwrap
+  a.close!.unwrap
+  b = os.create_temp(".", "b").unwrap
+  b.write_string!(want[5...want.size]).unwrap
+  b.close!.unwrap
+  afd = os.open_file(a.name, os.O_RDWR | os.O_APPEND, 0).unwrap
+  bfd = os.open(b.name).unwrap
+  aa = os.new_file(afd.fd, a.name).unwrap
+  bb = os.new_file(bfd.fd, b.name).unwrap
+  io.copy(aa, bb).unwrap
+  assert_eq os.read_file_string(aa.name).unwrap, want
+  aa.close!.unwrap
+  bb.close!.unwrap
+}
+
+# ---------------------------------------------------------------- pipe_test.go
+
+test "EPIPE" {
+  r, w = os.pipe.unwrap
+  r.close!.unwrap
+  for i in 0...20 {
+    e = w.write!("hi".bytes.to_a).err
+    assert e != none, "unexpected success of Write to broken pipe"
+    assert e.unwrap.failure.err == "broken pipe", "iteration #{i}: got #{e}, expected EPIPE"
+  }
+  w.close!.unwrap
+}
+
+def test_closed_pipe_race(read: Bool) {
+  limit = read ? 1 : 131073
+  r, w = os.pipe.unwrap
+  rc = r
+  wc = w
+  closer = spawn {
+    time.sleep(time.millisecond * 20)
+    if read {
+      f = rc
+      f.close!.unwrap
+    } else {
+      f = wc
+      f.close!.unwrap
+    }
+    0
+  }
+  b: [Byte] = [0; limit]
+  e = read ? r.read!(b).err : w.write!(b).err
+  closer.wait.unwrap
+  assert e != none, "I/O on closed pipe unexpectedly succeeded"
+  pe = e.unwrap
+  assert pe.path_error?, "I/O on closed pipe returned #{pe}; expected a PathError"
+  assert os.is_closed(pe), "got error #{pe} but expected ErrClosed"
+  if read {
+    w.close!.unwrap
+  } else {
+    r.close!.unwrap
+  }
+}
+
+test "ClosedPipeRaceRead" { test_closed_pipe_race(true) }
+test "ClosedPipeRaceWrite" { test_closed_pipe_race(false) }
+
+def test_close_with_blocking_read(r: os.File, w: os.File) {
+  entering = Chan[Bool].new(1)
+  rr = r
+  en = entering
+  reader = spawn {
+    b: [Byte] = [0; 1]
+    en << true
+    f = rr
+    res = f.read!(b)
+    # Go: an error, io.EOF or ErrClosed; here EOF is a 0 count.
+    ok = (res.ok? && res.unwrap == 0) || (res.err? && os.is_closed(res.err.unwrap))
+    assert ok, "got #{res.err}, expected EOF or closed"
+    0
+  }
+  entering.recv
+  time.sleep(time.millisecond * 20)
+  r.close!.unwrap
+  w.close!.unwrap
+  reader.wait.unwrap
+}
+
+test "CloseWithBlockingReadByNewFile" {
+  r, w = os.pipe.unwrap
+  test_close_with_blocking_read(os.new_file(r.fd, "reader").unwrap, os.new_file(w.fd, "writer").unwrap)
+}
+
+test "CloseWithBlockingReadByFd" {
+  r, w = os.pipe.unwrap
+  _ = r.fd
+  test_close_with_blocking_read(r, w)
+}
+
+test "PipeEOF" {
+  r, w = os.pipe.unwrap
+  park_delay = time.millisecond * 10
+  write = Chan[Int].new(1)
+  wr = write
+  wf = w
+  writer = spawn {
+    f = wf
+    loop {
+      i = wr.recv
+      break if i == none
+      time.sleep(park_delay)
+      f.write_string!("line #{i.unwrap}\n").unwrap
+    }
+    time.sleep(park_delay)
+    f.close!.unwrap
+    0
+  }
+  rbuf = bufio.new_reader(r)
+  for i in 0...3 {
+    write << i
+    b = rbuf.read_bytes!(10).unwrap.unwrap
+    assert_eq Str.from_bytes(b), "line #{i}\n"
+  }
+  write.close
+  last = rbuf.read_bytes!(10).unwrap
+  assert last == none, "ReadBytes: #{last}; want none at EOF"
+  writer.wait.unwrap
+  r.close!.unwrap
+}
+
+test "FdRace" {
+  r, w = os.pipe.unwrap
+  tasks: [Task[Int]] = []
+  for _i in 0...100 {
+    ww = w
+    tasks << spawn { ww.fd }
+  }
+  for tk in tasks { tk.wait.unwrap }
+  r.close!.unwrap
+  w.close!.unwrap
+}
+
+# Go sets a read deadline of a minute first (files have no deadlines here).
+test "FdReadRace" {
+  r, w = os.pipe.unwrap
+  count = 10
+  c = Chan[Bool].new(1)
+  rr = r
+  cc = c
+  reader = spawn {
+    buf: [Byte] = [0; count]
+    cc << true
+    f = rr
+    res = f.read!(buf)
+    assert !(res.err? && os.is_timeout(res.err.unwrap)), "read timed out"
+    0
+  }
+  c.recv
+  time.sleep(time.millisecond * 10)
+  _ = r.fd
+  zs: [Byte] = [0; count]
+  w.write!(zs).unwrap
+  reader.wait.unwrap
+  r.close!.unwrap
+  w.close!.unwrap
+}
+
+# ----------------------------------------------------------- exec_unix_test.go
+
+def sleeper -> os.Process {
+  files: [os.File?] = []
+  os.start_process("/bin/sleep", ["sleep", "1"], os.ProcAttr.new(dir: "", env: none, files: files)).unwrap
+}
+
+def true_process -> os.Process {
+  files: [os.File?] = []
+  os.start_process("/usr/bin/true", ["true"], os.ProcAttr.new(dir: "", env: none, files: files)).unwrap
+}
+
+test "ErrProcessDone" {
+  p = true_process
+  p.wait!.unwrap
+  e = p.signal(os.KILL).err
+  assert e != none && os.is_process_done(e.unwrap), "got #{e} want ErrProcessDone"
+  assert_eq e.unwrap.message, "os: process already finished"
+}
+
+test "ProcessAlreadyDone" {
+  pid = 2147483647 # math.MaxInt32
+  p = os.find_process(pid).unwrap
+  e = p.wait!.err
+  assert e != none && e.unwrap.failure.err == "no child processes", "Wait() got err #{e}, want ECHILD"
+  r = p.release!
+  assert r.ok?, "Release() got err #{r.err}, want nil"
+}
+
+test "UNIXProcessAlive" {
+  p = sleeper
+  e = p.signal(0)
+  p.kill.unwrap
+  st = p.wait!.unwrap
+  assert e.ok?, "Signal(0) on a live process got #{e.err}"
+  assert_eq st.to_s, "signal: killed"
+  assert_eq st.exit_code, -1
+}
+
+test "ProcessBadPID" {
+  p = os.find_process(-1).unwrap
+  assert p.signal(0).err?, "Signal(0) on pid -1 succeeded"
+}
+
+# --------------------------------------------------------- getwd_unix_test.go
+
+# Go's TestGetwdDeep: a working directory deeper than getcwd can tell.
+def test_getwd_deep(t: testing.T, set_pwd: Bool) {
+  temp_dir = t.temp_dir
+  sym_dir = real_path(temp_dir)
+  dir = temp_dir
+  t.chdir(dir)
+  if set_pwd {
+    t.setenv("PWD", dir)
+  } else {
+    t.setenv("PWD", "")
+  }
+  name = "a" * 200
+  loop {
+    os.mkdir(name, 0o700).unwrap
+    os.chdir(name).unwrap
+    if set_pwd {
+      dir += "/" + name
+      os.setenv("PWD", dir).unwrap
+    }
+    r = os.getwd
+    if e = r.err {
+      if os.is_permission(e) {
+        t.log("ignoring EACCES/EPERM error: #{e}")
+        break
+      }
+      t.fatal(e.message)
+    }
+    wd = r.unwrap
+    if set_pwd && wd != dir {
+
+      break if dir.size > 1000 && sym_dir != temp_dir && strings.replace(dir, temp_dir, sym_dir, 1) == wd
+      t.fatal("Getwd: got #{wd}, want same value as $PWD: #{dir}")
+    }
+    st = os.stat(wd)
+    if st.err? || wd.size > 4096 {
+      if e = st.err {
+        assert e.failure.err == "file name too long", "unexpected Stat error: #{e}"
+      }
+      break
+    }
+  }
+}
+
+test "GetwdDeep" { |t| test_getwd_deep(t, false) }
+test "GetwdDeepWithPWDSet" { |t| test_getwd_deep(t, true) }
+
+# --------------------------------------------------------- executable_test.go
+
+# Go runs the test binary again, from another directory, to check that
+# Executable names it; here the path must exist and be an executable file
+# (under `alx test` on the JIT, it is the alx compiler).
+test "Executable" {
+  ep = os.executable.unwrap
+  assert ep.start_with?("/"), "Executable() = #{ep}, want an absolute path"
+  fi = os.stat(ep).unwrap
+  assert fi.is_regular && (fi.mode & 0o111) != 0, "#{ep} is not an executable file"
+}

@@ -10,18 +10,21 @@
 //!
 //! What gets generated (`J` is the local name of the `encoding/json` import):
 //!
-//!   def json_enc(e: J.Encoder)                      writes the value to `e`
-//!   def self.json_dec(d: J.Decoder) -> ~T<J.JsonError>   reads one value
-//!   def to_json -> ~Str<J.JsonError>                compact JSON
-//!   def to_json_indent(prefix, indent) -> ~Str<..>  like Go's MarshalIndent
-//!   def self.from_json(_s: Str) -> ~T<J.JsonError>   one whole document
+//!   def json_str(e: J.Encoder) -> Str, json_enc(e)  the value's JSON
+//!   def json_merge(d: J.Decoder) -> T               (structs) decode into a copy of self
+//!   def self.json_dec(d: J.Decoder) -> T            reads a fresh value
+//!   def self.json_zero -> T, json_is_zero, json_mergeable, json_derived
+//!   def to_json / to_json_indent / self.from_json   through J.marshal / J.unmarshal_into
 //!
-//! Encodings (see `std/encoding/json/json.alx` for the full table):
-//! structs are objects; Int/sized ints/Float/Bool/Str are numbers, booleans
-//! and strings; `T?` is the value or `null`; `[T]` an array; `Map[Str, V]` an
-//! object; tuples are arrays; a payload-free enum variant is a string, a
-//! variant with fields is `{"Variant": payload}` (one unnamed field: the
-//! value itself; several: an array; named fields: an object).
+//! Go's v1 semantics (std/encoding/json/json.alx has the table): struct tags
+//! `name,omitempty,omitzero,string,embed` (embedded structs of this file are
+//! flattened with Go's dominance rules, `resolve_fields`), keys matched
+//! exactly then case-insensitively, null leaving values, map keys sorted,
+//! [Byte] as base64, and values of named types dispatched through
+//! `J.enc_val` / `J.dec_val` (Go's Marshaler and TextMarshaler first).
+//! Enums are alx's: a payload-free variant is a string, a variant with
+//! fields is `{"Variant": payload}` (one unnamed field: the value itself;
+//! several: an array; named fields: an object).
 
 use crate::ast::*;
 use crate::diag::{Diag, Span};

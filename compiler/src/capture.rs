@@ -110,17 +110,23 @@ fn scan_expr(e: &TExpr, by_task: &mut HashSet<LocalId>, multi: &mut HashSet<Loca
             by_task.extend(ls);
         }
     }
-    if let TK::M(_, _, _, Some(b)) = &e.kind {
-        for s in &b.body {
-            scan_stmt(s, by_task, multi);
+    // A block's or a Seq's statements go through scan_stmt (multiple
+    // assignment); `each_child` would visit them again, which doubles the
+    // work at every level of nesting.
+    match &e.kind {
+        TK::M(_, r, args, Some(b)) => {
+            r.iter().map(|r| &**r).chain(args).for_each(|c| scan_expr(c, by_task, multi));
+            for s in &b.body {
+                scan_stmt(s, by_task, multi);
+            }
         }
-    }
-    if let TK::Seq(ss) = &e.kind {
-        for s in ss {
-            scan_stmt(s, by_task, multi);
+        TK::Seq(ss) => {
+            for s in ss {
+                scan_stmt(s, by_task, multi);
+            }
         }
+        _ => crate::prove::each_child(e, &mut |c| scan_expr(c, by_task, multi)),
     }
-    crate::prove::each_child(e, &mut |c| scan_expr(c, by_task, multi));
 }
 
 struct Rewriter<'a> {

@@ -432,15 +432,6 @@ fn written_locals(e: &TExpr, out: &mut Vec<LocalId>) {
         }
         _ => {}
     }
-    if let TK::M(_, _, _, Some(b)) = &e.kind {
-        for s in &b.body {
-            crate::prove::stmt_exprs(s, &mut |x| written_locals(x, out));
-        }
-    }
-    if let TK::Seq(ss) = &e.kind {
-        for s in ss {
-            crate::prove::stmt_exprs(s, &mut |x| written_locals(x, out));
-        }
-    }
+    // (each_child visits blocks' and Seqs' statements too.)
     crate::prove::each_child(e, &mut |c| written_locals(c, out));
 }

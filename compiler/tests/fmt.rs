@@ -98,6 +98,21 @@ fn trailing_comments_align_in_runs() {
 }
 
 #[test]
+fn heredoc_interpolation_is_kept() {
+    let src = "x = 1\ns = <<~EOS\n    a #{x+1} \\#{x}\n      #{ [1].map { it } }\n  EOS\nputs s\n";
+    check(src, src);
+}
+
+#[test]
+fn leading_dot_chains_indent() {
+    check(
+        "ys = xs\n.map { it * 2 }\n# why\n.select { it > 2 }\nz = o\n?.to_s\n",
+        "ys = xs\n  .map { it * 2 }\n  # why\n  .select { it > 2 }\nz = o\n  ?.to_s\n",
+    );
+    check("w =\n1 + 2\nw +=\n4\n", "w =\n  1 + 2\nw +=\n  4\n");
+}
+
+#[test]
 fn trivial_files() {
     check("", "");
     check("\n\n", "");

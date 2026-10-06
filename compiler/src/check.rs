@@ -5643,9 +5643,6 @@ impl<'w, 'a> FnCx<'w, 'a> {
             if let Some(best) = cands.iter().filter(|c| c.as_str() != name && lev(c, name) <= 2).min_by_key(|c| lev(c, name)) {
                 msg.push_str(&format!("; did you mean `{best}`?"));
             }
-            if name == "fail" {
-                return Err(Diag::new(name_span, "`fail` is a statement, not a function: `fail e`, without parentheses").note("inside an expression it can only follow `||` (`v = opt || fail e`) or be a whole `case` arm (`X => fail e`) (S8)"));
-            }
             return Err(Diag::new(name_span, msg));
         };
         let d = self.w.defs[def].def.clone();
@@ -7359,6 +7356,12 @@ impl<'w, 'a> FnCx<'w, 'a> {
             msg = format!("`{name}` exists on {}, but not with these arguments or this block", rt.show());
         } else if let Some(best) = cands.iter().filter(|c| **c != name && lev(c, name) <= 2).min_by_key(|c| lev(c, name)) {
             msg.push_str(&format!("; did you mean `{best}`?"));
+        }
+        // `1.e5` is a method call (as in Ruby); `1.e-3` calls `e`.
+        let exp = name.strip_prefix(['e', 'E']).is_some_and(|d| d.bytes().all(|c| c.is_ascii_digit()));
+        if exp && matches!(rt, Ty::Int | Ty::IntK(_)) {
+            let e = if name.len() == 1 { format!("{name}-3") } else { name.to_string() };
+            msg.push_str(&format!("; for a Float, put a digit after the point: `1.0{e}`, not `1.{e}`"));
         }
         Diag::new(sp, msg)
     }

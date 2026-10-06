@@ -232,7 +232,7 @@ pub fn format(src: &str) -> Result<String, String> {
                     let l = i - 1;
                     let lead_closers = toks[f..=l].iter().take_while(|t| op(&t.tok).is_some_and(|o| matches!(o, ")" | "]" | "}"))).count();
                     let lead_cont = op(&toks[f].tok).is_some_and(|o| matches!(o, "." | "?." | "&&" | "||"));
-                    let trail_cont = op(&toks[l].tok).is_some_and(|o| matches!(o, "&&" | "||" | "+" | "-" | "*" | "/" | "=" | "." | "?." | "<<" | "==" | "!="));
+                    let trail_cont = op(&toks[l].tok).is_some_and(|o| matches!(o, "&&" | "||" | "+" | "-" | "*" | "/" | "=" | "." | "?." | "<<" | "==" | "!=") || (o.len() >= 2 && o.ends_with('=') && !matches!(o, "==" | "!=" | "<=" | ">=")));
                     let ends_open = op(&toks[l].tok).is_some_and(|o| matches!(o, "{" | "(" | "["));
                     lines.push(Line::Code(Code { text: std::mem::take(&mut text), comment: c, brackets: std::mem::take(&mut brackets), lead_closers, lead_cont, trail_cont, ends_open }));
                 }
@@ -260,7 +260,7 @@ pub fn format(src: &str) -> Result<String, String> {
             continue;
         }
         let tok_text = &src[lo..hi];
-        if let Tok::Str(_) = t.tok {
+        if let Tok::Str(_) | Tok::Interp(_) = t.tok {
             if let Some(id) = tok_text.strip_prefix("<<~") {
                 pending.push(id.to_string());
             }
@@ -322,6 +322,17 @@ fn layout(lines: Vec<Line>) -> String {
         }
         n
     };
+    // Comment lines whose next code line continues the expression (`.map`):
+    // they take that line's indent.
+    let mut before_cont = vec![false; lines.len()];
+    let mut next = false;
+    for (k, l) in lines.iter().enumerate().rev() {
+        match l {
+            Line::Code(c) => next = c.lead_cont,
+            Line::Comment(_) => before_cont[k] = next,
+            _ => next = false,
+        }
+    }
     for (id, l) in lines.into_iter().enumerate() {
         match l {
             Line::Blank => {
@@ -337,7 +348,7 @@ fn layout(lines: Vec<Line>) -> String {
                 cont = false;
             }
             Line::Comment(c) => {
-                out_lines.push(format!("{}{}", "  ".repeat(level(&stack)), c));
+                out_lines.push(format!("{}{}", "  ".repeat(level(&stack) + usize::from(cont || before_cont[id])), c));
                 last_blank = false;
                 last_open = false;
             }

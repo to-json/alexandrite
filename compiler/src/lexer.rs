@@ -78,6 +78,10 @@ pub enum Kw {
     In,
     Case,
     Defer,
+    /// `fail e`: return an error (a jump, so a hard keyword like `return`)
+    Fail,
+    /// `spawn { ... }` / `spawn f(x)`: start a task
+    Spawn,
     /// `none`: the absent value of a `T?`
     None,
 }
@@ -124,6 +128,7 @@ pub fn lex_at(file: u32, src: &str, base: u32) -> Result<Vec<Token>, Diag> {
             space = false;
             // Heredoc bodies follow the line that introduced them.
             for (idx, term, squiggly) in std::mem::take(&mut pending) {
+                let body_lo = i;
                 let mut lines = Vec::new();
                 loop {
                     if i >= b.len() {
@@ -131,19 +136,21 @@ pub fn lex_at(file: u32, src: &str, base: u32) -> Result<Vec<Token>, Diag> {
                     }
                     let end = src[i..].find('\n').map_or(b.len(), |k| i + k);
                     let line = &src[i..end];
-                    i = (end + 1).min(b.len());
                     if line.trim() == term {
                         break;
                     }
-                    lines.push(line.to_string());
+                    i = (end + 1).min(b.len());
+                    lines.push(line);
                 }
+                // The body is [body_lo, i); the terminator line follows.
+                let body_hi = i;
+                i = src[i..].find('\n').map_or(b.len(), |k| i + k + 1);
                 let indent = if squiggly {
                     lines.iter().filter(|l| !l.trim().is_empty()).map(|l| l.len() - l.trim_start().len()).min().unwrap_or(0)
                 } else {
                     0
                 };
-                let body: String = lines.iter().map(|l| format!("{}\n", l.get(indent..).unwrap_or(""))).collect();
-                out[idx].tok = Tok::Str(body);
+                out[idx].tok = heredoc_body(src, body_lo, body_hi, indent, base).map_err(|k| Diag::new(sp(k, k + 2), "unterminated `#{` in heredoc"))?;
             }
             continue;
         }
@@ -154,7 +161,10 @@ pub fn lex_at(file: u32, src: &str, base: u32) -> Result<Vec<Token>, Diag> {
                 let end = src[i..].find(']').map(|k| i + k).ok_or_else(|| Diag::new(sp(i, i + 3), "unterminated `#![`"))?;
                 let inner = &src[i + 3..end];
                 let (name, arg) = match inner.find('(') {
-                    Some(p) => (inner[..p].trim().to_string(), inner[p + 1..].trim_end_matches(')').trim().to_string()),
+                    Some(p) => {
+                        let a = inner[p + 1..].trim_end();
+                        (inner[..p].trim().to_string(), a.strip_suffix(')').unwrap_or(a).trim().to_string())
+                    }
                     None => (inner.trim().to_string(), String::new()),
                 };
                 out.push(Token { tok: Tok::Directive(name, arg), span: sp(i, end + 1), space_before: space });
@@ -320,6 +330,8 @@ pub fn lex_at(file: u32, src: &str, base: u32) -> Result<Vec<Token>, Diag> {
                 "in" => Tok::Kw(Kw::In),
                 "case" => Tok::Kw(Kw::Case),
                 "defer" => Tok::Kw(Kw::Defer),
+                "fail" => Tok::Kw(Kw::Fail),
+                "spawn" => Tok::Kw(Kw::Spawn),
                 "none" => Tok::Kw(Kw::None),
                 w if w.as_bytes()[0].is_ascii_uppercase() => Tok::Const(w.to_string()),
                 w => Tok::Ident(w.to_string()),
@@ -385,31 +397,11 @@ pub fn lex_at(file: u32, src: &str, base: u32) -> Result<Vec<Token>, Diag> {
                     continue;
                 }
                 if q == b'"' && b[i] == b'#' && b.get(i + 1) == Some(&b'{') {
-                    // `#{ expr }`: find the matching brace (strings inside count).
+                    // `#{ expr }`: find the matching brace (strings and comments inside count).
                     let open = i + 2;
-                    let mut j = open;
-                    let mut depth = 1;
-                    let mut in_str: Option<u8> = None;
-                    while j < b.len() && b[j] != b'\n' {
-                        match (in_str, b[j]) {
-                            (Some(qq), x) if x == qq => in_str = None,
-                            (Some(_), b'\\') => j += 1,
-                            (Some(_), _) => {}
-                            (None, b'"' | b'\'') => in_str = Some(b[j]),
-                            (None, b'{') => depth += 1,
-                            (None, b'}') => {
-                                depth -= 1;
-                                if depth == 0 {
-                                    break;
-                                }
-                            }
-                            _ => {}
-                        }
-                        j += 1;
-                    }
-                    if j >= b.len() || b[j] != b'}' {
+                    let Some(j) = interp_end(b, open) else {
                         return Err(Diag::new(sp(i, i + 2), "unterminated `#{` in string"));
-                    }
+                    };
                     if !s.is_empty() {
                         pieces.push(IPiece::Lit(std::mem::take(&mut s)));
                     }
@@ -499,17 +491,79 @@ pub fn lex_at(file: u32, src: &str, base: u32) -> Result<Vec<Token>, Diag> {
     Ok(out)
 }
 
-/// The end of a `#{...}` whose body starts at `open`: the index of its `}`.
+/// A heredoc's body, `src[lo..hi]` (whole lines), with `indent` bytes of
+/// leading blanks taken off each line. The text is raw except that `#{...}`
+/// interpolates, as in a double-quoted string, and `\#` is a literal `#`
+/// (so `\#{` stays literal). Err: the index of an unterminated `#{`.
+fn heredoc_body(src: &str, lo: usize, hi: usize, indent: usize, base: u32) -> Result<Tok, usize> {
+    let b = src.as_bytes();
+    let (mut s, mut pieces) = (String::new(), Vec::new());
+    let (mut k, mut line_start) = (lo, true);
+    while k < hi {
+        if line_start {
+            let mut n = 0;
+            while n < indent && k < hi && matches!(b[k], b' ' | b'\t' | b'\r') {
+                k += 1;
+                n += 1;
+            }
+            line_start = false;
+            continue;
+        }
+        match b[k] {
+            b'\n' => {
+                s.push('\n');
+                k += 1;
+                line_start = true;
+            }
+            b'\\' if b.get(k + 1) == Some(&b'#') => {
+                s.push('#');
+                k += 2;
+            }
+            b'#' if b.get(k + 1) == Some(&b'{') => {
+                let end = interp_end(b, k + 2).filter(|e| *e < hi).ok_or(k)?;
+                if !s.is_empty() {
+                    pieces.push(IPiece::Lit(std::mem::take(&mut s)));
+                }
+                pieces.push(IPiece::Code(src[k + 2..end].to_string(), base + (k + 2) as u32));
+                k = end + 1;
+            }
+            _ => {
+                let ch = src[k..].chars().next().unwrap();
+                s.push(ch);
+                k += ch.len_utf8();
+            }
+        }
+    }
+    if pieces.is_empty() {
+        return Ok(Tok::Str(s));
+    }
+    if !s.is_empty() {
+        pieces.push(IPiece::Lit(s));
+    }
+    Ok(Tok::Interp(pieces))
+}
+
+/// The end of a `#{...}` whose code starts at `open`: the index of its `}`.
+/// The one scanner for string, heredoc and command-literal interpolation: it
+/// skips nested strings and command literals (with their own `#{}`) and `#`
+/// comments, so a `}` in either doesn't close the code. The code may span
+/// lines (a comment ends at its line).
 fn interp_end(b: &[u8], open: usize) -> Option<usize> {
-    let (mut j, mut depth, mut in_str) = (open, 1, None::<u8>);
-    while j < b.len() && b[j] != b'\n' {
-        match (in_str, b[j]) {
-            (Some(qq), x) if x == qq => in_str = None,
-            (Some(_), b'\\') => j += 1,
-            (Some(_), _) => {}
-            (None, b'"' | b'\'') => in_str = Some(b[j]),
-            (None, b'{') => depth += 1,
-            (None, b'}') => {
+    let (mut j, mut depth) = (open, 1usize);
+    while j < b.len() {
+        match b[j] {
+            b'"' | b'\'' | b'`' => {
+                j = quoted_end(b, j, false)?;
+                continue;
+            }
+            b'#' => {
+                while j < b.len() && b[j] != b'\n' {
+                    j += 1;
+                }
+                continue;
+            }
+            b'{' => depth += 1,
+            b'}' => {
                 depth -= 1;
                 if depth == 0 {
                     return Some(j);
@@ -518,6 +572,26 @@ fn interp_end(b: &[u8], open: usize) -> Option<usize> {
             _ => {}
         }
         j += 1;
+    }
+    None
+}
+
+/// The index after the quoted text whose opening quote is at `start`:
+/// `"..."` (escapes, `#{}`), `'...'` (raw) or a command literal (`\` escapes,
+/// `#{}`, and '...' / "..." inside it). A string ends with its line, except
+/// inside a command literal (`in_cmd`), which may span lines.
+fn quoted_end(b: &[u8], start: usize, in_cmd: bool) -> Option<usize> {
+    let q = b[start];
+    let mut j = start + 1;
+    while j < b.len() {
+        match b[j] {
+            c if c == q => return Some(j + 1),
+            b'\n' if !in_cmd && q != b'`' => return None,
+            b'\\' if q != b'\'' => j += 2,
+            b'#' if q != b'\'' && b.get(j + 1) == Some(&b'{') => j = interp_end(b, j + 2)? + 1,
+            b'\'' | b'"' if q == b'`' => j = quoted_end(b, j, true)?,
+            _ => j += 1,
+        }
     }
     None
 }
@@ -569,8 +643,7 @@ fn lex_cmd(file: u32, src: &str, base: u32, start: usize) -> Result<(Tok, usize)
             i += t.len();
             continue;
         }
-        if let Some(&(text, kind, word_start)) = OPS.iter().find(|(t, _, ws)| rest.starts_with(t) && (!ws || !in_word)) {
-            let _ = word_start;
+        if let Some(&(text, kind, _)) = OPS.iter().find(|(t, _, ws)| rest.starts_with(t) && (!ws || !in_word)) {
             flush(&mut parts, &mut pieces, &mut lit, &mut in_word, sp(word_lo, i));
             parts.push(CmdPart::Op(kind, sp(i, i + text.len())));
             i += text.len();

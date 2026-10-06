@@ -1,0 +1,235 @@
+# Go's net_test.go, translated. TestAcceptIgnoreAbortedConnRequest is left
+# out: it injects accept errors through Go's socktest hooks, which alx's
+# runtime doesn't have.
+
+import "os"
+import "time"
+
+def stream_networks -> [Str] { ["tcp", "unix", "unixpacket"] }
+
+test "CloseRead" {
+  for network in stream_networks {
+    next unless testable_network?(network)
+    ln = new_local_listener(network)
+    c = dial(ln.network, ln.addr).unwrap
+    t = spawn { ln.~accept }
+    sc = t.wait.unwrap
+    r = c.close_read!
+    if e = r.err {
+      if p = parse_close_error(e, true) {
+        assert false, p
+      }
+      assert false, e.message
+    }
+    b: [Byte] = [0]
+    rr = c.read!(b)
+    # Go: (0, error) after CloseRead; a shut read side reads end of stream
+    # (0) on the BSDs and Linux, which alx reports as 0 without an error.
+    assert rr.err? || rr.unwrap == 0, "#{network}: read after close_read"
+    c.close!
+    sc.close!
+    ln.close!
+  }
+}
+
+test "CloseWrite" {
+  for network in stream_networks {
+    next unless testable_network?(network)
+    ln = new_local_listener(network)
+    srv = spawn {
+      c = ln.~accept
+      b: [Byte] = [0]
+      n = c.~read!(b)
+      fail "got (#{n}); want (0, EOF)" if n != 0
+      c.~close_write!
+      w = c.write!(b)
+      fail "got #{w.unwrap}; want error" if w.ok?
+      c.~close!
+      ""
+    }
+    c = dial(ln.network, ln.addr).unwrap
+    r = c.close_write!
+    if e = r.err {
+      if p = parse_close_error(e, true) {
+        assert false, p
+      }
+      assert false, e.message
+    }
+    b: [Byte] = [0]
+    assert_eq c.read!(b).unwrap, 0
+    assert c.write!(b).err?, "#{network}: write after close_write should fail"
+    assert_eq srv.wait.unwrap, ""
+    c.close!
+    ln.close!
+  }
+}
+
+test "ConnClose" {
+  for network in stream_networks {
+    next unless testable_network?(network)
+    ln = new_local_listener(network)
+    c = dial(ln.network, ln.addr).unwrap
+    r = c.close!
+    if e = r.err {
+      if p = parse_close_error(e, false) {
+        assert false, p
+      }
+      assert false, e.message
+    }
+    b: [Byte] = [0]
+    assert c.read!(b).err?, "#{network}: read after close should fail"
+    ln.close!
+  }
+}
+
+test "ListenerClose" {
+  for network in stream_networks {
+    next unless testable_network?(network)
+    ln = new_local_listener(network)
+    r = ln.close!
+    if e = r.err {
+      if p = parse_close_error(e, false) {
+        assert false, p
+      }
+      assert false, e.message
+    }
+    assert ln.accept.err?, "#{network}: accept should fail"
+  }
+}
+
+test "PacketConnClose" {
+  for network in ["udp", "unixgram"] {
+    next unless testable_network?(network)
+    c = new_local_packet_listener(network)
+    r = c.close!
+    if e = r.err {
+      if p = parse_close_error(e, false) {
+        assert false, p
+      }
+      assert false, e.message
+    }
+    b: [Byte] = [0]
+    assert c.read_from!(b).err?, "#{network}: read_from after close should fail"
+  }
+}
+
+test "ZeroByteRead" {
+  for network in stream_networks {
+    next unless testable_network?(network)
+    ln = new_local_listener(network)
+    t = spawn { ln.~accept }
+    c = dial(network, ln.addr).unwrap
+    sc = t.wait.unwrap
+    empty: [Byte] = []
+    assert_eq c.read!(empty).unwrap, 0
+    assert_eq sc.read!(empty).unwrap, 0
+    c.close!
+    sc.close!
+    ln.close!
+  }
+}
+
+# Go's withTCPConnPair, as a pair of connected TCP connections: the
+# accepted one and the dialed one (the tests run their peers on them).
+def tcp_conn_pair -> (Conn, Conn) {
+  ln = new_local_listener("tcp")
+  t = spawn { ln.~accept }
+  c2 = dial("tcp", ln.addr).unwrap
+  c1 = t.wait.unwrap
+  ln.close!
+  (c1, c2)
+}
+
+test "ReadTimeoutUnblocksRead" {
+  c1, cs = tcp_conn_pair
+  errc = Chan[Str].new(1)
+  spawn {
+    time.sleep(time.millisecond * 100)
+    cs.set_read_deadline(time.unix(123, 0))
+  }
+  reader = spawn {
+    buf: [Byte] = [0]
+    r = cs.read!(buf)
+    errc << (r.err? ? "" : "Read = #{r.unwrap}, nil; want 0, non-nil")
+  }
+  m = "timeout waiting for Read to finish"
+  select {
+    when v = errc.recv => m = v || ""
+    when t = time.after(time.second * 5).recv => nil
+  }
+  assert_eq m, ""
+  reader.wait
+  c1.close!
+  cs.close!
+}
+
+test "CloseUnblocksRead" {
+  ss, cs = tcp_conn_pair
+  spawn {
+    time.sleep(time.millisecond * 20)
+    cs.close!
+  }
+  buf: [Byte] = [0]
+  r = ss.read!(buf)
+  assert r.ok?, "Read = error; want 0, EOF"
+  assert_eq r.unwrap, 0
+  ss.close!
+}
+
+test "CloseUnblocksReadUDP" {
+  pc = listen_packet("udp", "127.0.0.1:0").unwrap
+  spawn {
+    time.sleep(time.millisecond * 250)
+    pc.close!
+  }
+  empty: [Byte] = []
+  r = pc.conn.read_from_udp_addr_port!(empty)
+  if r.ok? {
+    n, _ = r.unwrap
+    assert n == 0, "unexpected Read success from read_from_udp_addr_port: #{n} bytes"
+  }
+}
+
+test "NotTemporaryRead" {
+  ln = new_local_listener("tcp")
+  dialed = Chan[Bool].new
+  server_done = spawn {
+    r = ln.accept
+    if r.ok? {
+      dialed.recv
+      cs = r.unwrap
+      cs.set_linger(0)
+      cs.close!
+    }
+  }
+  ss = dial("tcp", ln.addr).unwrap
+  dialed.close
+  buf: [Byte] = [0]
+  r = ss.read!(buf)
+  assert r.err?, "Read succeeded unexpectedly (or returned EOF after an abrupt close)"
+  if e = r.err {
+    assert !is_temporary(e), "Read error is unexpectedly temporary: #{e.message}"
+  }
+  ss.close!
+  ln.close!
+  server_done.wait
+}
+
+# Go's TestErrors: every error type has Timeout and Temporary (the NetErr
+# interface), ErrClosed among them.
+test "Errors" {
+  errs: [NetErr] = [
+    NetError.Other(NetFailure.new(op: "x")),
+    parse_error("t", "x"),
+    addr_error("e", "a"),
+    UnknownNetworkError.Network(""),
+    InvalidAddrError.Msg(""),
+    NetError.Timeout(NetFailure.new),
+    DNSConfigError.Bad(""),
+    dns_error("", "", "", "")
+  ]
+  assert_eq errs.size, 8
+  closed: NetErr = err_closed
+  assert !closed.timeout?
+  assert is_closed(err_closed)
+}

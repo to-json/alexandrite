@@ -1,0 +1,146 @@
+# Connections from open files (Go's file.go, file_posix.go, file_unix.go).
+
+import "os"
+import "time"
+
+# Go's fileAddr: the address of a file in errors, network "file+net".
+pub struct FileAddr {
+  name: Str
+
+  pub def network -> Str { "file+net" }
+  pub def to_s -> Str { name }
+}
+
+# Go's newFileFD: a socket from a duplicate of f's descriptor.
+def new_file_fd(f: os.File) -> ~NetFD {
+  s = alx_net_dup(f.fd, 1)
+  fail syscall_error("dup", -s) if s < 0
+  sotype = alx_net_getsockopt(s, "SO_TYPE")
+  if sotype < 0 {
+    alx_fd_close(s)
+    fail syscall_error("getsockopt", -sotype)
+  }
+  lsa = sa_none
+  r = alx_net_sockname(s, lsa, 0)
+  if r < 0 {
+    alx_fd_close(s)
+    fail syscall_error("getsockname", -r)
+  }
+  rsa = sa_none
+  alx_net_sockname(s, rsa, 1)
+  family = sa_family(lsa)
+  if family == 0 {
+    alx_fd_close(s)
+    fail syscall_error("", c("EPROTONOSUPPORT"))
+  }
+  st = 0
+  if sotype == c("SOCK_STREAM") {
+    st = SOCK_STREAM
+  } elsif sotype == c("SOCK_DGRAM") {
+    st = SOCK_DGRAM
+  } elsif sotype == c("SOCK_RAW") {
+    st = SOCK_RAW
+  } else {
+    st = SOCK_SEQPACKET
+  }
+  net = ""
+  if family == 1 {
+    net = sotype_to_net(st)
+  } elsif st == SOCK_STREAM {
+    net = "tcp"
+  } elsif st == SOCK_DGRAM {
+    net = "udp"
+  } else {
+    net = "ip"
+  }
+  new_fd(s, family, st, net, sockaddr_to_addr(net, lsa), sockaddr_to_addr(net, rsa), sa_family(rsa) != 0)
+}
+
+def file_error(f: os.File, e: Error) -> NetError { wrap_any("file", "file+net", "", f.name, e) }
+
+# Go's FileConn: a connection on a duplicate of f's socket (closing it
+# doesn't close f, and the other way round).
+pub def file_conn(f: os.File) -> ~Conn {
+  r = new_file_fd(f)
+  if e = r.err {
+    fail file_error(f, e)
+  }
+  fd = r.unwrap
+  return new_tcp_conn(fd, time_ns(DEFAULT_KEEP_ALIVE_IDLE_NS), KeepAliveConfig.new) if net_kind(fd.net) == 0
+  new_conn(fd)
+}
+
+# Go's FileListener.
+pub def file_listener(f: os.File) -> ~Listener {
+  r = new_file_fd(f)
+  if e = r.err {
+    fail file_error(f, e)
+  }
+  fd = r.unwrap
+  k = net_kind(fd.net)
+  if k != 0 && k != 3 {
+    alx_fd_close(fd.fd)
+    fail file_error(f, syscall_error("", c("EINVAL")))
+  }
+  l = new_listener(fd, fd.la, ListenConfig.new)
+  l.set_unlink_on_close(false)
+  l
+}
+
+# Go's FilePacketConn.
+pub def file_packet_conn(f: os.File) -> ~PacketConn {
+  r = new_file_fd(f)
+  if e = r.err {
+    fail file_error(f, e)
+  }
+  fd = r.unwrap
+  if net_kind(fd.net) == 0 {
+    alx_fd_close(fd.fd)
+    fail file_error(f, syscall_error("", c("EINVAL")))
+  }
+  PacketConn.new(conn: new_conn(fd))
+}
+
+def time_ns(ns: Int) -> time.Duration { time.Duration.new(ns) }
+
+extern def alx_net_unix_rights(fds: [Byte], n: Int, out: [Byte], room: Int) -> Int
+extern def alx_net_parse_rights(oob: [Byte], n: Int, fds: [Byte], room: Int) -> Int
+extern def alx_net_socketpair(sotype: Int, fds: [Byte]) -> Int
+
+# The SCM_RIGHTS control message that passes descriptors fds over a Unix
+# socket (write_msg_unix!). Go's syscall.UnixRights.
+pub def unix_rights(fds: [Int]) -> [Byte] {
+  raw: [Byte] = [0; 8 * fds.size + 8]
+  for i in 0...fds.size {
+    put_le64(raw, 8 * i, fds[i])
+  }
+  out: [Byte] = [0; 64 + 4 * fds.size]
+  n = alx_net_unix_rights(raw, fds.size, out, out.size)
+  return [] if n < 0
+  out[0...n]
+}
+
+# The descriptors in the SCM_RIGHTS messages of control data (from
+# read_msg_unix!). Go's syscall.ParseSocketControlMessage and
+# ParseUnixRights together.
+pub def parse_unix_rights(oob: [Byte]) -> ~[Int] {
+  room = oob.size / 4 + 1
+  raw: [Byte] = [0; 8 * room]
+  n = alx_net_parse_rights(oob, oob.size, raw, room)
+  fail syscall_error("parse", -n) if n < 0
+  out: [Int] = []
+  for i in 0...n {
+    out << le64(raw, 8 * i)
+  }
+  out
+}
+
+# A connected pair of Unix sockets of a type ("unix", "unixgram",
+# "unixpacket") as files (Go's syscall.Socketpair, for FileConn).
+pub def socketpair_files(network: Str) -> ~(os.File, os.File) {
+  st = network == "unix" ? SOCK_STREAM : (network == "unixgram" ? SOCK_DGRAM : SOCK_SEQPACKET)
+  raw: [Byte] = [0; 16]
+  r = alx_net_socketpair(st, raw)
+  fail syscall_error("socketpair", -r) if r < 0
+  (os.new_file(le64(raw, 0), "socketpair-0").unwrap, os.new_file(le64(raw, 8), "socketpair-1").unwrap)
+}

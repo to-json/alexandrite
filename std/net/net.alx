@@ -1,587 +1,866 @@
-# Package net: Go's net for TCP, over the runtime's event loop (L3).
+# Package net: Go's net — TCP, UDP, IP and Unix sockets, name resolution,
+# IP and MAC addresses, interfaces.
 #
-# Conventions:
-#  - Blocking-looking calls park the TASK, not the worker thread: `accept!`,
-#    `Conn.read!`, `Conn.write!` and `dial` wait for the socket through the
-#    runtime's poller (kqueue / epoll) while other tasks run. Ten thousand
-#    idle connections cost ten thousand parked tasks, not threads. Outside a
-#    task (main) the same calls block in poll(2).
-#  - Failures are `NetError` values (`~T` results) with Go-like messages:
-#    `dial tcp 127.0.0.1:1: connect: connection refused`. Match with `case`:
-#        case e { ConnRefused => ...; Timeout => ...; Closed => ...; _ => ... }
-#  - End of stream is not an error: `Conn.read!` returns 0 (GO-VS-RUBY F3).
-#  - `Conn` and `Listener` hold their descriptor in an Atomic, so copies are
-#    the same connection and tasks may share one (one accepts or reads
-#    while another closes, as in Go). `close!` on any copy closes them all;
-#    a task parked on the descriptor is woken and fails with `Closed`.
-#  - `Conn` is an io.Reader, io.Writer and io.Closer. `write!` writes all of
-#    its argument, retrying on partial writes.
-#  - Addresses are "host:port" strings; ":0" lets the system pick a port
-#    (`listener.addr` tells which). "" or "0.0.0.0" means any IPv4 address,
-#    "::" any IPv6 (dual-stack).
-#  - Networks: "tcp", "tcp4", "tcp6" (all the same here: the runtime prefers
-#    IPv4 when a name has several addresses and doesn't fall back to the next
-#    one); "udp" (udp4, udp6): `dial` (a connected socket, a Conn whose
-#    write! sends one datagram and read! receives one) and `listen_packet`;
-#    "unix" (stream; the address is a path): `dial` and `listen` (closing the
-#    listener removes its socket file, as Go's); "unixgram": `dial` and
-#    `listen_packet`. A PacketConn has read_from! (no write_to yet). No
-#    read/write deadlines yet.
-#  - `lookup_host` and the name resolution inside `dial` / `listen` (a name
-#    that isn't an IP address) call getaddrinfo, which BLOCKS the worker
-#    thread; numeric addresses don't wait.
-#  - SIGPIPE is ignored once the first socket is made, so a write to a closed
-#    peer fails with EPIPE instead of killing the process.
+#   ln = net.listen("tcp", "127.0.0.1:0").unwrap
+#   spawn {
+#     c = ln.accept.unwrap               # Go: ln.Accept()
+#     c.write!("hi".bytes.to_a).unwrap
+#     c.close!
+#   }
+#   c = net.dial("tcp", ln.addr).unwrap  # Go: net.Dial("tcp", addr)
+#   n = c.read!(buf).unwrap              # 0: end of stream (Go: io.EOF)
+#
+# Sockets are non-blocking and wait in the runtime's poller: a task that
+# waits parks, its worker runs others (Go's netpoller).
+#
+# Go's API in alx:
+#
+#   Conn (interface), TCPConn, UDPConn,  Conn: one concrete struct for every
+#     UnixConn, IPConn                   socket kind and net.Pipe's ends
+#                                        (network says which). Methods of
+#                                        all four: read!, write!, close!,
+#                                        close_read!, close_write!,
+#                                        set_(read_|write_)deadline,
+#                                        set_read_buffer, set_write_buffer,
+#                                        set_no_delay, set_linger,
+#                                        set_keep_alive(_period|_config),
+#                                        multipath_tcp, read_from!,
+#                                        read_from_udp(_addr_port)!,
+#                                        read_from_unix!, read_from_ip!,
+#                                        write_to!, write_to_udp(_addr_port)!,
+#                                        write_to_unix!, write_to_ip!,
+#                                        read_msg(_udp|_udp_addr_port|_unix|
+#                                        _ip)!, write_msg_*!, file,
+#                                        syscall_conn
+#   Conn.LocalAddr / RemoteAddr          local_addr / remote_addr: the text
+#                                        (Str; "" for none), and
+#                                        local_net_addr / remote_net_addr:
+#                                        the Addr? (TCPAddr, UDPAddr, ...)
+#   Listener, TCPListener, UnixListener  Listener: accept, accept_tcp,
+#                                        accept_unix, close!, net_addr
+#                                        (Go's Addr; `addr` is the text),
+#                                        port, set_deadline,
+#                                        set_unlink_on_close, file,
+#                                        syscall_conn
+#   PacketConn                           PacketConn (wraps a Conn: conn)
+#   Dial, DialTimeout, Listen,           dial, dial_timeout, listen,
+#     ListenPacket                         listen_packet
+#   DialTCP / DialUDP / DialIP /         dial_tcp / dial_udp / dial_ip /
+#     DialUnix, ListenTCP / ListenUDP /    dial_unix, listen_tcp / ...
+#     ListenIP / ListenUnix /              (addresses as optionals: none for
+#     ListenUnixgram,                      Go's nil)
+#     ListenMulticastUDP
+#   Dialer, ListenConfig                 structs with Go's fields (control
+#                                        hooks are closures taking a RawConn)
+#   Resolver, DefaultResolver            Resolver; DEFAULT_RESOLVER (an
+#                                        Atomic, R11)
+#   LookupHost/IP/IPAddr/NetIP/Port/     lookup_host, lookup_ip, ... and the
+#     CNAME/Addr/SRV/MX/NS/TXT             Resolver methods taking a context
+#   ResolveTCPAddr / UDP / IP / Unix     resolve_tcp_addr, ...
+#   IP, IPMask, IPNet, HardwareAddr      structs over [Byte] (b); IP.nil?
+#                                        for Go's nil IP; to4 / to16 / mask
+#                                        / default_mask / cidr_mask return
+#                                        optionals
+#   ParseIP, ParseCIDR, ParseMAC,        parse_ip (IP?), parse_cidr,
+#     IPv4, IPv4Mask, CIDRMask             parse_mac, ipv4, ipv4_mask,
+#                                          cidr_mask
+#   IPv4bcast, IPv6loopback, ...         ipv4_bcast, ipv6_loopback, ... (defs:
+#                                        a struct can't be a constant)
+#   SplitHostPort, JoinHostPort          split_host_port, join_host_port
+#   Interfaces, InterfaceAddrs,          interfaces, interface_addrs,
+#     InterfaceByIndex/Name                interface_by_index / _by_name
+#   Pipe                                 pipe -> (Conn, Conn)
+#   FileConn, FileListener,              file_conn, file_listener,
+#     FilePacketConn                       file_packet_conn
+#   Buffers                              Buffers (buffers(v)); write_to!
+#                                        gathers the buffers into writes
+#   OpError                              NetError (variants ConnRefused,
+#                                        AddrInUse, Timeout, Closed, BadAddr,
+#                                        Lookup, Other; failure has Go's
+#                                        fields)
+#   AddrError, ParseError, DNSError,     AddrError, ParseError, DNSError,
+#     UnknownNetworkError,                 UnknownNetworkError,
+#     InvalidAddrError, DNSConfigError     InvalidAddrError, DNSConfigError
+#   Error (interface)                    NetErr (timeout?, temporary?);
+#                                        is_timeout, is_temporary,
+#                                        is_closed, is_conn_refused
+#   ErrClosed, ErrWriteToConnected       err_closed (is_closed tells it),
+#                                        WriteToConnectedError
+#   KeepAliveConfig, Flags, FlagUp, ...  KeepAliveConfig, Flags, FLAG_UP, ...
+#   syscall.RawConn                      RawConn (control / read / write)
+#   syscall.UnixRights /                 unix_rights, parse_unix_rights,
+#     ParseUnixRights, Socketpair          socketpair_files
+#
+# Name resolution follows Go's Unix rules: the hosts file, resolv.conf and
+# nsswitch.conf decide between the package's own DNS client (Go's "go"
+# resolver: UDP with TCP fallback, the search list, ndots, rotate,
+# attempts, timeouts, EDNS0, trust-ad, single-request, use-vc, the RFC 6724
+# sort; golang.org/x/net/dns/dnsmessage encodes the messages) and the
+# system's getaddrinfo / getnameinfo (Go's "cgo" resolver). As Go, darwin
+# prefers the system resolver; Resolver.prefer_go forces the DNS client,
+# and ALX_NETDNS=go / cgo is Go's GODEBUG=netdns=go / cgo.
+#
+# Differences from Go:
+#
+# - Conn, Listener and PacketConn are concrete types, not interfaces: a
+#   program can't supply its own net.Conn (Resolver.dial returns a Conn,
+#   e.g. one end of net.pipe). Type assertions to *TCPConn etc. become
+#   network checks; TCPConn's io.ReaderFrom / WriterTo (sendfile, splice)
+#   aren't there: io.copy reads and writes.
+# - Conn.local_addr / remote_addr are the address text (callers mostly
+#   print or compare them); the Addr values are local_net_addr /
+#   remote_net_addr.
+# - A read that reaches the end of a stream returns 0, not io.EOF (GO-VS-
+#   RUBY F3).
+# - Tasks aren't preempted: a write that succeeds yields to the other
+#   tasks of its worker (so a writer that never blocks can't starve them).
+# - Buffers.write_to! gathers small buffers into one write (64 KiB at a
+#   time) instead of calling writev.
+# - Resolver.lookup_srv / lookup_mx / lookup_ns / lookup_addr fail when the
+#   answer holds invalid names; Go returns the valid records along with the
+#   error (alx's ~T carries one or the other).
+# - The DNS client queries A and AAAA one after the other (Go sends them
+#   together unless single-request), and lookups don't share calls (Go's
+#   singleflight group).
+# - DNSError's UnwrapErr is ctx_err (CTX_CANCELED / CTX_DEADLINE): unwrap
+#   gives context.ContextError, so errors.is? works as Go's errors.Is;
+#   a timeout without an errno counts as the context deadline (alx's
+#   errTimeout and a socket deadline's error are the same NetError).
+# - Multipath TCP: Dialer / ListenConfig keep the choice
+#   (set_multipath_tcp!), but sockets are plain TCP (Go's behaviour where
+#   the system has no MPTCP).
+# - No GODEBUG: netdns is ALX_NETDNS, netedns0 is NETEDNS0 (an Atomic).
+# - Windows, Plan 9, wasip1, JS: not supported.
+#
+# Test hooks (package-private, Go's testHook* variables): TEST_HOOK_DIAL_TCP
+# and TEST_HOOK_BARRIER (dial_parallel), HOSTS_FILE_PATH, HOSTNAME_OVERRIDE /
+# HOSTNAME_FAIL (getHostname), force_update_conf / set_system_nss
+# (resolvConf / nssConfig), NETDNS_MODE (forceGoDNS), and on pipe ends
+# close_with_error! / pipe_read_deadline / packet_pipe (the fake DNS
+# servers of the tests; Go's fakes implement Conn).
+#
+# Tests: Go's _test.go files are translated in the *_test.alx files; each
+# file's header lists what it leaves out and why (the external network,
+# root, Windows / Plan 9, allocation counting, socktest / poll test hooks,
+# context values, the singleflight group, benchmarks). Not translated as a
+# whole: cgo_unix_test.go (cgo), external_test.go (the internet),
+# mptcpsock_linux_test.go (MPTCP sockets), sendfile_*_test.go and
+# splice_linux_test.go (no sendfile / splice), main_cloexec_test.go /
+# net_fake_test.go / main_*_test.go (test harness for wasip1 / js and Go's
+# socktest). vec_net_test.alx holds vectors generated from Go.
 
-import "strconv"
-import "strings"
-
-extern def c_read(fd: I32, buf: [Byte], n: Int) -> Int = "read"
-extern def c_write(fd: I32, buf: [Byte], n: Int) -> Int = "write"
-extern def alx_sys_const(name: Str) -> Int
-extern def alx_fd_wait(fd: Int, mode: Int) -> Int
-extern def alx_fd_close(fd: Int) -> Int
-extern def alx_sock_listen(host: Str, port: Int, backlog: Int) -> Int
-extern def alx_sock_accept(fd: Int, out: [Byte]) -> Int
-extern def alx_sock_connect(host: Str, port: Int) -> Int
-extern def alx_sock_error(fd: Int) -> Int
-extern def alx_sock_local_addr(fd: Int, out: [Byte]) -> Int
-extern def alx_sock_peer_addr(fd: Int, out: [Byte]) -> Int
-extern def alx_sock_set_nodelay(fd: Int, on: Int) -> Int
-extern def alx_sock_shutdown(fd: Int, how: Int) -> Int
-extern def alx_sock_lookup(host: Str, out: [Byte], n: Int) -> Int
-extern def alx_sleep_ns(ns: Int)
-extern def alx_sock_open(kind: Int, host: Str, port: Int, listen: Int, backlog: Int) -> Int
-extern def alx_sock_recvfrom(fd: Int, buf: [Byte], n: Int, out: [Byte]) -> Int
-extern def c_unlink(p: Str) -> I32 = "unlink"
-
-# getaddrinfo's "host not found", as the runtime reports it (not an errno).
-NO_HOST = 100000
-
-def c(name: Str) -> Int { alx_sys_const(name) }
-
-# ---------------------------------------------------------------------- errors
-
-# What failed: the operation ("dial", "listen", "accept", "read", "write",
-# "close"), the address, the failing system call ("connect", "bind", ...; for
-# a bad address, the reason) and the errno (0: none).
-pub struct NetFailure {
-  op: Str
-  addr: Str
-  syscall: Str
-  code: Int
-  # The network of a dial / listen ("" is "tcp").
-  network: Str
-}
-
-pub error NetError {
-  ConnRefused(at: NetFailure)
-  AddrInUse(at: NetFailure)
-  Timeout(at: NetFailure)
-  Closed(at: NetFailure)
-  # A malformed "host:port" (`at.syscall` is the reason).
-  BadAddr(at: NetFailure)
-  Other(at: NetFailure)
-
-  def message -> Str {
-    f = failure
-    describe(f, kind)
-  }
-
-  def kind -> Int {
-    case self {
-      ConnRefused => 0
-      AddrInUse => 0
-      Timeout => 1
-      Closed => 2
-      BadAddr => 3
-      Other => 0
-    }
-  }
-
-  # The failed call's details.
-  pub def failure -> NetFailure {
-    case self {
-      ConnRefused(at) => at
-      AddrInUse(at) => at
-      Timeout(at) => at
-      Closed(at) => at
-      BadAddr(at) => at
-      Other(at) => at
-    }
-  }
-
-  # The errno (0 for Timeout, Closed and BadAddr).
-  pub def errno -> Int {
-    f = failure
-    f.code
-  }
-}
-
-# C's message for an errno, in Go's lower case: "connection refused".
-pub def errno_message(code: Int) -> Str {
-  return "no such host" if code == NO_HOST
-  s = C.strerror(code)
-  return s if s.size == 0 || s[0] < 65 || s[0] > 90
-  return s if s.size > 1 && s[1] >= 65 && s[1] <= 90
-  b = s.bytes.to_a
-  b[0] = b[0] + 32
-  Str.from_bytes(b)
-}
-
-def describe(f: NetFailure, kind: Int) -> Str {
-  nw = f.network.size == 0 ? "tcp" : f.network
-  net = f.op == "dial" || f.op == "listen" ? " " + nw : ""
-  where = f.addr.size == 0 ? "" : " " + f.addr
-  head = "#{f.op}#{net}#{where}"
-  return "#{head}: i/o timeout" if kind == 1
-  return "#{head}: use of closed network connection" if kind == 2
-  return "address #{f.addr}: #{f.syscall}" if kind == 3
-  return "#{f.op}: #{f.syscall}: no such host" if f.code == NO_HOST
-  # No errno: the call's own reason is the whole message.
-  return "#{head}: #{f.syscall}" if f.code == 0
-  "#{head}: #{f.syscall}: #{errno_message(f.code)}"
-}
-
-# The NetError for errno `code` from `syscall` during `op` on `addr`.
-pub def net_error(op: Str, addr: Str, syscall: Str, code: Int) -> NetError {
-  at = NetFailure.new(op: op, addr: addr, syscall: syscall, code: code)
-  return NetError.ConnRefused(at) if code == c("ECONNREFUSED")
-  return NetError.AddrInUse(at) if code == c("EADDRINUSE")
-  return NetError.Closed(at) if code == c("EBADF")
-  return NetError.Timeout(at) if code == c("ETIMEDOUT")
-  NetError.Other(at)
-}
-
-def closed_error(op: Str, addr: Str) -> NetError {
-  NetError.Closed(NetFailure.new(op: op, addr: addr, syscall: "", code: 0))
-}
-
-def bad_addr(addr: Str, why: Str) -> NetError {
-  NetError.BadAddr(NetFailure.new(op: "address", addr: addr, syscall: why, code: 0))
-}
-
-pub def is_closed(e: Error) -> Bool {
-  case e {
-    Closed => true
-    _ => false
-  }
-}
-
-pub def is_timeout(e: Error) -> Bool {
-  case e {
-    Timeout => true
-    _ => false
-  }
-}
-
-pub def is_conn_refused(e: Error) -> Bool {
-  case e {
-    ConnRefused => true
-    _ => false
-  }
-}
-
-# ------------------------------------------------------------ host and port
-
-# Go's net.SplitHostPort: "host:port", "[v6addr]:port" or ":port".
-pub def split_host_port(hostport: Str) -> ~(Str, Str) {
-  n = hostport.size
-  fail bad_addr(hostport, "missing port in address") if n == 0
-  i = strings.last_index(hostport, ":")
-  fail bad_addr(hostport, "missing port in address") if i < 0
-  host = ""
-  if hostport[0] == 91 {
-    j = strings.index(hostport, "]")
-    fail bad_addr(hostport, "missing ']' in address") if j < 0
-    fail bad_addr(hostport, "missing port in address") if j + 1 == n
-    fail bad_addr(hostport, "too many colons in address") if j + 1 != i
-    host = hostport[1...j]
-    fail bad_addr(hostport, "unexpected '[' in address") if strings.contains(host, "[")
-  } else {
-    host = hostport[0...i]
-    fail bad_addr(hostport, "too many colons in address") if strings.contains(host, ":")
-    fail bad_addr(hostport, "unexpected '[' in address") if strings.contains(host, "[")
-    fail bad_addr(hostport, "unexpected ']' in address") if strings.contains(host, "]")
-  }
-  (host, hostport[i + 1...n])
-}
-
-# Go's net.JoinHostPort: an IPv6 host (one with a colon) gets brackets.
-pub def join_host_port(host: Str, port: Str) -> Str {
-  return "[#{host}]:#{port}" if strings.contains(host, ":")
-  "#{host}:#{port}"
-}
-
-def parse_port(addr: Str, port: Str) -> ~Int {
-  fail bad_addr(addr, "missing port in address") if port.size == 0
-  p = strconv.atoi(port).unwrap_or(-1)
-  fail bad_addr(addr, "invalid port #{port}") if p < 0 || p > 65535
-  p
-}
-
-def check_network(op: Str, network: Str, addr: Str) -> ~Unit {
-  ok = network == "tcp" || network == "tcp4" || network == "tcp6"
-  fail NetError.Other(NetFailure.new(op: op, addr: addr, syscall: "unknown network #{network}", code: 0)) unless ok
-}
-
-# The runtime's socket kind for a network (alx_sock_open): 0 tcp, 1 udp,
-# 2 unix, 3 unixgram; -1 unknown.
-def sock_kind(network: Str) -> Int {
-  return 0 if network == "tcp" || network == "tcp4" || network == "tcp6"
-  return 1 if network == "udp" || network == "udp4" || network == "udp6"
-  return 2 if network == "unix"
-  return 3 if network == "unixgram"
-  -1
-}
-
-def unknown_network(op: Str, network: Str, addr: Str) -> NetError {
-  NetError.Other(NetFailure.new(op: op, addr: addr, syscall: "unknown network #{network}", code: 0, network: network))
-}
-
-# A NetError for a dial / listen on a network other than tcp.
-def op_error(op: Str, network: Str, addr: Str, syscall: Str, code: Int) -> NetError {
-  at = NetFailure.new(op: op, addr: addr, syscall: syscall, code: code, network: network)
-  return NetError.ConnRefused(at) if code == c("ECONNREFUSED")
-  return NetError.AddrInUse(at) if code == c("EADDRINUSE")
-  return NetError.Closed(at) if code == c("EBADF")
-  return NetError.Timeout(at) if code == c("ETIMEDOUT")
-  NetError.Other(at)
-}
-
-# Opens a UDP or Unix socket (kind as sock_kind) for dial (bind false) or
-# listen / listen_packet: the descriptor.
-def open_sock(op: Str, network: Str, kind: Int, addr: Str, bind: Bool) -> ~Int {
-  host = addr
-  port = 0
-  if kind == 1 {
-    h, portstr = ~split_host_port(addr)
-    host = h
-    port = ~parse_port(addr, portstr)
-  }
-  fd = alx_sock_open(kind, host, port, bind ? 1 : 0, 1024)
-  fail op_error(op, network, addr, bind ? "bind" : "connect", -fd) if fd < 0
-  if kind == 2 && !bind {
-    e = finish_connect(fd)
-    if e != 0 {
-      alx_fd_close(fd)
-      fail op_error(op, network, addr, "connect", e)
-    }
-  }
-  fd
-}
-
-def zeros(n: Int) -> [Byte] {
-  b: [Byte] = [0; n]
-  b
-}
-
-# The address string a shim wrote into a 64-byte buffer (n: its length).
-def addr_of(b: [Byte], n: Int) -> Str {
-  return "" if n <= 0
-  Str.from_bytes(b[0...n])
-}
-
-# The NUL-terminated string in b.
-def cstr_of(b: [Byte]) -> Str {
-  n = 0
-  while n < b.size && b[n] != 0 {
-    n += 1
-  }
-  Str.from_bytes(b[0...n])
-}
-
-# Resolved addresses of a host name, IPv4 and IPv6 (blocks the worker).
-pub def lookup_host(host: Str) -> ~[Str] {
-  buf = zeros(4096)
-  n = alx_sock_lookup(host, buf, 4096)
-  fail net_error("lookup", host, "getaddrinfo", NO_HOST) if n < 0
-  out: [Str] = []
-  for line in strings.split(Str.from_bytes(buf[0...n]), "\n") {
-    out << line if line.size > 0
-  }
-  out
-}
+import "io"
+import "net/netip"
+import "os"
+import "time"
 
 # ---------------------------------------------------------------------- Conn
 
-# A TCP connection. The descriptor lives in shared state (D36).
+# A network connection: Go's Conn interface and its implementations
+# TCPConn, UDPConn, UnixConn and IPConn (and net.Pipe's ends), as one type.
+# The socket lives in shared state (Atomics, D36): copies are the same
+# connection, and tasks may share one (one reads while another closes).
 pub struct Conn {
-  # The descriptor, -1 once closed. Atomic: copies share it, and tasks may
-  # share a connection (one reads while another closes).
-  fdv: Atomic[Int]
-  local: Str
-  remote: Str
+  nfd: NetFD
+  # A net.Pipe end (empty for a socket).
+  pp: PipeEnd?
 
-  # The descriptor; -1 once closed.
-  pub def fd -> Int { fdv.load }
+  def pipe? -> Bool { pp.present? }
 
-  pub def local_addr -> Str { local }
-  pub def remote_addr -> Str { remote }
+  # The descriptor; -1 once closed (and for a pipe).
+  pub def fd -> Int { pipe? ? -1 : nfd.fd }
 
-  # Reads up to p.size bytes, waiting for some; 0 at end of stream (the peer
-  # closed or shut down its write side).
+  # The network: "tcp", "udp", "unix", "ip:icmp", "pipe", ...
+  pub def network -> Str { pipe? ? "pipe" : nfd.net }
+
+  # The local address as text ("" if none); Go's LocalAddr().String().
+  pub def local_addr -> Str { pipe? ? "pipe" : nfd.la }
+
+  # The remote address as text ("" if none); Go's RemoteAddr().String().
+  pub def remote_addr -> Str { pipe? ? "pipe" : nfd.ra }
+
+  # Go's LocalAddr: the local address (a TCPAddr, UDPAddr, UnixAddr, ...),
+  # none if the socket has none.
+  pub def local_net_addr -> Addr? {
+    return PipeAddr.new if pipe?
+    nfd.laddr
+  }
+
+  # Go's RemoteAddr.
+  pub def remote_net_addr -> Addr? {
+    return PipeAddr.new if pipe?
+    nfd.raddr
+  }
+
+  # Reads up to p.size bytes, waiting for some; 0 at end of stream. A
+  # deadline that has passed fails with a Timeout.
   pub def read!(p: [Byte]) -> ~Int {
-    return 0 if p.size == 0
-    loop {
-      f = fd
-      fail closed_error("read", remote) if f < 0
-      n = c_read(f.to_i32, p, p.size)
-      return n if n >= 0
-      code = C.errno
-      if code == c("EAGAIN") {
-        w = alx_fd_wait(f, 1)
-        fail net_error("read", remote, "read", -w) if w < 0
-      } else {
-        fail net_error("read", remote, "read", code) if code != c("EINTR")
-      }
+    if pe = pp {
+      pe2 = pe
+      return pe2.~read!(p)
     }
+    nfd.~fd_read(p, "read", nfd.la, nfd.ra)
   }
 
-  # Writes all of p (waiting while the socket's buffer is full); p.size.
+  # Writes all of p (a stream; waiting while the socket's buffer is full) or
+  # sends it as one datagram; p.size.
   pub def write!(p: [Byte]) -> ~Int {
-    off = 0
-    while off < p.size {
-      f = fd
-      fail closed_error("write", remote) if f < 0
-      n = c_write(f.to_i32, p[off...p.size], p.size - off)
-      if n >= 0 {
-        off += n
-      } else {
-        code = C.errno
-        if code == c("EAGAIN") {
-          w = alx_fd_wait(f, 2)
-          fail net_error("write", remote, "write", -w) if w < 0
-        } else {
-          fail net_error("write", remote, "write", code) if code != c("EINTR")
-        }
-      }
+    if pe = pp {
+      pe2 = pe
+      return pe2.~write!(p)
     }
-    p.size
+    nfd.~fd_write(p, "write", nfd.la, nfd.ra)
   }
 
-  pub def write_string!(s: Str) -> ~Int {
-    self.~write!(s.bytes.to_a)
-  }
+  pub def write_string!(s: Str) -> ~Int { self.~write!(s.bytes.to_a) }
 
-  # Closes the connection (every copy of it) and wakes tasks waiting on it.
-  # A second close fails with Closed.
+  # Closes the connection (every copy of it) and wakes tasks waiting on it,
+  # which fail with Closed. A second close fails with Closed.
   pub def close! -> ~Unit {
-    f = fdv.swap(-1)
-    fail closed_error("close", remote) if f < 0
-    r = alx_fd_close(f)
-    fail net_error("close", remote, "close", -r) if r < 0
+    if pe = pp {
+      pe2 = pe
+      return pe2.~close!
+    }
+    nfd.~fd_close("close", nfd.la, nfd.ra)
   }
+
+  # Shuts down the read side (Go's CloseRead, TCP and Unix).
+  pub def close_read! -> ~Unit { nfd.~fd_shutdown(0, "close", nfd.la, nfd.ra) }
 
   # Shuts down the write side: the peer reads end of stream; this side can
-  # still read.
-  pub def close_write! -> ~Unit {
-    f = fd
-    fail closed_error("close", remote) if f < 0
-    r = alx_sock_shutdown(f, 1)
-    fail net_error("close", remote, "shutdown", -r) if r < 0
+  # still read (Go's CloseWrite).
+  pub def close_write! -> ~Unit { nfd.~fd_shutdown(1, "close", nfd.la, nfd.ra) }
+
+  # For tests' fake servers on a pipe end: PipeEnd.close_with_error!.
+  def close_with_error!(kind: Str) {
+    if pe = pp {
+      pe2 = pe
+      pe2.close_with_error!(kind)
+    }
   }
 
-  pub def set_nodelay(on: Bool) -> ~Unit {
-    f = fd
-    fail closed_error("set", remote) if f < 0
-    r = alx_sock_set_nodelay(f, on ? 1 : 0)
-    fail net_error("set", remote, "setsockopt", -r) if r < 0
+  # For tests' fake servers: a pipe end's read deadline (Unix ns, 0: none).
+  def pipe_read_deadline -> Int {
+    if pe = pp {
+      return pe.read_dl.at
+    }
+    0
+  }
+
+  # The read and write deadlines: past them, reads and writes (and those
+  # waiting now) fail with a Timeout; the zero Time means none.
+  pub def set_deadline(t: time.Time) -> ~Unit {
+    if pe = pp {
+      pe2 = pe
+      return pe2.~set_deadline(3, t)
+    }
+    nfd.~set_deadline(3, t)
+  }
+
+  pub def set_read_deadline(t: time.Time) -> ~Unit {
+    if pe = pp {
+      pe2 = pe
+      return pe2.~set_deadline(1, t)
+    }
+    nfd.~set_deadline(1, t)
+  }
+
+  pub def set_write_deadline(t: time.Time) -> ~Unit {
+    if pe = pp {
+      pe2 = pe
+      return pe2.~set_deadline(2, t)
+    }
+    nfd.~set_deadline(2, t)
+  }
+
+  # SO_RCVBUF / SO_SNDBUF.
+  pub def set_read_buffer(bytes: Int) -> ~Unit { ~set_opt("SO_RCVBUF", bytes, true) }
+  pub def set_write_buffer(bytes: Int) -> ~Unit { ~set_opt("SO_SNDBUF", bytes, true) }
+
+  def set_opt(name: Str, v: Int, local_only: Bool) -> ~Unit {
+    f = nfd.fd
+    fail closed_error("set", nfd.net, local_only ? "" : nfd.la, local_only ? nfd.la : nfd.ra) if f < 0
+    r = alx_net_setsockopt(f, name, v)
+    fail op_error("set", nfd.net, local_only ? "" : nfd.la, local_only ? nfd.la : nfd.ra, "setsockopt", -r) if r < 0
+  }
+
+  # TCP_NODELAY (Go's SetNoDelay; on by default, as in Go).
+  pub def set_no_delay(on: Bool) -> ~Unit { ~set_opt("TCP_NODELAY", on ? 1 : 0, false) }
+
+  # An older name for set_no_delay.
+  pub def set_nodelay(on: Bool) -> ~Unit { ~set_opt("TCP_NODELAY", on ? 1 : 0, false) }
+
+  # SO_LINGER: sec < 0 closes in the background (the default), 0 discards
+  # unsent data and resets, > 0 lingers that many seconds.
+  pub def set_linger(sec: Int) -> ~Unit { ~set_opt("SO_LINGER", sec, false) }
+
+  pub def set_keep_alive(on: Bool) -> ~Unit { ~set_opt("SO_KEEPALIVE", on ? 1 : 0, false) }
+
+  # The idle time before keep-alive probes (rounded up to seconds; 0 is
+  # Go's default, 15 s; < 0 leaves it).
+  pub def set_keep_alive_period(d: time.Duration) -> ~Unit { ~set_keep_alive_secs("TCP_KEEPIDLE", d.ns, DEFAULT_KEEP_ALIVE_IDLE_NS) }
+
+  def set_keep_alive_secs(name: Str, ns: Int, def_ns: Int) -> ~Unit {
+    return if ns < 0
+    d = ns == 0 ? def_ns : ns
+    secs = (d + 999999999) / 1000000000
+    ~set_opt(name, secs, false)
+  }
+
+  # Go's SetKeepAliveConfig.
+  pub def set_keep_alive_config(cfg: KeepAliveConfig) -> ~Unit {
+    ~set_opt("SO_KEEPALIVE", cfg.enable ? 1 : 0, false)
+    ~set_keep_alive_secs("TCP_KEEPIDLE", cfg.idle.ns, DEFAULT_KEEP_ALIVE_IDLE_NS)
+    ~set_keep_alive_secs("TCP_KEEPINTVL", cfg.interval.ns, DEFAULT_KEEP_ALIVE_INTERVAL_NS)
+    n = cfg.count
+    return if n < 0
+    ~set_opt("TCP_KEEPCNT", n == 0 ? DEFAULT_KEEP_ALIVE_COUNT : n, false)
+  }
+
+  # Go's MultipathTCP: never (alx doesn't make MPTCP sockets).
+  pub def multipath_tcp -> ~Bool { false }
+
+  # Reads a datagram (UDP, unixgram, IP): its length and the sender, none
+  # for an unnamed one. Go's ReadFrom.
+  pub def read_from!(p: [Byte]) -> ~(Int, Addr?) {
+    n, sa = nfd.~fd_read_from(p, "read", nfd.la, nfd.ra)
+    a = from_addr(nfd.net, sa)
+    k = net_kind(nfd.net)
+    if k == 2 && nfd.family == 4 {
+      return (strip_ipv4_header(n, p), a)
+    }
+    (n, a)
+  }
+
+  # Go's ReadFromUDP: the sender as a UDPAddr.
+  pub def read_from_udp!(p: [Byte]) -> ~(Int, UDPAddr) {
+    n, a = self.~read_from!(p)
+    x = a || return (n, UDPAddr.new)
+    case x {
+      UDPAddr(u) => return (n, u)
+      _ => return (n, UDPAddr.new)
+    }
+  }
+
+  # Go's ReadFromUDPAddrPort.
+  pub def read_from_udp_addr_port!(p: [Byte]) -> ~(Int, netip.AddrPort) {
+    n, u = self.~read_from_udp!(p)
+    (n, u.addr_port)
+  }
+
+  # Go's ReadFromUnix: the sender, none if unnamed.
+  pub def read_from_unix!(p: [Byte]) -> ~(Int, UnixAddr?) {
+    n, a = self.~read_from!(p)
+    x = a || return (n, none)
+    case x {
+      UnixAddr(u) => return (n, u)
+      _ => return (n, none)
+    }
+  }
+
+  # Go's ReadFromIP.
+  pub def read_from_ip!(p: [Byte]) -> ~(Int, IPAddr) {
+    n, a = self.~read_from!(p)
+    x = a || return (n, IPAddr.new)
+    case x {
+      IPAddr(i) => return (n, i)
+      _ => return (n, IPAddr.new)
+    }
+  }
+
+  # Sends p to addr (an unconnected UDP, unixgram or IP socket). Go's
+  # WriteTo.
+  pub def write_to!(p: [Byte], addr: Addr) -> ~Int {
+    nfd2 = nfd
+    case addr {
+      UDPAddr(u) => return self.~write_to_udp!(p, u)
+      UnixAddr(u) => return self.~write_to_unix!(p, u)
+      IPAddr(i) => return self.~write_to_ip!(p, i)
+      _ => fail op_error("write", nfd2.net, nfd2.la, addr.to_s, "", c("EINVAL"))
+    }
+  }
+
+  # Go's WriteToUDP.
+  pub def write_to_udp!(p: [Byte], addr: UDPAddr?) -> ~Int {
+    fail write_to_connected_error("write", nfd.net, nfd.la, addr_s(opt_addr(addr))) if nfd.connected
+    a = addr || fail wrap_error("write", nfd.net, nfd.la, "", "", ERR_MISSING_ADDRESS)
+    sa = ip_to_sockaddr(nfd.family, a.ip, a.port, a.zone)
+    if e = sa.err {
+      fail wrap_any("write", nfd.net, nfd.la, a.to_s, e)
+    }
+    nfd.~fd_write_to(p, sa.unwrap, "write", nfd.la, a.to_s)
+  }
+
+  # Go's WriteToUDPAddrPort.
+  pub def write_to_udp_addr_port!(p: [Byte], ap: netip.AddrPort) -> ~Int {
+    fail write_to_connected_error("write", nfd.net, nfd.la, ap.to_s) if nfd.connected
+    fail wrap_error("write", nfd.net, nfd.la, ap.to_s, "", ERR_MISSING_ADDRESS) unless ap.valid?
+    a = ap.addr
+    if nfd.family == 4 && !a.is4? && !a.is4in6? {
+      fail wrap_error("write", nfd.net, nfd.la, ap.to_s, "addr", addr_error("non-IPv4 address", a.to_s).message)
+    }
+    self.~write_to_udp!(p, udp_addr_from_addr_port(ap))
+  }
+
+  # Go's WriteToUnix.
+  pub def write_to_unix!(p: [Byte], addr0: UnixAddr?) -> ~Int {
+    fail write_to_connected_error("write", nfd.net, nfd.la, addr_s(opt_addr(addr0))) if nfd.connected
+    addr = addr0 || fail wrap_error("write", nfd.net, nfd.la, "", "", ERR_MISSING_ADDRESS)
+    if addr.net != sotype_to_net(nfd.sotype) {
+      fail op_error("write", nfd.net, nfd.la, addr.to_s, "", c("EAFNOSUPPORT"))
+    }
+    sa = sa_unix(addr.name)
+    if e = sa.err {
+      fail wrap_any("write", nfd.net, nfd.la, addr.to_s, e)
+    }
+    nfd.~fd_write_to(p, sa.unwrap, "write", nfd.la, addr.to_s)
+  }
+
+  # Go's WriteToIP.
+  pub def write_to_ip!(p: [Byte], addr0: IPAddr?) -> ~Int {
+    fail write_to_connected_error("write", nfd.net, nfd.la, addr_s(opt_addr(addr0))) if nfd.connected
+    addr = addr0 || fail wrap_error("write", nfd.net, nfd.la, "", "", ERR_MISSING_ADDRESS)
+    sa = ip_to_sockaddr(nfd.family, addr.ip, 0, addr.zone)
+    if e = sa.err {
+      fail wrap_any("write", nfd.net, nfd.la, addr.to_s, e)
+    }
+    nfd.~fd_write_to(p, sa.unwrap, "write", nfd.la, addr.to_s)
+  }
+
+  # Go's ReadMsgUDP / ReadMsgUnix / ReadMsgIP: (n, oobn, flags, sender);
+  # flags as the runtime gives them (1 truncated data, 2 truncated control).
+  pub def read_msg!(p: [Byte], oob: [Byte]) -> ~(Int, Int, Int, Addr?) {
+    n, oobn, flags, sa = nfd.~fd_read_msg(p, oob, "read", nfd.la, nfd.ra)
+    (n, oobn, flags, from_addr(nfd.net, sa))
+  }
+
+  pub def read_msg_unix!(p: [Byte], oob: [Byte]) -> ~(Int, Int, Int, UnixAddr?) {
+    n, oobn, flags, a = self.~read_msg!(p, oob)
+    x = a || return (n, oobn, flags, none)
+    case x {
+      UnixAddr(u) => return (n, oobn, flags, u)
+      _ => return (n, oobn, flags, none)
+    }
+  }
+
+  pub def read_msg_udp!(p: [Byte], oob: [Byte]) -> ~(Int, Int, Int, UDPAddr) {
+    n, oobn, flags, a = self.~read_msg!(p, oob)
+    x = a || return (n, oobn, flags, UDPAddr.new)
+    case x {
+      UDPAddr(u) => return (n, oobn, flags, u)
+      _ => return (n, oobn, flags, UDPAddr.new)
+    }
+  }
+
+  # Go's WriteMsgUnix: p and the control data oob to addr (none: the
+  # connected peer). (n, oobn).
+  pub def write_msg_unix!(p: [Byte], oob: [Byte], addr: UnixAddr?) -> ~(Int, Int) {
+    dst = addr_s(opt_addr(addr))
+    fail write_to_connected_error("write", nfd.net, nfd.la, dst) if nfd.sotype == SOCK_DGRAM && nfd.connected && addr.present?
+    sa = sa_none
+    if a = addr {
+      fail op_error("write", nfd.net, nfd.la, dst, "", c("EAFNOSUPPORT")) if a.net != sotype_to_net(nfd.sotype)
+      r = sa_unix(a.name)
+      if e = r.err {
+        fail wrap_any("write", nfd.net, nfd.la, dst, e)
+      }
+      sa = r.unwrap
+    }
+    nfd.~fd_write_msg(p, oob, sa, "write", nfd.la, dst)
+  }
+
+  # Go's ReadMsgUDPAddrPort.
+  pub def read_msg_udp_addr_port!(p: [Byte], oob: [Byte]) -> ~(Int, Int, Int, netip.AddrPort) {
+    n, oobn, flags, sa = nfd.~fd_read_msg(p, oob, "read", nfd.la, nfd.ra)
+    f = sa_family(sa)
+    return (n, oobn, flags, netip.AddrPort.new) if f != 4 && f != 6
+    ip = sa_ip(sa)
+    a = netip.addr_from_slice(ip.bytes) || netip.Addr.new
+    a = a.with_zone(zone_name(sa_be32(sa))) if f == 6
+    (n, oobn, flags, netip.addr_port_from(a, sa_port(sa).as_u16))
+  }
+
+  # Go's WriteMsgUDPAddrPort (an invalid ap: the connected peer).
+  pub def write_msg_udp_addr_port!(p: [Byte], oob: [Byte], ap: netip.AddrPort) -> ~(Int, Int) {
+    dst = ap.valid? ? ap.to_s : ""
+    fail write_to_connected_error("write", nfd.net, nfd.la, dst) if nfd.connected && ap.valid?
+    fail wrap_error("write", nfd.net, nfd.la, dst, "", ERR_MISSING_ADDRESS) if !nfd.connected && !ap.valid?
+    sa = sa_none
+    if ap.valid? {
+      a = ap.addr
+      if nfd.family == 4 && !a.is4? && !a.is4in6? {
+        fail wrap_any("write", nfd.net, nfd.la, dst, addr_error("non-IPv4 address", a.to_s))
+      }
+      r = ip_to_sockaddr(nfd.family, IP.new(b: a.as_slice), ap.port.to_i, a.zone)
+      if e = r.err {
+        fail wrap_any("write", nfd.net, nfd.la, dst, e)
+      }
+      sa = r.unwrap
+    }
+    nfd.~fd_write_msg(p, oob, sa, "write", nfd.la, dst)
+  }
+
+  # Go's WriteMsgIP.
+  pub def write_msg_ip!(p: [Byte], oob: [Byte], addr0: IPAddr?) -> ~(Int, Int) {
+    dst = addr_s(opt_addr(addr0))
+    fail write_to_connected_error("write", nfd.net, nfd.la, dst) if nfd.connected
+    addr = addr0 || fail wrap_error("write", nfd.net, nfd.la, "", "", ERR_MISSING_ADDRESS)
+    r = ip_to_sockaddr(nfd.family, addr.ip, 0, addr.zone)
+    if e = r.err {
+      fail wrap_any("write", nfd.net, nfd.la, dst, e)
+    }
+    nfd.~fd_write_msg(p, oob, r.unwrap, "write", nfd.la, dst)
+  }
+
+  # Go's ReadMsgIP.
+  pub def read_msg_ip!(p: [Byte], oob: [Byte]) -> ~(Int, Int, Int, IPAddr?) {
+    n, oobn, flags, a = self.~read_msg!(p, oob)
+    x = a || return (n, oobn, flags, none)
+    case x {
+      IPAddr(i) => return (n, oobn, flags, i)
+      _ => return (n, oobn, flags, none)
+    }
+  }
+
+  # Go's WriteMsgUDP.
+  pub def write_msg_udp!(p: [Byte], oob: [Byte], addr: UDPAddr?) -> ~(Int, Int) {
+    dst = addr_s(opt_addr(addr))
+    fail write_to_connected_error("write", nfd.net, nfd.la, dst) if nfd.connected && addr.present?
+    fail wrap_error("write", nfd.net, nfd.la, dst, "", ERR_MISSING_ADDRESS) if !nfd.connected && !addr.present?
+    sa = sa_none
+    if a = addr {
+      r = ip_to_sockaddr(nfd.family, a.ip, a.port, a.zone)
+      if e = r.err {
+        fail wrap_any("write", nfd.net, nfd.la, dst, e)
+      }
+      sa = r.unwrap
+    }
+    nfd.~fd_write_msg(p, oob, sa, "write", nfd.la, dst)
+  }
+
+  # A duplicate of the socket as an os.File, in blocking mode (Go's File).
+  pub def file -> ~os.File {
+    d = alx_net_dup(nfd.fd, 0)
+    fail op_error("file", nfd.net, nfd.la, nfd.ra, "dup", -d) if d < 0
+    os.new_file(d, nfd.name).unwrap
+  }
+
+  # Go's SyscallConn.
+  pub def syscall_conn -> ~RawConn { RawConn.new(nfd: nfd, listener: false) }
+
+  # Joins the IPv4 or IPv6 multicast group ip on ifi (none: the default
+  # interface); for ListenMulticastUDP.
+  def join_group(ifi: Interface?, ip: IP) -> ~Unit {
+    f = nfd.fd
+    if ip4 = ip.to4 {
+      ifaddr: [Byte] = [0, 0, 0, 0]
+      if i = ifi {
+        ifaddr = ~interface_ipv4_addr(i)
+      }
+      r = alx_net_mcast(f, 4, ip4.bytes, 0, ifaddr, 1)
+      fail syscall_error("setsockopt", -r) if r < 0
+    } else {
+      idx = 0
+      if i = ifi {
+        idx = i.index
+      }
+      z: [Byte] = [0, 0, 0, 0]
+      r = alx_net_mcast(f, 6, ip.bytes, idx, z, 1)
+      fail syscall_error("setsockopt", -r) if r < 0
+    }
   }
 }
 
-def new_conn(fd: Int, local: Str, remote: Str) -> Conn {
-  Conn.new(fdv: Atomic.new(fd), local: local, remote: remote)
+extern def alx_net_mcast(fd: Int, family: Int, ip: [Byte], ifindex: Int, ifaddr: [Byte], join: Int) -> Int
+extern def alx_net_mcast_if4(fd: Int, ifaddr: [Byte]) -> Int
+
+# A datagram's sender: none for an unnamed Unix socket (Go's readFrom).
+def from_addr(net: Str, sa: [Byte]) -> Addr? {
+  return none if sa_family(sa) == 1 && sa_unix_name(sa) == ""
+  sockaddr_to_addr(net, sa)
 }
 
-# Waits for a non-blocking connect on fd to finish: 0 or the errno.
-def finish_connect(fd: Int) -> Int {
-  buf = zeros(64)
-  loop {
-    w = alx_fd_wait(fd, 2)
-    return -w if w < 0
-    e = alx_sock_error(fd)
-    return e if e != 0
-    r = alx_sock_peer_addr(fd, buf)
-    return 0 if r >= 0
-    return -r if -r != c("ENOTCONN")
-  }
+def write_to_connected_error(op: Str, net: Str, src: Str, dst: Str) -> NetError {
+  wrap_error(op, net, src, dst, "", "use of WriteTo with pre-connected connection")
 }
 
-# Connects to addr: "host:port" over "tcp" or "udp", a path over "unix" or
-# "unixgram".
-pub def dial(network: Str, addr: Str) -> ~Conn {
-  kind = sock_kind(network)
-  fail unknown_network("dial", network, addr) if kind < 0
-  if kind > 0 {
-    fd = ~open_sock("dial", network, kind, addr, false)
-    b = zeros(64)
-    return new_conn(fd, addr_of(b, alx_sock_local_addr(fd, b)), addr)
-  }
-  host, portstr = ~split_host_port(addr)
-  port = ~parse_port(addr, portstr)
-  fd = alx_sock_connect(host, port)
-  fail net_error("dial", addr, "connect", -fd) if fd < 0
-  e = finish_connect(fd)
-  if e != 0 {
-    alx_fd_close(fd)
-    fail net_error("dial", addr, "connect", e)
-  }
-  buf = zeros(64)
-  local = addr_of(buf, alx_sock_local_addr(fd, buf))
-  new_conn(fd, local, addr)
+# Go's sotypeToNet.
+def sotype_to_net(sotype: Int) -> Str {
+  return "unix" if sotype == SOCK_STREAM
+  return "unixgram" if sotype == SOCK_DGRAM
+  "unixpacket"
 }
 
-# Like dial, but gives up with `Timeout` after d_ns nanoseconds. A timer task
-# closes the half-open socket; it stays asleep until d_ns has passed even if
-# the connect finished sooner.
-pub def dial_timeout(network: Str, addr: Str, d_ns: Int) -> ~Conn {
-  ~check_network("dial", network, addr)
-  host, portstr = ~split_host_port(addr)
-  port = ~parse_port(addr, portstr)
-  fd = alx_sock_connect(host, port)
-  fail net_error("dial", addr, "connect", -fd) if fd < 0
-  state = Atomic.new(0)
-  spawn {
-    alx_sleep_ns(d_ns)
-    alx_fd_close(fd) if state.compare_and_swap(0, 2)
+# Go's stripIPv4Header: drops the IPv4 header a raw socket delivers.
+def strip_ipv4_header(n: Int, b: [Byte]) -> Int {
+  return n if b.size < 20
+  l = (b[0] & 0x0f).to_i << 2
+  return n if 20 > l || l > b.size
+  return n if b[0] >> 4 != 4
+  copy(b, b[l...b.size])
+  n - l
+}
+
+# The first IPv4 address of an interface (Go's interfaceToIPv4Addr).
+def interface_ipv4_addr(ifi: Interface) -> ~[Byte] {
+  addrs = ~ifi.addrs
+  for a in addrs {
+    case a {
+      IPNet(n) => {
+        if ip4 = n.ip.to4 {
+          return ip4.bytes
+        }
+      }
+      _ => nil
+    }
   }
-  e = finish_connect(fd)
-  if !state.compare_and_swap(0, 1) {
-    fail NetError.Timeout(NetFailure.new(op: "dial", addr: addr, syscall: "connect", code: 0))
+  fail wrap_error("", "", "", "", "", "no such multicast network interface")
+}
+
+def new_conn(fd: NetFD) -> Conn { Conn.new(nfd: fd, pp: none) }
+
+# Go's KeepAliveConfig: zero durations and count mean Go's defaults (15 s
+# idle, 15 s interval, 9 probes); negative ones leave the system's.
+pub struct KeepAliveConfig {
+  enable: Bool
+  idle: time.Duration
+  interval: time.Duration
+  count: Int
+}
+
+DEFAULT_KEEP_ALIVE_IDLE_NS = 15000000000
+DEFAULT_KEEP_ALIVE_INTERVAL_NS = 15000000000
+DEFAULT_KEEP_ALIVE_COUNT = 9
+
+# Go's newTCPConn: TCP_NODELAY on, keep-alive per the dialer's or
+# listener's settings (keep_alive < 0 and a disabled config: off).
+def new_tcp_conn(fd: NetFD, keep_alive: time.Duration, cfg: KeepAliveConfig) -> Conn {
+  alx_net_setsockopt(fd.fd, "TCP_NODELAY", 1)
+  kc = cfg
+  if !kc.enable && keep_alive.ns >= 0 {
+    kc = KeepAliveConfig.new(enable: true, idle: keep_alive)
   }
-  if e != 0 {
-    alx_fd_close(fd)
-    fail net_error("dial", addr, "connect", e)
+  c = new_conn(fd)
+  if kc.enable {
+    c.set_keep_alive_config(kc)
   }
-  buf = zeros(64)
-  local = addr_of(buf, alx_sock_local_addr(fd, buf))
-  new_conn(fd, local, addr)
+  c
 }
 
 # ------------------------------------------------------------------ Listener
 
-# A TCP (or Unix stream) listening socket. The descriptor lives in shared
-# state (D36).
+# A stream listener: Go's Listener interface and its TCPListener and
+# UnixListener, as one type. The socket lives in shared state (D36).
 pub struct Listener {
-  # The descriptor, -1 once closed. Atomic: copies share it, and tasks may
-  # share a connection (one reads while another closes).
-  fdv: Atomic[Int]
-  # The bound address, "ip:port" (the real port after ":0"), or the path.
+  nfd: NetFD
+  # The bound address as text: "ip:port" (the real port after ":0"), or
+  # the path.
   addr: Str
-  # A Unix socket file to remove on close (Go's UnixListener does).
-  unlink_path: Str
+  # A Unix socket file to remove on close ("" for none), and whether to.
+  path: Str
+  unlink: Atomic[Bool]
+  # The accepted TCP connections' keep-alive settings.
+  keep_alive: time.Duration
+  keep_alive_config: KeepAliveConfig
 
-  pub def fd -> Int { fdv.load }
+  pub def fd -> Int { nfd.fd }
+
+  # Go's Addr: the bound address (a TCPAddr or UnixAddr).
+  pub def net_addr -> Addr? { nfd.laddr }
+
+  pub def network -> Str { nfd.net }
 
   # The bound port, an Int: unlike `addr` (a Str, which the sharing check
-  # treats as part of the listener), it can be used after the listener has been
-  # moved into a task: `dial("tcp", "127.0.0.1:#{l.port}")`.
+  # treats as part of the listener), it can be used after the listener has
+  # been moved into a task: `dial("tcp", "127.0.0.1:#{l.port}")`.
   pub def port -> Int {
-    i = strings.last_index(addr, ":")
-    strconv.atoi(addr[i + 1...addr.size]).unwrap_or(0)
+    i = addr.size - 1
+    while i >= 0 && addr[i] != 58 {
+      i -= 1
+    }
+    return 0 if i < 0
+    n, _, _ = dtoi(addr[i + 1...addr.size])
+    n
   }
 
   # Waits for the next connection and returns it.
   pub def accept -> ~Conn {
-    buf = zeros(64)
-    loop {
-      f = fd
-      fail closed_error("accept", addr) if f < 0
-      r = alx_sock_accept(f, buf)
-      if r >= 0 {
-        lb = zeros(64)
-        local = addr_of(lb, alx_sock_local_addr(r, lb))
-        return new_conn(r, local, cstr_of(buf))
-      }
-      code = -r
-      if code == c("EAGAIN") {
-        w = alx_fd_wait(f, 1)
-        fail net_error("accept", addr, "accept", -w) if w < 0
-      } else {
-        fail net_error("accept", addr, "accept", code) if code != c("EINTR") && code != c("ECONNABORTED")
-      }
-    }
+    f = nfd.~fd_accept("accept", nfd.la)
+    return new_tcp_conn(f, keep_alive, keep_alive_config) if f.family != 1
+    new_conn(f)
   }
 
-  # Stops listening and wakes tasks blocked in accept! (they fail with
-  # Closed). A second close fails.
+  # Go's AcceptTCP / AcceptUnix (the same Conn).
+  pub def accept_tcp -> ~Conn { ~accept }
+  pub def accept_unix -> ~Conn { ~accept }
+
+  # Stops listening and wakes tasks blocked in accept (they fail with
+  # Closed). A second close fails. A Unix listener removes its socket file
+  # (unless set_unlink_on_close(false)).
   pub def close! -> ~Unit {
-    f = fdv.swap(-1)
-    fail closed_error("close", addr) if f < 0
-    c_unlink(unlink_path) if unlink_path.size > 0
-    r = alx_fd_close(f)
-    fail net_error("close", addr, "close", -r) if r < 0
+    if path.size > 0 && path[0] != 64 && unlink.swap(false) {
+      c_unlink(path)
+    }
+    nfd.~fd_close("close", "", nfd.la)
   }
+
+  # The deadline for accept (zero Time: none).
+  pub def set_deadline(t: time.Time) -> ~Unit { nfd.~set_deadline(3, t) }
+
+  # Whether close removes the socket file (Unix; Go's SetUnlinkOnClose).
+  pub def set_unlink_on_close(on: Bool) { unlink.store(on) }
+
+  # A duplicate of the socket as an os.File (Go's File).
+  pub def file -> ~os.File {
+    d = alx_net_dup(nfd.fd, 0)
+    fail op_error("file", nfd.net, "", nfd.la, "dup", -d) if d < 0
+    os.new_file(d, nfd.name).unwrap
+  }
+
+  pub def syscall_conn -> ~RawConn { RawConn.new(nfd: nfd, listener: true) }
 }
 
-# Listens on addr ("host:port"; ":0" picks a free port) over "tcp", or on
-# the path addr over "unix".
-pub def listen(network: Str, addr: Str) -> ~Listener {
-  if network == "unix" {
-    fd = ~open_sock("listen", network, 2, addr, true)
-    return Listener.new(fdv: Atomic.new(fd), addr: addr, unlink_path: addr)
-  }
-  fail unknown_network("listen", network, addr) if sock_kind(network) != 0
-  host, portstr = ~split_host_port(addr)
-  port = ~parse_port(addr, portstr)
-  fd = alx_sock_listen(host, port, 1024)
-  fail net_error("listen", addr, "bind", -fd) if fd < 0
-  buf = zeros(64)
-  bound = addr_of(buf, alx_sock_local_addr(fd, buf))
-  Listener.new(fdv: Atomic.new(fd), addr: bound, unlink_path: "")
+def new_listener(fd: NetFD, path: Str, lc: ListenConfig) -> Listener {
+  Listener.new(nfd: fd, addr: fd.la, path: path, unlink: Atomic.new(path.size > 0), keep_alive: lc.keep_alive, keep_alive_config: lc.keep_alive_config)
 }
 
 # ---------------------------------------------------------------- PacketConn
 
-# A datagram socket bound to an address ("udp" or "unixgram"), from
-# listen_packet. The descriptor lives in shared state (D36).
+# A packet-oriented connection from listen_packet: Go's PacketConn
+# interface (a UDPConn, IPConn or unixgram UnixConn). `conn` is the
+# connection itself (Go's type assertion to *UDPConn).
 pub struct PacketConn {
-  fdv: Atomic[Int]
-  local: Str
+  conn: Conn
 
-  pub def fd -> Int { fdv.load }
+  pub def fd -> Int { conn.fd }
 
-  # The bound address: "ip:port" (the real port after ":0"), or the path.
-  pub def local_addr -> Str { local }
+  # The bound address as text: "ip:port" (the real port after ":0"), or the
+  # path.
+  pub def local_addr -> Str { conn.local_addr }
+  pub def local_net_addr -> Addr? { conn.local_net_addr }
 
   # Waits for a datagram and reads it into p (the rest of a longer one is
-  # lost, as in Go): its length and the sender's address ("" for an unbound
-  # unixgram sender).
-  pub def read_from!(p: [Byte]) -> ~(Int, Str) {
-    from = zeros(64)
-    loop {
-      f = fd
-      fail closed_error("read", local) if f < 0
-      n = alx_sock_recvfrom(f, p, p.size, from)
-      return (n, cstr_of(from)) if n >= 0
-      code = -n
-      if code == c("EAGAIN") {
-        w = alx_fd_wait(f, 1)
-        fail net_error("read", local, "recvfrom", -w) if w < 0
-      } else {
-        fail net_error("read", local, "recvfrom", code) if code != c("EINTR")
-      }
-    }
+  # lost, as in Go): its length and the sender's address (none for an
+  # unnamed unixgram sender).
+  pub def read_from!(p: [Byte]) -> ~(Int, Addr?) {
+    c = conn
+    c.~read_from!(p)
   }
 
-  # Closes the socket (every copy) and wakes tasks waiting in read_from!.
+  pub def write_to!(p: [Byte], addr: Addr) -> ~Int {
+    c = conn
+    c.~write_to!(p, addr)
+  }
+
   pub def close! -> ~Unit {
-    f = fdv.swap(-1)
-    fail closed_error("close", local) if f < 0
-    r = alx_fd_close(f)
-    fail net_error("close", local, "close", -r) if r < 0
+    c = conn
+    c.~close!
+  }
+
+  pub def set_deadline(t: time.Time) -> ~Unit { conn.~set_deadline(t) }
+  pub def set_read_deadline(t: time.Time) -> ~Unit { conn.~set_read_deadline(t) }
+  pub def set_write_deadline(t: time.Time) -> ~Unit { conn.~set_write_deadline(t) }
+}
+
+# ------------------------------------------------------------------- Buffers
+
+# Bytes to write as one, with writev(2) where possible in Go (Go's
+# Buffers). An io.Reader; `write_to!` writes them all to w and empties them.
+pub struct Buffers {
+  st: [BuffersState]
+
+  pub def bufs -> [[Byte]] { st[0].v }
+  pub def size -> Int { st[0].v.size }
+
+  # Go's WriteTo: writes every buffer to w; the bytes written.
+  pub def write_to![W](w: W) -> ~Int {
+    n = 0
+    ww = w
+    if W is Conn {
+      # Go writes a Conn's buffers with writev; here small buffers are
+      # gathered (up to 64 KiB) into one write, big ones written as they are.
+      batch: [Byte] = []
+      for b in st[0].v.dup {
+        if b.size >= 65536 || batch.size + b.size > 65536 {
+          if batch.size > 0 {
+            r = ww.write!(batch)
+            if r.err? {
+              consume(n)
+              ~r
+            }
+            n += r.unwrap
+            batch = []
+          }
+        }
+        if b.size >= 65536 {
+          r = ww.write!(b)
+          if r.err? {
+            consume(n)
+            ~r
+          }
+          n += r.unwrap
+        } else {
+          batch = batch + b
+        }
+      }
+      if batch.size > 0 {
+        r = ww.write!(batch)
+        if r.err? {
+          consume(n)
+          ~r
+        }
+        n += r.unwrap
+      }
+      consume(n)
+      return n
+    }
+    for b in st[0].v.dup {
+      r = ww.write!(b)
+      if r.err? {
+        n += r.unwrap_or(0)
+        consume(n)
+        ~r
+      }
+      n += r.unwrap
+    }
+    consume(n)
+    n
+  }
+
+  # Go's Read: copies from the buffers, consuming them; 0 when empty.
+  pub def read!(p: [Byte]) -> ~Int {
+    n = 0
+    q = p
+    while q.size > 0 && st[0].v.size > 0 {
+      n0 = copy(q, st[0].v[0])
+      consume(n0)
+      q = q[n0...q.size]
+      n += n0
+    }
+    n
+  }
+
+  def consume(n0: Int) {
+    n = n0
+    v = st[0].v
+    while v.size > 0 {
+      ln0 = v[0].size
+      if ln0 > n {
+        v[0] = v[0][n...ln0]
+        cell = st
+        cell[0] = BuffersState.new(v: v)
+        return
+      }
+      n -= ln0
+      v = v[1...v.size]
+    }
+    cell = st
+    cell[0] = BuffersState.new(v: v)
   }
 }
 
-# A datagram socket bound to addr: "host:port" over "udp" (":0" picks a
-# port), a path over "unixgram". Go's ListenPacket.
-pub def listen_packet(network: Str, addr: Str) -> ~PacketConn {
-  kind = sock_kind(network)
-  fail unknown_network("listen", network, addr) if kind != 1 && kind != 3
-  fd = ~open_sock("listen", network, kind, addr, true)
-  b = zeros(64)
-  local = addr_of(b, alx_sock_local_addr(fd, b))
-  local = addr if kind == 3
-  PacketConn.new(fdv: Atomic.new(fd), local: local)
+struct BuffersState {
+  v: [[Byte]]
 }
+
+pub def buffers(v: [[Byte]]) -> Buffers { Buffers.new(st: [BuffersState.new(v: v)]) }

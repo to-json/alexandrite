@@ -1,0 +1,253 @@
+# Network interfaces (Go's interface.go, over getifaddrs(3) in the runtime).
+
+extern def alx_net_interfaces(out: [Byte], n: Int) -> Int
+extern def alx_net_multicast_addrs(out: [Byte], n: Int) -> Int
+
+# Go's Flags.
+pub FLAG_UP = 1
+pub FLAG_BROADCAST = 2
+pub FLAG_LOOPBACK = 4
+pub FLAG_POINT_TO_POINT = 8
+pub FLAG_MULTICAST = 16
+pub FLAG_RUNNING = 32
+
+# Interface flags (Go's `type Flags uint`): FLAG_UP | FLAG_LOOPBACK ...
+pub struct Flags {
+  v: Int
+
+  pub def bits -> Int { v }
+
+  # "up|loopback|multicast"; "0" for none.
+  pub def to_s -> Str {
+    names = ["up", "broadcast", "loopback", "pointtopoint", "multicast", "running"]
+    s = ""
+    for i in 0...names.size {
+      if v & (1 << i) != 0 {
+        s = s + "|" if s != ""
+        s = s + names[i]
+      }
+    }
+    s == "" ? "0" : s
+  }
+
+  pub def string -> Str { to_s }
+
+  pub def has?(f: Int) -> Bool { v & f != 0 }
+}
+
+pub def flags(v: Int) -> Flags { Flags.new(v: v) }
+
+# A network interface: its index (from 1), MTU, name ("lo0", "eth0"),
+# hardware address and flags.
+pub struct Interface {
+  index: Int
+  mtu: Int
+  name: Str
+  hardware_addr: HardwareAddr
+  flags: Flags
+
+  # The interface's unicast addresses (IPNets). Go's Addrs.
+  pub def addrs -> ~[Addr] {
+    tab = ~interface_lines
+    interface_addr_table(tab, index)
+  }
+
+  # The multicast group addresses joined on the interface (IPAddrs). Go's
+  # MulticastAddrs.
+  pub def multicast_addrs -> ~[Addr] { ~interface_multicast_addr_table(self) }
+}
+
+def route_error(err: Str) -> NetError { wrap_error("route", "ip+net", "", "", "", err) }
+
+# The runtime's interface listing, as lines.
+def interface_lines -> ~[Str] {
+  size = 16384
+  loop {
+    buf: [Byte] = [0; size]
+    n = alx_net_interfaces(buf, size)
+    if n == -c("ENOBUFS") && size < 1 << 22 {
+      size = size * 4
+      next
+    }
+    fail op_error("route", "ip+net", "", "", "getifaddrs", -n) if n < 0
+    out: [Str] = []
+    for l in Str.from_bytes(buf[0...n]).split("\n") {
+      out << l if l.size > 0
+    }
+    return out
+  }
+}
+
+def interfaces_of(lines: [Str]) -> [Interface] {
+  out: [Interface] = []
+  for l in lines {
+    next if l[0] == 64
+    f = l.split(" ")
+    next if f.size < 4
+    idx, _, _ = dtoi(f[0])
+    fl, _, _ = dtoi(f[2])
+    mtu, _, _ = dtoi(f[3])
+    hw: [Byte] = []
+    if f.size > 4 && f[4].size > 0 {
+      h = f[4]
+      i = 0
+      while i + 1 < h.size {
+        b = xtoi2(h[i...i + 2], 0) || 0
+        hw << b
+        i += 2
+      }
+    }
+    out << Interface.new(index: idx, mtu: mtu, name: f[1], hardware_addr: HardwareAddr.new(b: hw), flags: Flags.new(v: fl))
+  }
+  out
+}
+
+# The addresses of interface `index` (0: all), as IPNets.
+def interface_addr_table(lines: [Str], index: Int) -> [Addr] {
+  out: [Addr] = []
+  for l in lines {
+    next if l[0] != 64
+    f = l[1...l.size].split(" ")
+    next if f.size < 4
+    idx, _, _ = dtoi(f[0])
+    next if index != 0 && idx != index
+    fam, _, _ = dtoi(f[1])
+    h = f[2]
+    b: [Byte] = []
+    i = 0
+    while i + 1 < h.size {
+      b << (xtoi2(h[i...i + 2], 0) || 0)
+      i += 2
+    }
+    ones, _, _ = dtoi(f[3])
+    m = cidr_mask(ones, fam == 4 ? 32 : 128) || IPMask.new
+    ip = IP.new(b: b)
+    out << IPNet.new(ip: ip.to16 || ip, mask: m)
+  }
+  out
+}
+
+# The interface table, read fresh (Go's zoneCache refreshes at most once a
+# minute; this reads it each time); [] if it can't be read.
+def interface_table -> [Interface] {
+  r = interface_lines
+  return [] if r.err?
+  interfaces_of(r.unwrap)
+}
+
+# The system's network interfaces. Go's Interfaces.
+pub def interfaces -> ~[Interface] {
+  r = interface_lines
+  if e = r.err {
+    fail wrap_any("route", "ip+net", "", "", e)
+  }
+  interfaces_of(r.unwrap)
+}
+
+# The system's unicast interface addresses (IPNets). Go's InterfaceAddrs.
+pub def interface_addrs -> ~[Addr] {
+  r = interface_lines
+  if e = r.err {
+    fail wrap_any("route", "ip+net", "", "", e)
+  }
+  interface_addr_table(r.unwrap, 0)
+}
+
+# The interface with this index. Go's InterfaceByIndex.
+pub def interface_by_index(index: Int) -> ~Interface {
+  fail route_error("invalid network interface index") if index <= 0
+  ift = ~interfaces
+  for ifi in ift {
+    return ifi if ifi.index == index
+  }
+  fail route_error("no such network interface")
+}
+
+# The interface with this name. Go's InterfaceByName.
+pub def interface_by_name(name: Str) -> ~Interface {
+  fail route_error("invalid network interface name") if name == ""
+  ift = ~interfaces
+  for ifi in ift {
+    return ifi if ifi.name == name
+  }
+  fail route_error("no such network interface")
+}
+
+# Go's interfaceMulticastAddrTable: getifmaddrs(3) on the BSDs and macOS,
+# /proc/net/igmp and igmp6 on Linux.
+def interface_multicast_addr_table(ifi: Interface) -> ~[Addr] {
+  size = 16384
+  buf: [Byte] = [0; size]
+  n = alx_net_multicast_addrs(buf, size)
+  if n == -c("ENOSYS") {
+    return parse_proc_net_igmp("/proc/net/igmp", ifi) + parse_proc_net_igmp6("/proc/net/igmp6", ifi)
+  }
+  fail op_error("route", "ip+net", "", "", "getifmaddrs", -n) if n < 0
+  out: [Addr] = []
+  for l in Str.from_bytes(buf[0...n]).split("\n") {
+    f = l.split(" ")
+    next if f.size < 3
+    idx, _, _ = dtoi(f[0])
+    next if idx != ifi.index
+    h = f[2]
+    b: [Byte] = []
+    i = 0
+    while i + 1 < h.size {
+      b << (xtoi2(h[i...i + 2], 0) || 0)
+      i += 2
+    }
+    ip = IP.new(b: b)
+    out << IPAddr.new(ip: ip.to16 || ip)
+  }
+  out
+}
+
+# Go's parseProcNetIGMP.
+def parse_proc_net_igmp(path: Str, ifi: Interface) -> [Addr] {
+  out: [Addr] = []
+  r = open_lines(path)
+  return out if r.err?
+  fd = r.unwrap
+  fd.read_line
+  name = ""
+  loop {
+    l = fd.read_line || break
+    f = split_at_bytes(l, " :\r\t\n")
+    next if f.size < 4
+    if l[0] != 32 && l[0] != 9 {
+      name = f[1]
+    } elsif f[0].size == 8 && name == ifi.name {
+      b: [Byte] = [0, 0, 0, 0]
+      i = 0
+      while i + 1 < f[0].size {
+        b[i / 2] = xtoi2(f[0][i...i + 2], 0) || 0
+        i += 2
+      }
+      # The kernel prints the address as a host-order (little-endian) word.
+      out << IPAddr.new(ip: ipv4(b[3], b[2], b[1], b[0]))
+    }
+  }
+  out
+}
+
+# Go's parseProcNetIGMP6.
+def parse_proc_net_igmp6(path: Str, ifi: Interface) -> [Addr] {
+  out: [Addr] = []
+  r = open_lines(path)
+  return out if r.err?
+  fd = r.unwrap
+  loop {
+    l = fd.read_line || break
+    f = split_at_bytes(l, " \r\t\n")
+    next if f.size < 6
+    next unless f[1] == ifi.name
+    b: [Byte] = [0; 16]
+    i = 0
+    while i + 1 < f[2].size && i < 32 {
+      b[i / 2] = xtoi2(f[2][i...i + 2], 0) || 0
+      i += 2
+    }
+    out << IPAddr.new(ip: IP.new(b: b))
+  }
+  out
+}

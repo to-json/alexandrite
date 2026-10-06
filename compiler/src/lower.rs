@@ -995,17 +995,22 @@ impl<'a> Lw<'a> {
             return;
         }
         let saved = self.defers.clone();
+        let saved_iters = self.iter_open.clone();
         for depth in (from..saved.len()).rev() {
             // Errors in deferred code clean up only the outer blocks; a scope
             // inside it sits below an empty level (so its own cleanup never
             // looks like leaving the function, which frees the frame).
             self.defers.truncate(depth);
             self.defers.push(vec![]);
+            // The iteration regions of the levels being left are freed once,
+            // below: the deferred code's own scopes must not free them too.
+            self.iter_open.retain(|(d, _, _)| *d < depth);
             for e in saved[depth].iter().rev() {
                 self.stmt(&TStmt::Expr(e.clone()));
             }
         }
         self.defers = saved;
+        self.iter_open = saved_iters;
         // Leaving loops: their iteration regions go (innermost first).
         for (d, r, sv) in self.iter_open.clone().into_iter().rev() {
             if d >= from {
@@ -4437,10 +4442,17 @@ impl<'a> Lw<'a> {
                         let out = self.tmp(self.lty(&e.ty));
                         self.emit(LS::Set(out, val));
                         let b = blk.unwrap();
-                        let body = self.sub(|lw| {
+                        let mut body = self.sub(|lw| {
                             let v = lw.inline_block(b, &[err], &[], None);
                             lw.emit(LS::Set(out, v));
                         });
+                        // A block that ends in `fail` / `return` / a panic has
+                        // no value: nothing to store after the jump (the C and
+                        // Rust backends reject a Unit stored into the result).
+                        let n = body.len();
+                        if n >= 2 && matches!(body[n - 2], LS::Return(_) | LS::Die(_) | LS::Panic(..) | LS::Break(_) | LS::Continue(_)) {
+                            body.pop();
+                        }
                         self.emit(LS::If(LE::Not(Box::new(ok)), body, vec![]));
                         LE::Var(out)
                     }

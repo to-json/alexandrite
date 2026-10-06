@@ -1,0 +1,919 @@
+# Go's message_test.go, translated. The allocation tests and benchmarks
+# run their bodies as plain tests; TestNoFmt (Go's import check) has no
+# counterpart; FuzzUnpackPack runs its seed corpus.
+
+# A type from the IANA private-use range.
+PRIVATE_USE_TYPE: U16 = 65362
+
+# Whether e is present and equal to want (Go's `err == want`).
+def is_err(e: Error?, want: Error) -> Bool {
+  if x = e {
+    return x == want
+  }
+  false
+}
+
+# Go's checkErrorPrefix: e is a nested error with context prefix.
+def check_error_prefix(e: Error?, prefix: Str) -> Bool {
+  if x = e {
+    case x {
+      DnsMessageError.Nested(s, _) => return s == prefix
+      _ => return false
+    }
+  }
+  false
+}
+
+# A length-prefixed label.
+def lbl(s: Str) -> [Byte] { [s.size.as_u8] + s.bytes }
+
+def must_edns0_resource_header(l: Int, extrc: U16, dnssec_ok: Bool) -> ResourceHeader {
+  h = ResourceHeader.new(class: CLASS_INET)
+  h.set_edns0!(l, extrc, dnssec_ok).unwrap
+  h
+}
+
+def rh(name: Name, t: U16) -> ResourceHeader { ResourceHeader.new(name: name, type: t, class: CLASS_INET) }
+
+# Zeroes the resource headers' lengths: Go's Pack writes them back into the
+# message it packs, alx's doesn't, so an unpacked message is compared with
+# its lengths cleared.
+def without_lengths(m: Message) -> Message {
+  out = m
+  out.answers = clear_lengths(m.answers)
+  out.authorities = clear_lengths(m.authorities)
+  out.additionals = clear_lengths(m.additionals)
+  out
+}
+
+def clear_lengths(rs: [Resource]) -> [Resource] {
+  rs.map { |r|
+    x = r
+    x.header.length = 0
+    x
+  }
+}
+
+def a4(a: Int, b: Int, c: Int, d: Int) -> [Byte; 4] {
+  out: [Byte; 4] = [a.as_u8, b.as_u8, c.as_u8, d.as_u8]
+  out
+}
+
+def small_test_msg -> Message {
+  name = must_new_name("example.com.")
+  Message.new(
+    header: Header.new(response: true, authoritative: true),
+    questions: [Question.new(name: name, type: TYPE_A, class: CLASS_INET)],
+    answers: [Resource.new(header: rh(name, TYPE_A), body: ResourceBody.A(a: a4(127, 0, 0, 1)))],
+    authorities: [Resource.new(header: rh(name, TYPE_A), body: ResourceBody.A(a: a4(127, 0, 0, 1)))],
+    additionals: [Resource.new(header: rh(name, TYPE_A), body: ResourceBody.A(a: a4(127, 0, 0, 1)))],
+  )
+}
+
+def large_test_msg -> Message {
+  name = must_new_name("foo.bar.example.com.")
+  aaaa: [Byte; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+  unknown: [Byte] = [42, 0, 43, 44]
+  cookie: [Byte] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]
+  Message.new(
+    header: Header.new(response: true, authoritative: true),
+    questions: [Question.new(name: name, type: TYPE_A, class: CLASS_INET)],
+    answers: [
+      Resource.new(header: rh(name, TYPE_A), body: ResourceBody.A(a: a4(127, 0, 0, 1))),
+      Resource.new(header: rh(name, TYPE_A), body: ResourceBody.A(a: a4(127, 0, 0, 2))),
+      Resource.new(header: rh(name, TYPE_AAAA), body: ResourceBody.AAAA(aaaa: aaaa)),
+      Resource.new(header: rh(name, TYPE_CNAME), body: ResourceBody.CNAME(cname: must_new_name("alias.example.com."))),
+      Resource.new(
+        header: rh(name, TYPE_SOA),
+        body: SOAResource.new(
+          ns: must_new_name("ns1.example.com."),
+          mbox: must_new_name("mb.example.com."),
+          serial: 1,
+          refresh: 2,
+          retry: 3,
+          expire: 4,
+          min_ttl: 5,
+        ).body,
+      ),
+      Resource.new(header: rh(name, TYPE_PTR), body: ResourceBody.PTR(ptr: must_new_name("ptr.example.com."))),
+      Resource.new(header: rh(name, TYPE_MX), body: ResourceBody.MX(pref: 7, mx: must_new_name("mx.example.com."))),
+      Resource.new(header: rh(name, TYPE_SRV), body: ResourceBody.SRV(priority: 8, weight: 9, port: 11, target: must_new_name("srv.example.com."))),
+      Resource.new(header: rh(name, PRIVATE_USE_TYPE), body: ResourceBody.Unknown(type: PRIVATE_USE_TYPE, data: unknown)),
+    ],
+    authorities: [
+      Resource.new(header: rh(name, TYPE_NS), body: ResourceBody.NS(ns: must_new_name("ns1.example.com."))),
+      Resource.new(header: rh(name, TYPE_NS), body: ResourceBody.NS(ns: must_new_name("ns2.example.com."))),
+    ],
+    additionals: [
+      Resource.new(header: rh(name, TYPE_TXT), body: ResourceBody.TXT(txt: ["So Long, and Thanks for All the Fish"])),
+      Resource.new(header: rh(name, TYPE_TXT), body: ResourceBody.TXT(txt: ["Hamster Huey and the Gooey Kablooie"])),
+      Resource.new(
+        header: must_edns0_resource_header(4096, 0xfe0 | RCODE_SUCCESS, false),
+        body: ResourceBody.OPT(options: [Option.new(code: 10, data: cookie)]),
+      ),
+    ],
+  )
+}
+
+def build_test_svcb_msg -> Message {
+  svcb = SVCBResource.new(
+    priority: 1,
+    target: must_new_name("svc.example.com."),
+    params: [SVCParam.new(key: SVC_PARAM_ALPN, value: "h2".bytes)],
+  )
+  port: [Byte] = [0x01, 0xbb]
+  hint: [Byte] = [192, 0, 2, 1]
+  https = HTTPSResource.new(
+    priority: 2,
+    target: must_new_name("https.example.com."),
+    params: [SVCParam.new(key: SVC_PARAM_PORT, value: port), SVCParam.new(key: SVC_PARAM_IPV4_HINT, value: hint)],
+  )
+  name = must_new_name("foo.bar.example.com.")
+  Message.new(
+    answers: [
+      Resource.new(header: rh(name, TYPE_SVCB), body: svcb.body),
+      Resource.new(header: rh(name, TYPE_HTTPS), body: https.body),
+    ],
+  )
+}
+
+test "PrintPaddedUint8" {
+  tests: [(U8, Str)] = [
+    (0, "000"),
+    (1, "001"),
+    (9, "009"),
+    (10, "010"),
+    (99, "099"),
+    (100, "100"),
+    (124, "124"),
+    (104, "104"),
+    (120, "120"),
+    (255, "255"),
+  ]
+  for t in tests {
+    assert_eq print_padded_u8(t[0]), t[1]
+  }
+}
+
+test "PrintUint8Bytes" {
+  tests: [U8] = [0, 1, 9, 10, 99, 100, 124, 104, 120, 255]
+  for t in tests {
+    empty: [Byte] = []
+    assert_eq Str.from_bytes(print_u8_bytes(empty, t)), "#{t}"
+  }
+}
+
+test "PrintUint16" {
+  tests: [U16] = [65535, 0, 1, 10, 100, 1000, 10000, 324, 304, 320]
+  for t in tests {
+    assert_eq print_u16(t), "#{t}"
+  }
+}
+
+test "PrintUint32" {
+  tests: [U32] = [4294967295, 65535, 0, 1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000, 324, 304, 320]
+  for t in tests {
+    assert_eq print_u32(t), "#{t}"
+  }
+}
+
+test "NameString" {
+  name = must_new_name("foo")
+  assert_eq name.to_s, "foo"
+  assert_eq "#{name.to_s}", "foo"
+}
+
+test "QuestionPackUnpack" {
+  want = Question.new(name: must_new_name("."), type: TYPE_A, class: CLASS_INET)
+  init: [Byte] = [0]
+  comp: Map[Str, U16]? = {}
+  buf = want.pack_q(init, comp, 1).unwrap
+  p = Parser.new(st: [ParserState.new(msg: buf, section: SECTION_QUESTIONS, off: 1)])
+  p.st[0].header.questions = 1
+  got = p.question!.unwrap
+  assert_eq p.st[0].off, buf.size
+  assert got == want, "got from Parser.question! = #{got.go_string}, want = #{want.go_string}"
+}
+
+test "Name" {
+  tests = ["", ".", "google..com", "google.com", "google..com.", "google.com.", ".google.com.", "www..google.com.", "www.google.com."]
+  for t in tests {
+    n = new_name(t).unwrap
+    assert_eq n.to_s, t
+  }
+}
+
+test "NameWithDotsUnpack" {
+  name = lbl("w.w") + lbl("go") + lbl("dev") + [0.as_u8]
+  n = Name.new()
+  assert is_err(n.unpack_name!(name, 0).err, DnsMessageError.InvalidName)
+}
+
+test "NamePackUnpack" {
+  suffix = ".go.dev."
+  long_dns_prefix = "verylongdomainlabel." * 20
+  tests: [(Str, Error?)] = [
+    ("", DnsMessageError.NonCanonicalName),
+    (".", none),
+    ("google..com", DnsMessageError.NonCanonicalName),
+    ("google.com", DnsMessageError.NonCanonicalName),
+    ("google..com.", DnsMessageError.ZeroSegLen),
+    ("google.com.", none),
+    (".google.com.", DnsMessageError.ZeroSegLen),
+    ("www..google.com.", DnsMessageError.ZeroSegLen),
+    ("www.google.com.", none),
+    # 254-byte name, with the ending dot.
+    (long_dns_prefix[0...254 - suffix.size] + suffix, none),
+    # 255 bytes.
+    (long_dns_prefix[0...255 - suffix.size] + suffix, DnsMessageError.NameTooLong),
+  ]
+  for t in tests {
+    input = must_new_name(t[0])
+    comp: Map[Str, U16]? = {}
+    empty: [Byte] = []
+    r = input.pack_name(empty, comp, 0)
+    if want = t[1] {
+      assert is_err(r.err, want), "#{t[0]}.pack: got #{r.err}, want #{want}"
+      next
+    }
+    buf = r.unwrap
+    got = Name.new()
+    n = got.unpack_name!(buf, 0).unwrap
+    assert_eq n, buf.size
+    assert got == input, "unpacking packing of #{t[0]}: got #{got.go_string}"
+  }
+}
+
+test "NameUnpackTooLongName" {
+  suffix = lbl("go") + lbl("dev") + [0.as_u8]
+  label = "longdnslabel"
+  long_dns_prefix: [Byte] = []
+  for _i in 0...18 {
+    long_dns_prefix = long_dns_prefix + lbl(label)
+  }
+  prep_name = ->(length: Int) -> [Byte] {
+    missing = length - (long_dns_prefix.size + suffix.size + 1)
+    long_dns_prefix + [missing.as_u8] + ("a" * missing).bytes + suffix
+  }
+  tests: [([Byte], Error?)] = [
+    (prep_name.call(255), none),
+    (prep_name.call(256), DnsMessageError.NameTooLong),
+    # Too large to be valid: an error while unpacking.
+    (prep_name.call(300), DnsMessageError.NameTooLong),
+  ]
+  for t in tests {
+    got = Name.new()
+    r = got.unpack_name!(t[0], 0)
+    if want = t[1] {
+      assert is_err(r.err, want), "got #{r.err}"
+    } else {
+      assert r.ok?, "got #{r.err}"
+    }
+  }
+}
+
+test "HeaderUnpackError" {
+  wants = ["id", "bits", "questions", "answers", "authorities", "additionals"]
+  buf: [Byte] = []
+  h = WireHeader.new()
+  for want in wants {
+    r = h.unpack_wire!(buf, 0)
+    assert check_error_prefix(r.err, want), "header.unpack([#{buf.size}]byte, 0) = #{r.err}, want #{want}"
+    buf << 0
+    buf << 0
+  }
+}
+
+test "ParserStart" {
+  want = "unpacking header"
+  p = Parser.new()
+  for _i in 0...2 {
+    empty: [Byte] = []
+    r = p.start!(empty)
+    assert check_error_prefix(r.err, want), "got Parser.start!([]) = #{r.err}, want #{want}"
+  }
+}
+
+test "ResourceNotStarted" {
+  p = Parser.new()
+  assert is_err(p.cname_resource!.err, ERR_NOT_STARTED)
+  assert is_err(p.mx_resource!.err, ERR_NOT_STARTED)
+  assert is_err(p.ns_resource!.err, ERR_NOT_STARTED)
+  assert is_err(p.ptr_resource!.err, ERR_NOT_STARTED)
+  assert is_err(p.soa_resource!.err, ERR_NOT_STARTED)
+  assert is_err(p.txt_resource!.err, ERR_NOT_STARTED)
+  assert is_err(p.srv_resource!.err, ERR_NOT_STARTED)
+  assert is_err(p.a_resource!.err, ERR_NOT_STARTED)
+  assert is_err(p.aaaa_resource!.err, ERR_NOT_STARTED)
+  assert is_err(p.unknown_resource!.err, ERR_NOT_STARTED)
+  # Also on a parser whose state exists but hasn't read a header.
+  q = Parser.new(st: [ParserState.new()])
+  assert is_err(q.cname_resource!.err, ERR_NOT_STARTED)
+  assert is_err(q.unknown_resource!.err, ERR_NOT_STARTED)
+  assert is_err(q.opt_resource!.err, ERR_NOT_STARTED)
+}
+
+def dns_pack_unpack_wants -> [Message] {
+  [
+    Message.new(questions: [Question.new(name: must_new_name("."), type: TYPE_AAAA, class: CLASS_INET)]),
+    large_test_msg(),
+  ]
+}
+
+test "DNSPackUnpack" {
+  wants = dns_pack_unpack_wants() + [build_test_svcb_msg()]
+  for i in 0...wants.size {
+    want = wants[i]
+    b = want.pack.unwrap
+    got = unpack_message(b).unwrap
+    assert without_lengths(got) == want, "#{i}: Message.pack/unpack roundtrip: got = #{got.go_string}, want = #{want.go_string}"
+    # The method form.
+    m = Message.new()
+    m.unpack!(b).unwrap
+    assert m == got
+  }
+}
+
+test "DNSAppendPackUnpack" {
+  for want in dns_pack_unpack_wants() {
+    b: [Byte] = [0, 0]
+    b = want.append_pack(b).unwrap
+    b = b[2...b.size]
+    got = unpack_message(b).unwrap
+    assert without_lengths(got) == want, "Message.append_pack/unpack roundtrip: got = #{got.go_string}"
+  }
+}
+
+test "SkipAll" {
+  buf = large_test_msg().pack.unwrap
+  p = Parser.new()
+  p.start!(buf).unwrap
+  for _i in 0...3 {
+    p.skip_all_questions!.unwrap
+  }
+  for _i in 0...3 {
+    p.skip_all_answers!.unwrap
+  }
+  for _i in 0...3 {
+    p.skip_all_authorities!.unwrap
+  }
+  for _i in 0...3 {
+    p.skip_all_additionals!.unwrap
+  }
+}
+
+test "SkipEach" {
+  buf = small_test_msg().pack.unwrap
+  p = Parser.new()
+  p.start!(buf).unwrap
+  p.skip_question!.unwrap
+  assert is_err(p.skip_question!.err, ERR_SECTION_DONE)
+  p.skip_answer!.unwrap
+  assert is_err(p.skip_answer!.err, ERR_SECTION_DONE)
+  p.skip_authority!.unwrap
+  assert is_err(p.skip_authority!.err, ERR_SECTION_DONE)
+  p.skip_additional!.unwrap
+  assert is_err(p.skip_additional!.err, ERR_SECTION_DONE)
+}
+
+test "SkipAfterRead" {
+  buf = small_test_msg().pack.unwrap
+  p = Parser.new()
+  p.start!(buf).unwrap
+  p.question!.unwrap
+  assert is_err(p.skip_question!.err, ERR_SECTION_DONE)
+  p.answer!.unwrap
+  assert is_err(p.skip_answer!.err, ERR_SECTION_DONE)
+  p.authority!.unwrap
+  assert is_err(p.skip_authority!.err, ERR_SECTION_DONE)
+  p.additional!.unwrap
+  assert is_err(p.skip_additional!.err, ERR_SECTION_DONE)
+}
+
+test "SkipNotStarted" {
+  p = Parser.new()
+  assert is_err(p.skip_all_questions!.err, ERR_NOT_STARTED)
+  assert is_err(p.skip_all_answers!.err, ERR_NOT_STARTED)
+  assert is_err(p.skip_all_authorities!.err, ERR_NOT_STARTED)
+  assert is_err(p.skip_all_additionals!.err, ERR_NOT_STARTED)
+}
+
+test "TooManyRecords" {
+  recs = 65536
+  q: [Question] = [Question.new(); recs]
+  r: [Resource] = [Resource.new(); recs]
+  assert is_err(Message.new(questions: q).pack.err, DnsMessageError.TooManyQuestions)
+  assert is_err(Message.new(answers: r).pack.err, DnsMessageError.TooManyAnswers)
+  assert is_err(Message.new(authorities: r).pack.err, DnsMessageError.TooManyAuthorities)
+  assert is_err(Message.new(additionals: r).pack.err, DnsMessageError.TooManyAdditionals)
+}
+
+test "VeryLongTxt" {
+  want = Resource.new(
+    header: rh(must_new_name("foo.bar.example.com."), TYPE_TXT),
+    body: ResourceBody.TXT(txt: ["", "", "foo bar", "", "www.example.com", "www.example.com.", "." * 255]),
+  )
+  comp: Map[Str, U16]? = {}
+  empty: [Byte] = []
+  buf = want.pack_res(empty, comp, 0).unwrap
+  got = Resource.new()
+  off = got.header.unpack_rh!(buf, 0).unwrap
+  body, n = unpack_resource_body(buf, off, got.header).unwrap
+  got.body = body
+  assert_eq n, buf.size
+  got.header.length = 0
+  assert got == want, "Resource.pack/unpack roundtrip: got = #{got.go_string}"
+}
+
+test "TooLongTxt" {
+  rb = TXTResource.new(txt: ["." * 256])
+  empty: [Byte] = []
+  assert is_err(rb.pack_rdata(empty).err, DnsMessageError.StringTooLong)
+}
+
+test "StartAppends" {
+  buf: [Byte] = [4, 44]
+  want_buf: [Byte] = [4, 44]
+  b = new_builder(buf, Header.new())
+  b.enable_compression!
+  out = b.finish!.unwrap
+  assert_eq out.size, HEADER_LEN + 2
+  assert out[0...2] == want_buf
+}
+
+test "StartError" {
+  envs: [(Int, Error)] = [(SECTION_NOT_STARTED, ERR_NOT_STARTED), (SECTION_DONE, ERR_SECTION_DONE)]
+  for env in envs {
+    b = Builder.new(section: env[0])
+    assert is_err(b.start_questions!.err, env[1])
+    b = Builder.new(section: env[0])
+    assert is_err(b.start_answers!.err, env[1])
+    b = Builder.new(section: env[0])
+    assert is_err(b.start_authorities!.err, env[1])
+    b = Builder.new(section: env[0])
+    assert is_err(b.start_additionals!.err, env[1])
+  }
+}
+
+test "BuilderResourceError" {
+  envs: [(Int, Error)] = [
+    (SECTION_NOT_STARTED, ERR_NOT_STARTED),
+    (SECTION_HEADER, ERR_NOT_STARTED),
+    (SECTION_QUESTIONS, ERR_NOT_STARTED),
+    (SECTION_DONE, ERR_SECTION_DONE),
+  ]
+  h = ResourceHeader.new()
+  for env in envs {
+    sec = env[0]
+    want = env[1]
+    b = Builder.new(section: sec)
+    assert is_err(b.a_resource!(h, AResource.new()).err, want)
+    b = Builder.new(section: sec)
+    assert is_err(b.aaaa_resource!(h, AAAAResource.new()).err, want)
+    b = Builder.new(section: sec)
+    assert is_err(b.cname_resource!(h, CNAMEResource.new()).err, want)
+    b = Builder.new(section: sec)
+    assert is_err(b.https_resource!(h, HTTPSResource.new()).err, want)
+    b = Builder.new(section: sec)
+    assert is_err(b.mx_resource!(h, MXResource.new()).err, want)
+    b = Builder.new(section: sec)
+    assert is_err(b.ns_resource!(h, NSResource.new()).err, want)
+    b = Builder.new(section: sec)
+    assert is_err(b.opt_resource!(h, OPTResource.new()).err, want)
+    b = Builder.new(section: sec)
+    assert is_err(b.ptr_resource!(h, PTRResource.new()).err, want)
+    b = Builder.new(section: sec)
+    assert is_err(b.soa_resource!(h, SOAResource.new()).err, want)
+    b = Builder.new(section: sec)
+    assert is_err(b.srv_resource!(h, SRVResource.new()).err, want)
+    b = Builder.new(section: sec)
+    assert is_err(b.svcb_resource!(h, SVCBResource.new()).err, want)
+    b = Builder.new(section: sec)
+    assert is_err(b.txt_resource!(h, TXTResource.new()).err, want)
+    b = Builder.new(section: sec)
+    assert is_err(b.unknown_resource!(h, UnknownResource.new()).err, want)
+  }
+}
+
+test "FinishError" {
+  b = Builder.new()
+  assert is_err(b.finish!.err, ERR_NOT_STARTED)
+}
+
+# Adds r with the Builder method for its body's type.
+def build_resource(b: Builder, r: Resource) -> ~Builder {
+  bb = b
+  h = r.header
+  case r.body {
+    A(a) => bb.~a_resource!(h, AResource.new(a: a))
+    NS(ns) => bb.~ns_resource!(h, NSResource.new(ns: ns))
+    CNAME(c) => bb.~cname_resource!(h, CNAMEResource.new(cname: c))
+    SOA(ns, mb, s, rf, rt, ex, mt) => bb.~soa_resource!(h, soa(ns, mb, s, rf, rt, ex, mt))
+    PTR(p) => bb.~ptr_resource!(h, PTRResource.new(ptr: p))
+    MX(p, mx) => bb.~mx_resource!(h, MXResource.new(pref: p, mx: mx))
+    TXT(t) => bb.~txt_resource!(h, TXTResource.new(txt: t))
+    AAAA(a) => bb.~aaaa_resource!(h, AAAAResource.new(aaaa: a))
+    SRV(p, w, port, t) => bb.~srv_resource!(h, SRVResource.new(priority: p, weight: w, port: port, target: t))
+    SVCB(p, t, ps) => bb.~svcb_resource!(h, SVCBResource.new(priority: p, target: t, params: ps))
+    HTTPS(p, t, ps) => bb.~https_resource!(h, HTTPSResource.new(priority: p, target: t, params: ps))
+    OPT(o) => bb.~opt_resource!(h, OPTResource.new(options: o))
+    Unknown(t, d) => bb.~unknown_resource!(h, UnknownResource.new(type: t, data: d))
+    Nil => fail DnsMessageError.NilResourceBody
+  }
+  bb
+}
+
+test "Builder" {
+  msg = large_test_msg()
+  want = msg.pack.unwrap
+  empty: [Byte] = []
+  b = new_builder(empty, msg.header)
+  b.enable_compression!
+  b.start_questions!.unwrap
+  for q in msg.questions {
+    b.question!(q).unwrap
+  }
+  b.start_answers!.unwrap
+  for a in msg.answers {
+    b = build_resource(b, a).unwrap
+  }
+  b.start_authorities!.unwrap
+  for a in msg.authorities {
+    b = build_resource(b, a).unwrap
+  }
+  b.start_additionals!.unwrap
+  for a in msg.additionals {
+    b = build_resource(b, a).unwrap
+  }
+  got = b.finish!.unwrap
+  assert got == want, "got from Builder.finish! = #{got}\nwant = #{want}"
+}
+
+test "ResourcePack" {
+  q = [Question.new(name: must_new_name("."), type: TYPE_AAAA, class: CLASS_INET)]
+  m1 = Message.new(questions: q, answers: [Resource.new()])
+  e1 = m1.pack.err
+  assert is_err(e1, DnsMessageError.Nested(s: "packing Answer", err: DnsMessageError.NilResourceBody)), "got #{e1}"
+  m2 = Message.new(questions: q, authorities: [Resource.new(body: ResourceBody.NS(ns: Name.new()))])
+  e2 = m2.pack.err
+  want2 = DnsMessageError.Nested(
+    s: "packing Authority",
+    err: DnsMessageError.Nested(s: "ResourceHeader", err: DnsMessageError.Nested(s: "Name", err: DnsMessageError.NonCanonicalName)),
+  )
+  assert is_err(e2, want2), "got #{e2}"
+  assert_eq e2?.message || "", "packing Authority: ResourceHeader: Name: name is not in canonical format (it must end with a .)"
+  q3 = [Question.new(name: must_new_name("."), type: TYPE_A, class: CLASS_INET)]
+  m3 = Message.new(questions: q3, additionals: [Resource.new()])
+  assert is_err(m3.pack.err, DnsMessageError.Nested(s: "packing Additional", err: DnsMessageError.NilResourceBody))
+}
+
+test "ResourcePackLength" {
+  r = Resource.new(header: rh(must_new_name("."), TYPE_A), body: ResourceBody.A(a: a4(127, 0, 0, 2)))
+  empty: [Byte] = []
+  hb = r.header.pack_rh(empty, none, 0).unwrap
+  buf = r.pack_res(empty, none, 0).unwrap
+  hdr = ResourceHeader.new()
+  hdr.unpack_rh!(buf, 0).unwrap
+  assert_eq hdr.length.to_i, buf.size - hb.size
+}
+
+test "OptionPackUnpack" {
+  w1: [Byte] = [0x00, 0x00, 0x29, 0x10, 0x00, 0xfe, 0x00, 0x80, 0x00, 0x00, 0x00]
+  m1 = Message.new(
+    header: Header.new(rcode: RCODE_FORMAT_ERROR),
+    questions: [Question.new(name: must_new_name("."), type: TYPE_A, class: CLASS_INET)],
+    additionals: [Resource.new(header: must_edns0_resource_header(4096, 0xfe0 | RCODE_FORMAT_ERROR, true), body: ResourceBody.OPT(options: []))],
+  )
+  w2: [Byte] = [
+    0x00, 0x00, 0x29, 0x10, 0x00, 0xff, 0x00, 0x00,
+    0x00, 0x00, 0x0c, 0x00, 0x0c, 0x00, 0x02, 0x00,
+    0x00, 0x00, 0x0b, 0x00, 0x02, 0x12, 0x34,
+  ]
+  d12: [Byte] = [0x00, 0x00]
+  d11: [Byte] = [0x12, 0x34]
+  m2 = Message.new(
+    header: Header.new(rcode: RCODE_SERVER_FAILURE),
+    questions: [Question.new(name: must_new_name("."), type: TYPE_AAAA, class: CLASS_INET)],
+    additionals: [
+      Resource.new(
+        header: must_edns0_resource_header(4096, 0xff0 | RCODE_SERVER_FAILURE, false),
+        body: ResourceBody.OPT(options: [Option.new(code: 12, data: d12), Option.new(code: 11, data: d11)]),
+      ),
+    ],
+  )
+  # Multiple OPT resources in a message are invalid, but needed for
+  # protocol conformance testing.
+  w3: [Byte] = [
+    0x00, 0x00, 0x29, 0x10, 0x00, 0xff, 0x00, 0x00,
+    0x00, 0x00, 0x06, 0x00, 0x0b, 0x00, 0x02, 0x12,
+    0x34, 0x00, 0x00, 0x29, 0x10, 0x00, 0xff, 0x00,
+    0x00, 0x00, 0x00, 0x06, 0x00, 0x0c, 0x00, 0x02,
+    0x00, 0x00,
+  ]
+  m3 = Message.new(
+    header: Header.new(rcode: RCODE_NAME_ERROR),
+    questions: [Question.new(name: must_new_name("."), type: TYPE_AAAA, class: CLASS_INET)],
+    additionals: [
+      Resource.new(
+        header: must_edns0_resource_header(4096, 0xff0 | RCODE_NAME_ERROR, false),
+        body: ResourceBody.OPT(options: [Option.new(code: 11, data: d11)]),
+      ),
+      Resource.new(
+        header: must_edns0_resource_header(4096, 0xff0 | RCODE_NAME_ERROR, false),
+        body: ResourceBody.OPT(options: [Option.new(code: 12, data: d12)]),
+      ),
+    ],
+  )
+  tests: [(Str, [Byte], Message)] = [
+    ("without EDNS(0) options", w1, m1),
+    ("with EDNS(0) options", w2, m2),
+    ("with multiple OPT resources", w3, m3),
+  ]
+  for t in tests {
+    w = t[2].pack.unwrap
+    tail = w[w.size - t[1].size...w.size]
+    assert tail == t[1], "got Message.pack for #{t[0]} = #{tail}, want #{t[1]}"
+    m = unpack_message(w).unwrap
+    assert without_lengths(m).additionals == t[2].additionals, "roundtrip for #{t[0]}: got #{m.go_string}"
+  }
+  # The EDNS(0) header accessors.
+  h = must_edns0_resource_header(4096, 0xfe0 | RCODE_FORMAT_ERROR, true)
+  assert h.dnssec_allowed?
+  assert_eq h.extended_rcode(RCODE_FORMAT_ERROR), 0xfe0 | RCODE_FORMAT_ERROR
+  h2 = must_edns0_resource_header(4096, 0xff0 | RCODE_SERVER_FAILURE, false)
+  assert !h2.dnssec_allowed?
+  assert_eq h2.extended_rcode(RCODE_SERVER_FAILURE), 0xff0 | RCODE_SERVER_FAILURE
+}
+
+def small_test_msg_with_unknown_resource -> Message {
+  data: [Byte] = [42, 42, 42, 42]
+  Message.new(
+    answers: [
+      Resource.new(
+        header: ResourceHeader.new(name: must_new_name("."), type: PRIVATE_USE_TYPE, class: CLASS_INET, ttl: 123),
+        # Packing uses the body's type, so it must match the header's.
+        body: ResourceBody.Unknown(type: PRIVATE_USE_TYPE, data: data),
+      ),
+    ],
+  )
+}
+
+test "UnknownPackUnpack" {
+  msg = small_test_msg_with_unknown_resource()
+  packed = msg.pack.unwrap
+  received = unpack_message(packed).unwrap
+  assert_eq received.answers.size, 1
+  case received.answers[0].body {
+    Unknown(_, _) => {}
+    _ => assert false, "parsed a #{received.answers[0].body.go_string}, wanted an UnknownResource"
+  }
+  assert received.answers[0].body == msg.answers[0].body
+}
+
+test "ParseUnknownResource" {
+  msg = small_test_msg_with_unknown_resource()
+  packed = msg.pack.unwrap
+  p = Parser.new()
+  p.start!(packed).unwrap
+  p.all_questions!.unwrap
+  parsed_header = p.answer_header!.unwrap
+  want_header = msg.answers[0].header
+  parsed_header.length = 0
+  assert parsed_header == want_header, "parsed header #{parsed_header.go_string}"
+  parsed = p.unknown_resource!.unwrap
+  assert parsed.body == msg.answers[0].body
+  # The parser is left consistent.
+  assert is_err(p.answer_header!.err, ERR_SECTION_DONE)
+  p.all_authorities!.unwrap
+  p.all_additionals!.unwrap
+}
+
+test "GoString" {
+  want = <<~'EOS'
+    dnsmessage.Message{Header: dnsmessage.Header{ID: 0, Response: true, OpCode: 0, Authoritative: true, Truncated: false, RecursionDesired: false, RecursionAvailable: false, AuthenticData: false, CheckingDisabled: false, RCode: dnsmessage.RCodeSuccess}, Questions: []dnsmessage.Question{dnsmessage.Question{Name: dnsmessage.MustNewName("foo.bar.example.com."), Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET}}, Answers: []dnsmessage.Resource{dnsmessage.Resource{Header: dnsmessage.ResourceHeader{Name: dnsmessage.MustNewName("foo.bar.example.com."), Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET, TTL: 0, Length: 0}, Body: &dnsmessage.AResource{A: [4]byte{127, 0, 0, 1}}}, dnsmessage.Resource{Header: dnsmessage.ResourceHeader{Name: dnsmessage.MustNewName("foo.bar.example.com."), Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET, TTL: 0, Length: 0}, Body: &dnsmessage.AResource{A: [4]byte{127, 0, 0, 2}}}, dnsmessage.Resource{Header: dnsmessage.ResourceHeader{Name: dnsmessage.MustNewName("foo.bar.example.com."), Type: dnsmessage.TypeAAAA, Class: dnsmessage.ClassINET, TTL: 0, Length: 0}, Body: &dnsmessage.AAAAResource{AAAA: [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}}}, dnsmessage.Resource{Header: dnsmessage.ResourceHeader{Name: dnsmessage.MustNewName("foo.bar.example.com."), Type: dnsmessage.TypeCNAME, Class: dnsmessage.ClassINET, TTL: 0, Length: 0}, Body: &dnsmessage.CNAMEResource{CNAME: dnsmessage.MustNewName("alias.example.com.")}}, dnsmessage.Resource{Header: dnsmessage.ResourceHeader{Name: dnsmessage.MustNewName("foo.bar.example.com."), Type: dnsmessage.TypeSOA, Class: dnsmessage.ClassINET, TTL: 0, Length: 0}, Body: &dnsmessage.SOAResource{NS: dnsmessage.MustNewName("ns1.example.com."), MBox: dnsmessage.MustNewName("mb.example.com."), Serial: 1, Refresh: 2, Retry: 3, Expire: 4, MinTTL: 5}}, dnsmessage.Resource{Header: dnsmessage.ResourceHeader{Name: dnsmessage.MustNewName("foo.bar.example.com."), Type: dnsmessage.TypePTR, Class: dnsmessage.ClassINET, TTL: 0, Length: 0}, Body: &dnsmessage.PTRResource{PTR: dnsmessage.MustNewName("ptr.example.com.")}}, dnsmessage.Resource{Header: dnsmessage.ResourceHeader{Name: dnsmessage.MustNewName("foo.bar.example.com."), Type: dnsmessage.TypeMX, Class: dnsmessage.ClassINET, TTL: 0, Length: 0}, Body: &dnsmessage.MXResource{Pref: 7, MX: dnsmessage.MustNewName("mx.example.com.")}}, dnsmessage.Resource{Header: dnsmessage.ResourceHeader{Name: dnsmessage.MustNewName("foo.bar.example.com."), Type: dnsmessage.TypeSRV, Class: dnsmessage.ClassINET, TTL: 0, Length: 0}, Body: &dnsmessage.SRVResource{Priority: 8, Weight: 9, Port: 11, Target: dnsmessage.MustNewName("srv.example.com.")}}, dnsmessage.Resource{Header: dnsmessage.ResourceHeader{Name: dnsmessage.MustNewName("foo.bar.example.com."), Type: 65362, Class: dnsmessage.ClassINET, TTL: 0, Length: 0}, Body: &dnsmessage.UnknownResource{Type: 65362, Data: []byte{42, 0, 43, 44}}}}, Authorities: []dnsmessage.Resource{dnsmessage.Resource{Header: dnsmessage.ResourceHeader{Name: dnsmessage.MustNewName("foo.bar.example.com."), Type: dnsmessage.TypeNS, Class: dnsmessage.ClassINET, TTL: 0, Length: 0}, Body: &dnsmessage.NSResource{NS: dnsmessage.MustNewName("ns1.example.com.")}}, dnsmessage.Resource{Header: dnsmessage.ResourceHeader{Name: dnsmessage.MustNewName("foo.bar.example.com."), Type: dnsmessage.TypeNS, Class: dnsmessage.ClassINET, TTL: 0, Length: 0}, Body: &dnsmessage.NSResource{NS: dnsmessage.MustNewName("ns2.example.com.")}}}, Additionals: []dnsmessage.Resource{dnsmessage.Resource{Header: dnsmessage.ResourceHeader{Name: dnsmessage.MustNewName("foo.bar.example.com."), Type: dnsmessage.TypeTXT, Class: dnsmessage.ClassINET, TTL: 0, Length: 0}, Body: &dnsmessage.TXTResource{TXT: []string{"So Long\x2c and Thanks for All the Fish"}}}, dnsmessage.Resource{Header: dnsmessage.ResourceHeader{Name: dnsmessage.MustNewName("foo.bar.example.com."), Type: dnsmessage.TypeTXT, Class: dnsmessage.ClassINET, TTL: 0, Length: 0}, Body: &dnsmessage.TXTResource{TXT: []string{"Hamster Huey and the Gooey Kablooie"}}}, dnsmessage.Resource{Header: dnsmessage.ResourceHeader{Name: dnsmessage.MustNewName("."), Type: dnsmessage.TypeOPT, Class: 4096, TTL: 4261412864, Length: 0}, Body: &dnsmessage.OPTResource{Options: []dnsmessage.Option{dnsmessage.Option{Code: 10, Data: []byte{1, 35, 69, 103, 137, 171, 205, 239}}}}}}}
+  EOS
+  got = large_test_msg().go_string
+  assert_eq got, want.strip
+}
+
+def parsing_setup -> [Byte] {
+  name = must_new_name("foo.bar.example.com.")
+  aaaa: [Byte; 16] = [0; 16]
+  msg = Message.new(
+    header: Header.new(response: true, authoritative: true),
+    questions: [Question.new(name: name, type: TYPE_A, class: CLASS_INET)],
+    answers: [
+      Resource.new(header: ResourceHeader.new(name: name, class: CLASS_INET), body: ResourceBody.A(a: a4(0, 0, 0, 0))),
+      Resource.new(header: ResourceHeader.new(name: name, class: CLASS_INET), body: ResourceBody.AAAA(aaaa: aaaa)),
+      Resource.new(header: ResourceHeader.new(name: name, class: CLASS_INET), body: ResourceBody.CNAME(cname: name)),
+      Resource.new(header: ResourceHeader.new(name: name, class: CLASS_INET), body: ResourceBody.NS(ns: name)),
+    ],
+  )
+  msg.pack.unwrap
+}
+
+# Go's benchmarkParsing: reads every answer with its typed reader.
+def parse_all(buf: [Byte]) -> ~Int {
+  p = Parser.new()
+  p.~start!(buf)
+  loop {
+    r = p.question!
+    if e = r.err {
+      break if section_done?(e)
+      fail e
+    }
+  }
+  n = 0
+  loop {
+    hr = p.answer_header!
+    if e = hr.err {
+      break if section_done?(e)
+      fail e
+    }
+    h = hr.unwrap
+    case h.type {
+      TYPE_A => p.~a_resource!
+      TYPE_AAAA => p.~aaaa_resource!
+      TYPE_CNAME => p.~cname_resource!
+      TYPE_NS => p.~ns_resource!
+      TYPE_SVCB => p.~svcb_resource!
+      TYPE_HTTPS => p.~https_resource!
+      TYPE_OPT => p.~opt_resource!
+      _ => fail Failure.Msg("got unknown type: #{h.type}")
+    }
+    n += 1
+  }
+  n
+}
+
+test "Parsing" {
+  buf = parsing_setup()
+  for _i in 0...10 {
+    assert_eq parse_all(buf).unwrap, 4
+  }
+}
+
+# Go's benchmarkBuilding.
+def build_all(name: Name, buf: [Byte]) -> ~[Byte] {
+  bld = new_builder(buf, Header.new(response: true, authoritative: true))
+  bld.~start_questions!
+  bld.~question!(Question.new(name: name, type: TYPE_A, class: CLASS_INET))
+  hdr = ResourceHeader.new(name: name, class: CLASS_INET)
+  bld.~start_answers!
+  bld.~a_resource!(hdr, AResource.new())
+  bld.~aaaa_resource!(hdr, AAAAResource.new())
+  bld.~cname_resource!(hdr, CNAMEResource.new(cname: name))
+  bld.~ns_resource!(hdr, NSResource.new(ns: name))
+  extrc = 0xfe0 | RCODE_NOT_IMPLEMENTED
+  hdr.~set_edns0!(4096, extrc, true)
+  bld.~opt_resource!(hdr, OPTResource.new())
+  bld.~finish!
+}
+
+test "Building" {
+  name = must_new_name("foo.bar.example.com.")
+  empty: [Byte] = []
+  for _i in 0...10 {
+    out = build_all(name, empty).unwrap
+    p = Parser.new()
+    h = p.start!(out).unwrap
+    assert h.response && h.authoritative
+    assert_eq p.all_questions!.unwrap.size, 1
+    assert_eq p.all_answers!.unwrap.size, 5
+  }
+}
+
+test "UnpackPack seeds" {
+  # FuzzUnpackPack's seed corpus.
+  for msg in [small_test_msg(), large_test_msg()] {
+    seed = msg.pack.unwrap
+    m = unpack_message(seed).unwrap
+    packed = m.pack.unwrap
+    m2 = unpack_message(packed).unwrap
+    assert m == m2, "unpack(msg) is not equal to unpack(pack(unpack(msg)))"
+  }
+}
+
+test "ParseResourceHeaderMultipleTimes" {
+  msg = Message.new(
+    header: Header.new(response: true, authoritative: true),
+    answers: [Resource.new(header: rh(must_new_name("go.dev."), TYPE_A), body: ResourceBody.A(a: a4(127, 0, 0, 1)))],
+    authorities: [Resource.new(header: rh(must_new_name("go.dev."), TYPE_A), body: ResourceBody.A(a: a4(127, 0, 0, 1)))],
+  )
+  raw = msg.pack.unwrap
+  p = Parser.new()
+  p.start!(raw).unwrap
+  p.skip_all_questions!.unwrap
+  hdr1 = p.answer_header!.unwrap
+  hdr2 = p.answer_header!.unwrap
+  assert hdr1 == hdr2, "answer_header! called twice without reading the data returned different headers"
+  p.a_resource!.unwrap
+  assert is_err(p.answer_header!.err, ERR_SECTION_DONE)
+  hdr3 = p.authority_header!.unwrap
+  hdr4 = p.authority_header!.unwrap
+  assert hdr3 == hdr4, "authority_header! called twice without reading the data returned different headers"
+  p.a_resource!.unwrap
+  assert is_err(p.authority_header!.err, ERR_SECTION_DONE)
+}
+
+test "ParseDifferentResourceHeadersWithoutParsingRData" {
+  raw = small_test_msg().pack.unwrap
+  p = Parser.new()
+  p.start!(raw).unwrap
+  p.skip_all_questions!.unwrap
+  p.answer_header!.unwrap
+  assert p.additional_header!.err?, "p.additional_header! unexpected success"
+  assert p.authority_header!.err?, "p.authority_header! unexpected success"
+}
+
+test "ParseWrongSection" {
+  raw = small_test_msg().pack.unwrap
+  p = Parser.new()
+  p.start!(raw).unwrap
+  p.skip_all_questions!.unwrap
+  p.answer_header!.unwrap
+  assert p.authority_header!.err?, "p.authority_header!: unexpected success in Answer section"
+  assert p.skip_authority!.err?, "p.skip_authority!: unexpected success in Answer section"
+  assert p.skip_all_authorities!.err?, "p.skip_all_authorities!: unexpected success in Answer section"
+}
+
+def go_dev_expect -> [Byte] {
+  h: [Byte] = [0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0]
+  q2: [Byte] = [0xC0, 12, 0, 0, 0, 0]
+  h + lbl("go") + lbl("dev") + [0.as_u8, 0.as_u8, 0.as_u8, 0.as_u8, 0.as_u8] + q2
+}
+
+test "BuilderNameCompressionWithNonZeroedName" {
+  empty: [Byte] = []
+  b = new_builder(empty, Header.new())
+  b.enable_compression!
+  b.start_questions!.unwrap
+  name = must_new_name("go.dev.")
+  b.question!(Question.new(name: name)).unwrap
+  # A byte past the name's length doesn't affect compression.
+  name.data[name.length.to_i] = 49
+  b.question!(Question.new(name: name)).unwrap
+  msg = b.finish!.unwrap
+  assert msg == go_dev_expect(), "b.finish! = #{msg}"
+}
+
+test "BuilderCompressionInAppendMode" {
+  max_ptr = 0x3FFF
+  buf: [Byte] = [0; max_ptr]
+  b = new_builder(buf, Header.new())
+  b.enable_compression!
+  b.start_questions!.unwrap
+  b.question!(Question.new(name: must_new_name("go.dev."))).unwrap
+  b.question!(Question.new(name: must_new_name("go.dev."))).unwrap
+  msg = b.finish!.unwrap
+  assert msg[max_ptr...msg.size] == go_dev_expect(), "msg[max_ptr...] = #{msg[max_ptr...msg.size]}"
+}
+
+test "InvalidMessages" {
+  invalid_svcb: [Byte] = [
+    0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x41, 0x00, 0x01,
+    0x00, 0x00, 0x41, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x64,
+    0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x5d,
+  ]
+  out_of_order: [Byte] = [
+    0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x41, 0x00, 0x01,
+    0x00, 0x00, 0x41, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x0b,
+    0x00, 0x01, 0x00,
+    0x00, 0x02, 0x00, 0x00,
+    0x00, 0x01, 0x00, 0x00,
+  ]
+  duplicate: [Byte] = [
+    0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x41, 0x00, 0x01,
+    0x00, 0x00, 0x41, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x0b,
+    0x00, 0x01, 0x00,
+    0x00, 0x01, 0x00, 0x00,
+    0x00, 0x01, 0x00, 0x00,
+  ]
+  tests: [(Str, [Byte])] = [("invalid SVCB", invalid_svcb), ("SVCB out-of-order keys", out_of_order), ("SVCB duplicate keys", duplicate)]
+  for t in tests {
+    p = Parser.new()
+    failed = !p.start!(t[1]).ok? || !p.all_questions!.ok? || !p.all_answers!.ok?
+    assert failed, "#{t[0]}: successfully parsed message: want error"
+  }
+}
+
+test "type and class strings" {
+  assert_eq type_string(TYPE_A), "TypeA"
+  assert_eq type_string(PRIVATE_USE_TYPE), "65362"
+  assert_eq type_go_string(TYPE_HTTPS), "dnsmessage.TypeHTTPS"
+  assert_eq class_string(CLASS_ANY), "ClassANY"
+  assert_eq class_go_string(4096), "4096"
+  assert_eq rcode_string(RCODE_NAME_ERROR), "RCodeNameError"
+  assert_eq rcode_go_string(RCODE_REFUSED), "dnsmessage.RCodeRefused"
+  assert_eq rcode_string(9), "9"
+  assert section_done?(ERR_SECTION_DONE)
+  assert !section_done?(ERR_NOT_STARTED)
+  assert not_started?(ERR_NOT_STARTED)
+  assert_eq ERR_SECTION_DONE.message, "parsing/packing of this section has completed"
+}

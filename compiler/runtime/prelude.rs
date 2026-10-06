@@ -688,9 +688,12 @@ mod rt {
         unsafe {
             libc_fcntl(p[0], sysc("F_SETFD"), sysc("FD_CLOEXEC"));
             libc_fcntl(p[1], sysc("F_SETFD"), sysc("FD_CLOEXEC"));
-            if nonblock != 0 {
-                let fl = libc_fcntl(p[0], sysc("F_GETFL"));
-                libc_fcntl(p[0], sysc("F_SETFL"), fl | sysc("O_NONBLOCK"));
+            // nonblock: bit 0 the read end, bit 1 the write end.
+            for (i, bit) in [(0usize, 1i64), (1, 2)] {
+                if nonblock & bit != 0 {
+                    let fl = libc_fcntl(p[i], sysc("F_GETFL"));
+                    libc_fcntl(p[i], sysc("F_SETFL"), fl | sysc("O_NONBLOCK"));
+                }
             }
         }
         let v = [p[0] as i64, p[1] as i64];

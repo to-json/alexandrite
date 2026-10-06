@@ -1,0 +1,50 @@
+# A task waiting on a child process must not block its worker (port-issues
+# #154). Tasks are pinned to the worker they first ran on; the task that runs
+# a child and reads its output (exec's drain: poll), waits for it (wait4) or
+# feeds its stdin (write) used to block that worker in the syscall, so a task
+# pinned to the same worker never ran again. When the child was waiting on
+# that task (the TLS interop tests: a Go server mid-handshake with an alx
+# client), both hung for good.
+#
+# One worker makes the collision certain: the main task parks (sleeps), the
+# worker picks up the exec task, and before the fix it blocked there. The
+# child gives up after 10 s instead of hanging, so the old runtime fails the
+# case rather than hanging it.
+import "os"
+import "os/exec"
+import "strings"
+import "time"
+
+_ = os.setenv("ALX_PROCS", "1") # read when the first task starts
+
+dir = os.mkdir_temp("", "alx-exec-pinned").unwrap
+flag = dir + "/flag"
+# Waits (up to 10 s) for the flag file the main task writes after its sleep.
+script = "i=0; while [ ! -f \"$1\" ]; do i=$((i+1)); if [ $i -gt 200 ]; then echo timeout; exit 3; fi; sleep 0.05; done"
+
+def run_case(name: Str, flag: Str, cmd: exec.Cmd) {
+  _ = os.remove(flag)
+  c = cmd.dup
+  t = spawn {
+    w = spawn { c.~output }
+    time.sleep(time.millisecond * 100) # parks: the worker runs `w`
+    os.write_file(flag, "go".bytes, 0o644).unwrap
+    r = w.wait
+    if out = r.ok {
+      "#{name}: #{out.strip}"
+    } else {
+      "#{name}: failed: #{r.err?.message || ""}"
+    }
+  }
+  puts t.wait.unwrap
+}
+
+# drain: the child's stdout is open while it waits.
+run_case("output", flag, exec.command("sh", ["-c", script + "; echo seen", "sh", flag]))
+# wait4: the child closes its stdout and stderr, then waits.
+run_case("wait", flag, exec.command("sh", ["-c", "echo early; exec >/dev/null 2>&1; " + script, "sh", flag]))
+# stdin: more than a pipe holds, read only once the flag is there.
+fed = exec.command("sh", ["-c", script + "; wc -c | tr -d ' '", "sh", flag])
+fed.stdin = strings.repeat("x", 300000)
+run_case("stdin", flag, fed)
+_ = os.remove_all(dir)

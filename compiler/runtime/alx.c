@@ -2282,6 +2282,62 @@ int64_t alx_sys_pipe(uint8_t *out, int64_t nonblock) {
     return 0;
 }
 
+/* Like alx_sys_spawn, with the program's path apart from argv[0] (no $PATH
+ * search: a relative path is relative to this process's directory) and any
+ * number of descriptors: fds (nfds native-endian int64s) become the child's
+ * 0, 1, 2, 3, ...; -1 is inherited for 0-2 and closed above (Go's
+ * ProcAttr.Files / Cmd.ExtraFiles). The pid, or -errno. */
+int64_t alx_sys_spawn2(const char *path, const uint8_t *argv, int64_t argc, const uint8_t *env, int64_t envc,
+                       const char *dir, const uint8_t *fdblob, int64_t nfds) {
+    char **av = nul_list(argv, argc);
+    char **ev = envc >= 0 ? nul_list(env, envc) : environ;
+    if (!av || !ev) return -ENOMEM;
+    int64_t *fds = malloc(sizeof(int64_t) * (size_t)(nfds ? nfds : 1));
+    int *hi = malloc(sizeof(int) * (size_t)(nfds ? nfds : 1));
+    if (!fds || !hi) return -ENOMEM;
+    memcpy(fds, fdblob, sizeof(int64_t) * (size_t)nfds);
+    /* Each source first moves above every target number, so dup2(src, i)
+     * never overwrites a source still needed (and src == i still clears
+     * close-on-exec). */
+    int floor = (int)nfds + 3;
+    int rc = 0;
+    for (int64_t i = 0; i < nfds; i++) {
+        hi[i] = -1;
+        if (fds[i] >= 0) {
+            hi[i] = fcntl((int)fds[i], F_DUPFD_CLOEXEC, floor);
+            if (hi[i] < 0) { rc = errno; break; }
+        }
+    }
+    pid_t pid = 0;
+    if (!rc) {
+        posix_spawn_file_actions_t fa;
+        posix_spawn_file_actions_init(&fa);
+        for (int64_t i = 0; i < nfds; i++) {
+            if (hi[i] >= 0) posix_spawn_file_actions_adddup2(&fa, hi[i], (int)i);
+            else if (i > 2) posix_spawn_file_actions_addclose(&fa, (int)i);
+        }
+        if (dir && dir[0]) posix_spawn_file_actions_addchdir_np(&fa, dir);
+        posix_spawnattr_t at;
+        posix_spawnattr_init(&at);
+        sigset_t none, all;
+        sigemptyset(&none);
+        sigfillset(&all);
+        posix_spawnattr_setsigmask(&at, &none);
+        posix_spawnattr_setsigdefault(&at, &all);
+        posix_spawnattr_setflags(&at, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF);
+        rc = posix_spawn(&pid, path, &fa, &at, av, ev);
+        posix_spawn_file_actions_destroy(&fa);
+        posix_spawnattr_destroy(&at);
+    }
+    for (int64_t i = 0; i < nfds; i++)
+        if (hi[i] >= 0) close(hi[i]);
+    free(hi);
+    free(fds);
+    free(av);
+    if (envc >= 0) free(ev);
+    return rc ? -(int64_t)rc : (int64_t)pid;
+}
+
 int64_t alx_sys_exec(const uint8_t *argv, int64_t argc, const uint8_t *env, int64_t envc, const char *dir,
                      int64_t fd0, int64_t fd1, int64_t fd2) {
     char **av = nul_list(argv, argc);
@@ -2739,6 +2795,35 @@ int64_t alx_sys_poll2(int64_t a, int64_t b) {
     while (poll(pf, 2, -1) < 0)
         if (errno != EINTR) return -errno;
     return 0;
+}
+
+/* Wait until one of n descriptors is ready: blob holds n (fd, mode) int64
+ * pairs, mode 1 read / 2 write (negative fds are skipped). A task parks on
+ * the poller; a plain thread poll(2)s. 0 or -errno. */
+int64_t alx_sys_polln(const uint8_t *blob, int64_t n) {
+    int *fds = malloc(sizeof(int) * (size_t)(n ? n : 1));
+    int *modes = malloc(sizeof(int) * (size_t)(n ? n : 1));
+    if (!fds || !modes) alx_panic("out of memory", "runtime");
+    for (int64_t i = 0; i < n; i++) {
+        int64_t v[2];
+        memcpy(v, blob + 16 * i, 16);
+        fds[i] = (int)v[0];
+        modes[i] = (int)v[1];
+    }
+    int64_t r = 0;
+    if (tl_task) {
+        r = fd_wait_task(fds, modes, (int)n);
+    } else {
+        struct pollfd *pf = calloc((size_t)(n ? n : 1), sizeof *pf);
+        if (!pf) alx_panic("out of memory", "runtime");
+        for (int64_t i = 0; i < n; i++) { pf[i].fd = fds[i]; pf[i].events = modes[i] == 1 ? POLLIN : POLLOUT; }
+        while (poll(pf, (nfds_t)n, -1) < 0)
+            if (errno != EINTR) { r = -errno; break; }
+        free(pf);
+    }
+    free(fds);
+    free(modes);
+    return r;
 }
 
 /* wait4(2) from a task: a helper thread blocks in it while the task parks

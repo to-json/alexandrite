@@ -691,6 +691,69 @@ mod rt {
         unsafe { std::ptr::copy_nonoverlapping(v.as_ptr() as *const u8, out, 40) };
         0
     }
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn shim_alx_sys_spawn2(path: *const std::ffi::c_char, argv: *mut u8, argc: i64, env: *mut u8, envc: i64, dir: *const std::ffi::c_char, fdblob: *mut u8, nfds: i64) -> i64 {
+        use std::os::unix::process::CommandExt;
+        let av = unsafe { nul_list(argv, argc) };
+        let mut cmd = std::process::Command::new(cpath(path));
+        if let Some(a0) = av.first() {
+            cmd.arg0(a0);
+        }
+        if av.len() > 1 {
+            cmd.args(&av[1..]);
+        }
+        if envc >= 0 {
+            cmd.env_clear();
+            for kv in unsafe { nul_list(env, envc) } {
+                let kv = kv.to_string_lossy().into_owned();
+                let (k, v) = kv.split_once('=').unwrap_or((&kv, ""));
+                cmd.env(k, v);
+            }
+        }
+        let d = cpath(dir);
+        if !d.as_os_str().is_empty() {
+            cmd.current_dir(d);
+        }
+        let mut fds = vec![0i64; nfds.max(0) as usize];
+        unsafe { std::ptr::copy_nonoverlapping(fdblob, fds.as_mut_ptr() as *mut u8, fds.len() * 8) };
+        let get = |i: usize| fds.get(i).copied().unwrap_or(-1);
+        let (i0, i1, i2) = match (child_stdio(get(0)), child_stdio(get(1)), child_stdio(get(2))) {
+            (Ok(a), Ok(b), Ok(c)) => (a, b, c),
+            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => return e,
+        };
+        cmd.stdin(i0).stdout(i1).stderr(i2);
+        // Descriptors 3 and up: duplicates above every target, moved into place
+        // in the child.
+        let mut extra: Vec<(i32, i32)> = vec![];
+        for (i, &fd) in fds.iter().enumerate().skip(3) {
+            if fd >= 0 {
+                let d = unsafe { libc_fcntl(fd as i32, sysc("F_DUPFD_CLOEXEC"), (nfds + 3) as i32) };
+                if d < 0 {
+                    return neg_errno(&std::io::Error::last_os_error());
+                }
+                extra.push((d, i as i32));
+            }
+        }
+        let moves = extra.clone();
+        unsafe {
+            cmd.pre_exec(move || {
+                for &(d, i) in &moves {
+                    if dup2(d, i) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+        let r = match cmd.spawn() {
+            Ok(c) => c.id() as i64,
+            Err(e) => neg_errno(&e),
+        };
+        for (d, _) in extra {
+            unsafe { close(d) };
+        }
+        r
+    }
     pub unsafe fn shim_alx_sys_exec(argv: *mut u8, argc: i64, env: *mut u8, envc: i64, dir: *const std::ffi::c_char, fd0: i64, fd1: i64, fd2: i64) -> i64 {
         use std::os::unix::process::CommandExt;
         let av = unsafe { nul_list(argv, argc) };
@@ -740,6 +803,22 @@ mod rt {
     pub unsafe fn shim_alx_sys_poll2(a: i64, b: i64) -> i64 {
         let mut fds = [PollFd { fd: a as i32, events: 1, revents: 0 }, PollFd { fd: b as i32, events: 1, revents: 0 }];
         while unsafe { poll(fds.as_mut_ptr(), 2, -1) } < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::Interrupted {
+                return neg_errno(&e);
+            }
+        }
+        0
+    }
+    pub unsafe fn shim_alx_sys_polln(blob: *mut u8, n: i64) -> i64 {
+        let mut fds: Vec<PollFd> = (0..n.max(0) as usize)
+            .map(|i| {
+                let mut v = [0i64; 2];
+                unsafe { std::ptr::copy_nonoverlapping(blob.add(16 * i), v.as_mut_ptr() as *mut u8, 16) };
+                PollFd { fd: v[0] as i32, events: if v[1] == 1 { 1 } else { 4 }, revents: 0 }
+            })
+            .collect();
+        while unsafe { poll(fds.as_mut_ptr(), fds.len() as std::ffi::c_ulong, -1) } < 0 {
             let e = std::io::Error::last_os_error();
             if e.kind() != std::io::ErrorKind::Interrupted {
                 return neg_errno(&e);
@@ -1732,6 +1811,14 @@ mod rt {
     /// An atomic cell handle.
     #[derive(Clone, Default)]
     pub struct AlxAtomic(Arc<std::sync::atomic::AtomicI64>);
+    // `==` on a value holding an Atomic (an os.File, a Timer) compares the
+    // handle: copies of one are equal, as in the C backend.
+    impl PartialEq for AlxAtomic {
+        fn eq(&self, o: &Self) -> bool {
+            Arc::ptr_eq(&self.0, &o.0)
+        }
+    }
+    impl Eq for AlxAtomic {}
     impl AlxAtomic {
         pub fn new(v: i64) -> Self {
             AlxAtomic(Arc::new(std::sync::atomic::AtomicI64::new(v)))

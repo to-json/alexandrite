@@ -1,0 +1,404 @@
+#![test(external)]
+# Go's strings_test.go: the test functions that aren't plain tables, and the
+# helpers the translated tables (strings_tables_test.alx) call. Like Go's
+# (package strings_test), these are external tests (S11).
+#
+# Not translated: the AllocsPerRun checks (TestIndexRune's, TestReplace's),
+# Map's no-copy identity check (unsafe.StringData), the benchmarks, and
+# FuzzReplace's random inputs (its seed corpus, Go's ReplaceTests, is checked
+# against the fuzz test's reference implementation below).
+
+import "bytes"
+import "io"
+import "strings"
+import "unicode"
+
+# ---------------------------------------------------------------- helpers
+
+def runes_str(rs: [Rune]) -> Str {
+  b = strings.new_builder
+  for r in rs { b.write_rune!(r) }
+  b.string
+}
+
+#[track_caller]
+def check_split(s: Str, sep: Str, n: Int, want: [Str]) {
+  a = strings.split_n(s, sep, n)
+  assert a == want, "split_n(#{s}, #{sep}, #{n}) = #{a} at #{caller_location}"
+  assert_eq strings.split_seq(s, sep), want if n < 0
+  return if n == 0
+  assert_eq strings.join(a, sep), s
+  assert_eq strings.split(s, sep), a if n < 0
+}
+
+#[track_caller]
+def check_split_after(s: Str, sep: Str, n: Int, want: [Str]) {
+  a = strings.split_after_n(s, sep, n)
+  assert a == want, "split_after_n(#{s}, #{sep}, #{n}) = #{a} at #{caller_location}"
+  assert_eq strings.split_after_seq(s, sep), want if n < 0
+  assert_eq strings.join(a, ""), s
+  assert_eq strings.split_after(s, sep), a if n < 0
+}
+
+#[track_caller]
+def check_fields(s: Str, want: [Str]) {
+  a = strings.fields(s)
+  assert a == want, "fields(#{s}) = #{a} at #{caller_location}"
+  assert_eq strings.fields_seq(s), want
+}
+
+#[track_caller]
+def check_cut(got: (Str, Str)?, before: Str, after: Str, found: Bool) {
+  if v = got {
+    assert found, "found at #{caller_location}"
+    assert_eq v[0], before
+    assert_eq v[1], after
+  } else {
+    assert !found, "not found at #{caller_location}"
+    assert_eq after, ""
+  }
+}
+
+# cut_prefix / cut_suffix: Go returns (s, false) when absent.
+#[track_caller]
+def check_cut1(got: Str?, rest: Str, found: Bool) {
+  if v = got {
+    assert found, "found at #{caller_location}"
+    assert_eq v, rest
+  } else {
+    assert !found, "not found at #{caller_location}"
+  }
+}
+
+#[track_caller]
+def check_runes(s: Str, want: [Rune], lossy: Bool) {
+  a = s.runes
+  assert a == want, "runes(#{s}) = #{a} at #{caller_location}"
+  assert_eq runes_str(a), s if !lossy
+}
+
+# Go's predicates (TestTrimFunc, TestIndexFunc).
+def is_space_p(r: Rune) -> Bool { unicode.is_space(r) }
+def is_digit_p(r: Rune) -> Bool { unicode.is_digit(r) }
+def is_upper_p(r: Rune) -> Bool { unicode.is_upper(r) }
+def is_valid_rune_p(r: Rune) -> Bool { r != 0xFFFD }
+def not_is_space_p(r: Rune) -> Bool { !unicode.is_space(r) }
+def not_is_digit_p(r: Rune) -> Bool { !unicode.is_digit(r) }
+def not_is_valid_rune_p(r: Rune) -> Bool { r == 0xFFFD }
+
+# ------------------------------------------------------------------ tests
+
+test "LastIndexByte" {
+  tests = [("", "q", -1), ("abcdef", "q", -1), ("abcdefabcdef", "a", 6), ("abcdefabcdef", "f", 11), ("zabcdefabcdef", "z", 0), ("a☺b☻c☹d", "b", 4)]
+  for t in tests {
+    assert_eq strings.last_index_byte(t[0], t[1][0]), t[2]
+  }
+}
+
+def simple_index(s: Str, sep: Str) -> Int {
+  n = sep.size
+  i = n
+  while i <= s.size {
+    return i - n if s[i - n...i] == sep
+    i += 1
+  }
+  -1
+}
+
+test "IndexRandom" {
+  chars = "abcdefghijklmnopqrstuvwxyz0123456789"
+  seed = 1
+  rnd = ->(n: Int) -> Int {
+    seed = (seed * 1103515245 + 12345) % 2147483648
+    seed % n
+  }
+  for _times in 0...10 {
+    str_len = 5 + rnd.call(5)
+    while str_len < 140 {
+      s1: [Byte] = []
+      for _i in 0...str_len { s1 << chars[rnd.call(chars.size)] }
+      s = Str.from_bytes(s1)
+      for i in 0...50 {
+        begin = rnd.call(s.size + 1)
+        e = begin + rnd.call(s.size + 1 - begin)
+        sep = s[begin...e]
+        if i % 4 == 0 {
+          pos = rnd.call(sep.size + 1)
+          sep = sep[0...pos] + "A" + sep[pos...sep.size]
+        }
+        assert_eq strings.index(s, sep), simple_index(s, sep)
+      }
+      str_len += 10
+    }
+  }
+}
+
+test "IndexRune" {
+  bad = "a☺b☻c☹d" + bs([0xe2, 0x98]) + "�" + bs([0xff]) + "�" + bs([0xed, 0xa0, 0x80])
+  tests: [(Str, Rune, Int)] = [
+    ("", 97, -1), ("", 0x263A, -1), ("foo", 0x2639, -1), ("foo", 111, 1), ("foo☺bar", 0x263A, 3),
+    ("foo☺☻☹bar", 0x2639, 9), ("a A x", 65, 2), ("some_text=some_value", 61, 9), ("☺a", 97, 3), ("a☻☺b", 0x263A, 4),
+    # RuneError should match any invalid UTF-8 byte sequence.
+    ("�", 0xFFFD, 0), (bs([0xff]), 0xFFFD, 0), ("☻x�", 0xFFFD, 4), ("☻x" + bs([0xe2, 0x98]), 0xFFFD, 4),
+    ("☻x" + bs([0xe2, 0x98]) + "�", 0xFFFD, 4), ("☻x" + bs([0xe2, 0x98]) + "x", 0xFFFD, 4),
+    # Invalid rune values should never match.
+    (bad, -1, -1), (bad, 0xD800, -1), (bad, 0x110000, -1),
+    # 2 bytes
+    ("ӆ", 0x4C6, 0), ("a", 0x4C6, -1), ("  ӆ", 0x4C6, 2), ("  a", 0x4C6, -1),
+    (strings.repeat("ц", 64) + "ӆ", 0x4C6, 128), (strings.repeat("Ꙁ", 64) + "Ꚁ", 0x4680, -1),
+    # 3 bytes
+    ("Ꚁ", 0xA680, 0), ("a", 0xA680, -1), ("  Ꚁ", 0xA680, 2), ("  a", 0xA680, -1),
+    (strings.repeat("Ꙁ", 64) + "Ꚁ", 0xA680, 192), (strings.repeat("𡋀", 64) + "𡌀", 0x23300, -1),
+    # 4 bytes
+    ("𡌀", 0x21300, 0), ("a", 0x21300, -1), ("  𡌀", 0x21300, 2), ("  a", 0x21300, -1),
+    (strings.repeat("𡋀", 64) + "𡌀", 0x21300, 256), (strings.repeat("𡋀", 64), 0x21300, -1),
+    ("aaaaa\u212A\u212A\u212A\u212A\U000BC104", 0xBC104, 17), ("aaaaa\u212A\u212A\u212A\u212A鄄", 0x9104, 17),
+    ("aa\u212A\u212A\u212A\u212A\u212Aa\U000BC104", 0xBC104, 18), ("aa\u212A\u212A\u212A\u212A\u212Aa鄄", 0x9104, 18),
+  ]
+  for t in tests {
+    assert_eq strings.index_rune(t[0], t[1]), t[2]
+  }
+  haystack = "test" + strings.repeat("𡋀", 32) + "𡌀"
+  assert_eq strings.index_rune(haystack, 115), 2
+  assert_eq strings.index_rune(haystack, 0x21300), 132
+}
+
+def bs(b: [Byte]) -> Str { Str.from_bytes(b) }
+
+def ten_runes(r: Rune) -> Str { runes_str([r; 10]) }
+
+def rot13(r: Rune) -> Rune {
+  return (r - 97 + 13) % 26 + 97 if r >= 97 && r <= 122
+  return (r - 65 + 13) % 26 + 65 if r >= 65 && r <= 90
+  r
+}
+
+test "Map" {
+  a = ten_runes(97)
+  # 1. Grow.
+  assert_eq strings.map(->(_r: Rune) -> Rune { 0x10FFFF }, a), ten_runes(0x10FFFF)
+  # 2. Shrink.
+  assert_eq strings.map(->(_r: Rune) -> Rune { 97 }, ten_runes(0x10FFFF)), a
+  # 3. Rot13.
+  assert_eq strings.map(->(r: Rune) -> Rune { rot13(r) }, "a to zed"), "n gb mrq"
+  # 4. Rot13^2.
+  assert_eq strings.map(->(r: Rune) -> Rune { rot13(r) }, strings.map(->(r: Rune) -> Rune { rot13(r) }, "a to zed")), "a to zed"
+  # 5. Drop.
+  latin = unicode.script("Latin").unwrap
+  drop_not_latin = ->(r: Rune) -> Rune { unicode.is(latin, r) ? r : -1 }
+  assert_eq strings.map(drop_not_latin, "Hello, 세계"), "Hello"
+  # 6. Identity (Go also checks that nothing is copied: no such check here).
+  orig = "Input string that we expect not to be copied."
+  assert_eq strings.map(->(r: Rune) -> Rune { r }, orig), orig
+  # 7. Invalid UTF-8.
+  replace_not_latin = ->(r: Rune) -> Rune { unicode.is(latin, r) ? r : 0xFFFD }
+  assert_eq strings.map(replace_not_latin, "Hello" + bs([0xAD]) + "World"), "Hello�World"
+  # 8. utf8.RuneSelf and utf8.MaxRune encoding.
+  encode = ->(r: Rune) -> Rune {
+    return 0x10FFFF if r == 0x80
+    return 0x80 if r == 0x10FFFF
+    r
+  }
+  s = runes_str([0x80, 0x10FFFF])
+  r = runes_str([0x10FFFF, 0x80])
+  assert_eq strings.map(encode, s), r
+  assert_eq strings.map(encode, r), s
+  # 9. Mapping in the front, middle and back.
+  trim_spaces = ->(r: Rune) -> Rune { unicode.is_space(r) ? -1 : r }
+  assert_eq strings.map(trim_spaces, "   abc    123   "), "abc123"
+}
+
+# Go's TestSpecialCase, with a Turkish special case built here (std/unicode
+# has no TurkishCase yet): Go's unicode.TurkishCase maps İ/i and I/ı.
+struct TurkishCase {
+  def to_upper(r: Rune) -> Rune {
+    return 0x130 if r == 0x69
+    return 0x49 if r == 0x131
+    unicode.to_upper(r)
+  }
+  def to_lower(r: Rune) -> Rune {
+    return 0x69 if r == 0x130
+    return 0x131 if r == 0x49
+    unicode.to_lower(r)
+  }
+  def to_title(r: Rune) -> Rune {
+    return 0x130 if r == 0x69
+    return 0x49 if r == 0x131
+    unicode.to_title(r)
+  }
+}
+
+test "SpecialCase" {
+  lower = "abcçdefgğhıijklmnoöprsştuüvyz"
+  upper = "ABCÇDEFGĞHIİJKLMNOÖPRSŞTUÜVYZ"
+  tc = TurkishCase.new()
+  assert_eq strings.to_upper_special(tc, upper), upper
+  assert_eq strings.to_upper_special(tc, lower), upper
+  assert_eq strings.to_lower_special(tc, lower), lower
+  assert_eq strings.to_lower_special(tc, upper), lower
+  assert_eq strings.to_title_special(tc, "dünyanın ilk borsa yapısı Aizonai kabul edilir"), "DÜNYANIN İLK BORSA YAPISI AİZONAİ KABUL EDİLİR"
+}
+
+test "CaseConsistency" {
+  num_runes = 0x110000
+  b = strings.new_builder
+  i = 0
+  while i < num_runes {
+    b.write_rune!(i.as_i32)
+    i += 1
+  }
+  s = b.string
+  upper = strings.to_upper(s)
+  lower = strings.to_lower(s)
+  assert_eq strings.count(upper, "") - 1, num_runes
+  assert_eq strings.count(lower, "") - 1, num_runes
+  assert strings.to_upper(upper) == upper, "to_upper(upper) consistency"
+  assert strings.to_lower(lower) == lower, "to_lower(lower) consistency"
+}
+
+test "Repeat" {
+  long_string = "a" + zeros(1 << 16) + "z"
+  long_spaces = strings.repeat(" ", 200)
+  tests: [(Str, Str, Int)] = [
+    ("", "", 0), ("", "", 1), ("", "", 2), ("-", "", 0), ("-", "-", 1), ("-", "----------", 10),
+    ("abc ", "abc abc abc ", 3), (" ", " ", 1), ("--", "----", 2), ("===", "======", 2), ("000", "000000000", 3),
+    ("\t\t\t\t", "\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t", 4), (" ", long_spaces, long_spaces.size),
+    ("\x00", zeros(1 << 16), 1 << 16), (long_string, long_string + long_string, 2),
+  ]
+  for t in tests {
+    assert t[1] == strings.repeat(t[0], t[2]), "repeat(#{t[0].size} bytes, #{t[2]})"
+  }
+}
+
+test "RepeatCatchesOverflow" {
+  max_int = 0x7FFF_FFFF_FFFF_FFFF
+  assert_panics("negative") { strings.repeat("--", -2147483647) }
+  assert_eq strings.repeat("", max_int), ""
+  assert_eq strings.repeat("-", 10), "----------"
+  assert_eq strings.repeat("gopher", 0), ""
+  assert_panics("negative") { strings.repeat("-", -1) }
+  assert_panics("negative") { strings.repeat("--", -102) }
+  assert_panics("overflow") { strings.repeat(zeros(255), 72340172838076674) }
+  assert_panics("out of range") { strings.repeat("-", max_int) }
+}
+
+test "ReadByte" {
+  for s in ["", "abcd", "☺☻☹", "1,2,3,4"] {
+    reader = strings.new_reader(s)
+    assert !reader.unread_byte!.ok?, "unreading #{s} at beginning: expected error"
+    res = bytes.new_buffer([])
+    loop {
+      b = reader.read_byte! || break
+      res.write_byte!(b)
+      # unread and read again
+      reader.~unread_byte!
+      b1 = reader.read_byte! || 0
+      assert_eq b1, b
+    }
+    assert_eq res.to_s, s
+  }
+}
+
+test "ReadRune" {
+  for s in ["", "abcd", "☺☻☹", "1,2,3,4"] {
+    reader = strings.new_reader(s)
+    assert !reader.unread_rune!.ok?, "unreading #{s} at beginning: expected error"
+    res = ""
+    loop {
+      rz = reader.read_rune! || break
+      res += runes_str([rz[0]])
+      # unread and read again
+      reader.~unread_rune!
+      rz1 = reader.read_rune! || (0.as_i32, 0)
+      assert_eq rz1[0], rz[0]
+      assert_eq rz1[1], rz[1]
+    }
+    assert_eq res, s
+  }
+}
+
+test "UnreadRuneError" {
+  for k in 0...5 {
+    reader = strings.new_reader("0123456789")
+    assert reader.read_rune!.some?, "read_rune"
+    case k {
+      0 => {
+        b: [Byte] = [0]
+        reader.read!(b)
+      }
+      1 => reader.read_byte!
+      2 => reader.unread_rune!
+      3 => reader.~seek!(0, io.SEEK_CURRENT)
+      _ => reader.~write_to!(bytes.new_buffer([]))
+    }
+    assert !reader.unread_rune!.ok?, "unreading after #{k}: expected error"
+  }
+}
+
+# FuzzReplace's reference implementation, run on its seed corpus (Go's
+# ReplaceTests).
+def different_impl(input: Str, old: Str, new: Str, n0: Int) -> Str {
+  out = strings.new_builder
+  n = n0 < 0 ? 0x7FFF_FFFF_FFFF_FFFF : n0
+  i = 0
+  while i < input.size {
+    if n == 0 {
+      out.write_string!(input[i...input.size])
+      break
+    }
+    if strings.has_prefix(input[i...input.size], old) {
+      out.write_string!(new)
+      i += old.size
+      n -= 1
+      next if old.size != 0
+      break if i == input.size
+    }
+    if old.size == 0 {
+      rd = strings.new_reader(input[i...input.size])
+      rz = rd.read_rune! || (0.as_i32, 1)
+      len = rz[1]
+      out.write_string!(input[i...i + len])
+      i += len
+    } else {
+      out.write_byte!(input[i])
+      i += 1
+    }
+  }
+  out.write_string!(new) if old.size == 0 && n != 0
+  out.string
+}
+
+test "FuzzReplace seeds" {
+  seeds: [(Str, Str, Str, Int)] = [
+    ("hello", "l", "L", 0), ("hello", "l", "L", -1), ("hello", "x", "X", -1), ("", "x", "X", -1),
+    ("radar", "r", "<r>", -1), ("", "", "<>", -1), ("banana", "a", "<>", -1), ("banana", "a", "<>", 1),
+    ("banana", "a", "<>", 1000), ("banana", "an", "<>", -1), ("banana", "ana", "<>", -1), ("banana", "", "<>", -1),
+    ("banana", "", "<>", 10), ("banana", "", "<>", 6), ("banana", "", "<>", 5), ("banana", "", "<>", 1),
+    ("banana", "a", "a", -1), ("banana", "a", "a", 1), ("☺☻☹", "", "<>", -1),
+    # beyond Go's seeds: invalid UTF-8 with an empty old string
+    ("a" + bs([0xff]) + "b" + bs([0xe2, 0x98]), "", "|", -1),
+  ]
+  for t in seeds {
+    assert_eq strings.replace(t[0], t[1], t[2], t[3]), different_impl(t[0], t[1], t[2], t[3])
+  }
+}
+
+test "CutLast" {
+  tests: [(Str, Str, Str, Str, Bool)] = [
+    ("a/b/c", "/", "a/b", "c", true), ("a//b//c", "//", "a//b", "c", true), ("abc", "/", "abc", "", false),
+    ("abc", "", "abc", "", true), ("", "", "", "", true), ("/abc", "/", "", "abc", true), ("abc/", "/", "abc", "", true),
+  ]
+  for t in tests {
+    check_cut(strings.cut_last(t[0], t[1]), t[2], t[3], t[4])
+  }
+}
+
+def no_strs -> [Str] {
+  x: [Str] = []
+  x
+}
+
+def zeros(n: Int) -> Str {
+  b: [Byte] = [0; n]
+  Str.from_bytes(b)
+}

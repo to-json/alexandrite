@@ -1717,7 +1717,8 @@ impl<'a> Parser<'a> {
             } else {
                 loop {
                     // A qualified variant: `PErr.Bad(..)`, `pk.PErr.Bad(..)`. The
-                    // name keeps its type part (`PErr.Bad`), not the package.
+                    // name keeps its type part and package (`pk.PErr.Bad`): two
+                    // packages' error types may share a name (os.FsError, fs.FsError).
                     let mut k = 0;
                     while matches!(self.peek_at(k), Tok::Ident(_) | Tok::Const(_)) && matches!(self.peek_at(k + 1), Tok::Op(".")) {
                         k += 2;
@@ -1743,7 +1744,7 @@ impl<'a> Parser<'a> {
                     let qualified = qualified || pkg_type;
                     if qualified && !pkg_type {
                         for _ in 0..k / 2 {
-                            if let Tok::Const(c) = self.bump().tok {
+                            if let Tok::Const(c) | Tok::Ident(c) = self.bump().tok {
                                 qual.push_str(&c);
                                 qual.push('.');
                             }

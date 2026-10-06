@@ -5,21 +5,115 @@
 # the length return the new slice, as in Go: always use the result,
 # `xs = slices.delete(xs, 1, 3)`.
 #
+#   Go                                   alx
+#   All(s) iter.Seq2[int, E]             all(xs) -> [(Int, T)]
+#   AppendSeq(s, seq) S                  append_seq(xs, seq: [T]) -> [T]
+#   Backward(s) iter.Seq2[int, E]        backward(xs) -> [(Int, T)]
+#   BinarySearch(s, t) (int, bool)       binary_search(xs, t) -> (Int, Bool)
+#   BinarySearchFunc(s, t, cmp)          binary_search_func(xs, t) { |e, t| }
+#   Chunk(s, n) iter.Seq[S]              chunk(xs, n) -> [[T]]
+#   Clip, Clone                          clip, clone
+#   Collect(seq) []E                     collect(seq: [T]) -> [T]
+#   Compact, CompactFunc                 compact, compact_func
+#   Compare, CompareFunc                 compare, compare_func
+#   Concat(slices...)                    concat(ss: [[T]])
+#   Contains, ContainsFunc               contains, contains_func
+#   Delete, DeleteFunc                   delete, delete_func
+#   Equal, EqualFunc                     equal, equal_func
+#   Grow(s, n)                           grow(xs, n)
+#   Index, IndexFunc                     index, index_func
+#   Insert(s, i, v...)                   insert(xs, i, vs: [T])
+#   IsSorted, IsSortedFunc               is_sorted, is_sorted_func
+#   Max, MaxFunc, Min, MinFunc           max, max_func, min, min_func
+#   Repeat(s, count)                     repeat(xs, count)
+#   Replace(s, i, j, v...)               replace(xs, i, j, vs: [T])
+#   Reverse(s)                           reverse(xs)
+#   Sort, SortFunc, SortStableFunc       sort, sort_func, sort_stable_func
+#   Sorted, SortedFunc, SortedStableFunc sorted, sorted_func, sorted_stable_func
+#   Values(s) iter.Seq[E]                values(xs) -> [T]
+#
+# The sorts are Go's code (pdqsort for `sort`/`sort_func`, insertion sort +
+# SymMerge for `sort_stable_func`; see sort.tmpl), so an unstable sort leaves
+# equal elements in the order Go leaves them.
+#
 # Differences from Go:
+#   - Iterators: alx has no range-over-func, so Go's iter.Seq / iter.Seq2
+#     values are slices here: `all`, `backward`, `values` and `chunk` return
+#     every element at once (`[(Int, T)]` for a Seq2), and the functions that
+#     take a sequence (`append_seq`, `collect`, `sorted*`) take a slice. The
+#     results are the same; nothing is lazy, so stopping early still pays for
+#     the whole sequence.
 #   - Builtin methods win over method sugar: `xs.sort` and `xs.max` are the
 #     builtin (non-mutating) versions. The package versions stay reachable
 #     qualified: `slices.sort(xs)` sorts in place.
 #   - A function argument can be a block: `xs.index_func { it > 2 }`.
-#   - NaN: `sort`, `binary_search`, `compare` and `is_sorted` order NaNs before
-#     every other float, and `min`/`max` return NaN if any element is NaN (Go).
-#   - Elements left past the new length by `delete`, `compact` and `replace`
-#     are not cleared (there is nothing to release without a GC), and `grow`
-#     is a no-op: `<<` already grows geometrically.
-#   - Bad arguments (an empty slice for `min`, indexes out of range) panic.
+#   - Variadic parameters take a slice: `insert(xs, 1, [a, b])`,
+#     `concat([xs, ys])`.
+#   - No nil slices: the results Go documents as nil (`clone(nil)`, `concat`
+#     of empty slices, `collect` of an empty sequence) are empty slices.
+#   - Capacity: a subslice has no spare capacity (GO-VS-RUBY D6) and alx has
+#     no `cap`, so `insert` and a growing `replace` always allocate (Go's path
+#     when the capacity is exceeded), `grow` only checks its argument (`<<`
+#     grows geometrically) and `clip` returns the slice unchanged. A shrinking
+#     `replace` and `delete` work in place, as in Go.
+#   - Elements left past the new length by `delete`, `delete_func`, `compact`,
+#     `compact_func` and `replace` are not zeroed (Go clears them for its
+#     garbage collector; not every alx type has a zero value, e.g. closures).
+#   - Panics carry Go's messages where Go has its own ("slices.Min: empty
+#     list", "cannot be negative", ...); bad indexes panic on the bounds check
+#     with alx's message.
+
+# The `hint` of choose_pivot (Go's sortedHint).
+UNKNOWN_HINT = 0
+INCREASING_HINT = 1
+DECREASING_HINT = 2
+
+# Go's bits.Len(uint(n)) for n >= 0.
+def bits_len(n: Int) -> Int {
+  k = 0
+  while n > 0 {
+    k += 1
+    n = n >> 1
+  }
+  k
+}
+
+def next_power_of_two(length: Int) -> U64 {
+  one: U64 = 1
+  one << bits_len(length)
+}
 
 # `a` sorts strictly before `b`, NaNs first (Go's cmp.Less).
 def lt_nan[T](a: T, b: T) -> Bool {
   (a != a && b == b) || a < b
+}
+
+# Go's builtin min(a, b): NaN if either is, -0.0 before 0.0.
+def min2[T](a: T, b: T) -> T {
+  if T is Float {
+    return a if a != a
+    return b if b != b
+    if a == 0.0 && b == 0.0 {
+      return a if 1.0 / a < 0.0
+      return b
+    }
+  }
+  return b if b < a
+  a
+}
+
+# Go's builtin max(a, b): NaN if either is, 0.0 after -0.0.
+def max2[T](a: T, b: T) -> T {
+  if T is Float {
+    return a if a != a
+    return b if b != b
+    if a == 0.0 && b == 0.0 {
+      return a if 1.0 / a > 0.0
+      return b
+    }
+  }
+  return b if b > a
+  a
 }
 
 # A slice of `n` elements, to be overwritten by the caller: copies of an
@@ -35,36 +129,113 @@ def alloc[T](n: Int, a: [T], b: [T]) -> [T] {
   [b[0]; n]
 }
 
+# Every (index, element) of `xs`, in order (Go's iterator, as a slice).
+pub def all[T](xs: [T]) -> [(Int, T)] {
+  out: [(Int, T)] = []
+  i = 0
+  while i < xs.size {
+    out << (i, xs[i])
+    i += 1
+  }
+  out
+}
+
+# Every (index, element) of `xs`, last first.
+pub def backward[T](xs: [T]) -> [(Int, T)] {
+  out: [(Int, T)] = []
+  i = xs.size - 1
+  while i >= 0 {
+    out << (i, xs[i])
+    i -= 1
+  }
+  out
+}
+
+# The elements of `xs`, in order (a copy: Go's iterator, as a slice).
+pub def values[T](xs: [T]) -> [T] {
+  xs.dup
+}
+
+# `xs` with the values of `seq` appended (Go's AppendSeq).
+pub def append_seq[T](xs: [T], seq: [T]) -> [T] {
+  for v in seq { xs << v }
+  xs
+}
+
+# The values of `seq` in a new slice.
+pub def collect[T](seq: [T]) -> [T] {
+  seq.dup
+}
+
+# The values of `seq` in a new slice, sorted.
+pub def sorted[T](seq: [T]) -> [T] {
+  s = seq.dup
+  sort(s)
+  s
+}
+
+# The values of `seq` in a new slice, sorted by `cmp`.
+pub def sorted_func[T](seq: [T], cmp: (T, T) -> Int) -> [T] {
+  s = seq.dup
+  sort_func(s, cmp)
+  s
+}
+
+# The values of `seq` in a new slice, sorted by `cmp`, keeping equal
+# elements in their original order.
+pub def sorted_stable_func[T](seq: [T], cmp: (T, T) -> Int) -> [T] {
+  s = seq.dup
+  sort_stable_func(s, cmp)
+  s
+}
+
+# Consecutive subslices of `xs` of `n` elements (the last may be shorter).
+# The chunks share `xs`'s storage; appending to one copies. Panics if n < 1.
+pub def chunk[T](xs: [T], n: Int) -> [[T]] {
+  panic "cannot be less than 1" if n < 1
+  out: [[T]] = []
+  i = 0
+  while i < xs.size {
+    end = n
+    end = xs.size - i if xs.size - i < end
+    out << xs[i...i + end]
+    i += n
+  }
+  out
+}
+
 # The smallest position at which `target` could be inserted in the sorted
 # `xs`, and whether it is already there.
 pub def binary_search[T](xs: [T], target: T) -> (Int, Bool) {
+  n = xs.size
   i = 0
-  j = xs.size
+  j = n
   while i < j {
-    h = i + (j - i) / 2
+    h = i + (j - i) / 2 # Go: int(uint(i+j) >> 1), no overflow
     if lt_nan(xs[h], target) {
       i = h + 1
     } else {
       j = h
     }
   }
-  (i, i < xs.size && !lt_nan(target, xs[i]))
+  (i, i < n && (xs[i] == target || (xs[i] != xs[i] && target != target)))
 }
 
 # `binary_search` for a slice sorted by `cmp(element, target)` (negative when
 # the element sorts before the target).
 pub def binary_search_func[E, T](xs: [E], target: T, cmp: (E, T) -> Int) -> (Int, Bool) {
+  n = xs.size
   i = 0
-  j = xs.size
+  j = n
   while i < j {
-    h = i + (j - i) / 2
+    h = i + (j - i) / 2 # Go: int(uint(i+j) >> 1), no overflow
     if cmp(xs[h], target) < 0 {
       i = h + 1
     } else {
       j = h
     }
   }
-  (i, i < xs.size && cmp(xs[i], target) == 0)
+  (i, i < n && cmp(xs[i], target) == 0)
 }
 
 # `xs` without spare capacity: appending to the result copies.
@@ -81,61 +252,74 @@ pub def clone[T](xs: [T]) -> [T] {
 # shortened slice).
 pub def compact[T](xs: [T]) -> [T] {
   return xs if xs.size < 2
-  w = 1
-  i = 1
-  while i < xs.size {
-    if xs[i] != xs[w - 1] {
-      xs[w] = xs[i]
-      w += 1
+  k = 1
+  while k < xs.size {
+    if xs[k] == xs[k - 1] {
+      # xs[k...] from here on: keep each element unequal to its neighbour.
+      base = k
+      k2 = 1
+      while base + k2 < xs.size {
+        if xs[base + k2] != xs[base + k2 - 1] {
+          xs[k] = xs[base + k2]
+          k += 1
+        }
+        k2 += 1
+      }
+      return xs[0...k]
     }
-    i += 1
+    k += 1
   }
-  xs[0...w]
+  xs
 }
 
-# `compact` with `eq` deciding which neighbours are duplicates.
+# `compact` with `eq(later, earlier)` deciding which neighbours are
+# duplicates (it is asked about neighbours of the original slice).
 pub def compact_func[T](xs: [T], eq: (T, T) -> Bool) -> [T] {
   return xs if xs.size < 2
-  w = 1
-  i = 1
-  while i < xs.size {
-    if !eq(xs[w - 1], xs[i]) {
-      xs[w] = xs[i]
-      w += 1
+  k = 1
+  while k < xs.size {
+    if eq(xs[k], xs[k - 1]) {
+      base = k
+      k2 = 1
+      while base + k2 < xs.size {
+        if !eq(xs[base + k2], xs[base + k2 - 1]) {
+          xs[k] = xs[base + k2]
+          k += 1
+        }
+        k2 += 1
+      }
+      return xs[0...k]
     }
-    i += 1
+    k += 1
   }
-  xs[0...w]
+  xs
 }
 
-# -1, 0 or 1: the lexicographic order of two slices (a prefix sorts first).
+# -1, 0 or 1: the lexicographic order of two slices (a prefix sorts first),
+# comparing elements with cmp.compare (NaNs first and equal).
 pub def compare[T](a: [T], b: [T]) -> Int {
-  n = a.size
-  n = b.size if b.size < n
   i = 0
-  while i < n {
+  while i < a.size {
+    return 1 if i >= b.size
     return -1 if lt_nan(a[i], b[i])
     return 1 if lt_nan(b[i], a[i])
     i += 1
   }
   return -1 if a.size < b.size
-  return 1 if a.size > b.size
   0
 }
 
-# `compare` with `cmp` ordering the elements.
+# `compare` with `cmp` ordering the elements: the first non-zero result of
+# `cmp`, else -1, 0 or 1 by length.
 pub def compare_func[E, F](a: [E], b: [F], cmp: (E, F) -> Int) -> Int {
-  n = a.size
-  n = b.size if b.size < n
   i = 0
-  while i < n {
+  while i < a.size {
+    return 1 if i >= b.size
     c = cmp(a[i], b[i])
-    return -1 if c < 0
-    return 1 if c > 0
+    return c if c != 0
     i += 1
   }
   return -1 if a.size < b.size
-  return 1 if a.size > b.size
   0
 }
 
@@ -144,35 +328,38 @@ pub def contains[T](xs: [T], v: T) -> Bool {
   index(xs, v) >= 0
 }
 
+# Whether an element of `xs` satisfies `f`.
 pub def contains_func[T](xs: [T], f: (T) -> Bool) -> Bool {
   index_func(xs, f) >= 0
 }
 
 # `xs` without xs[i...j], shifting the tail down in place; returns the
-# shortened slice.
+# shortened slice. Panics if xs[i...j] is out of range.
 pub def delete[T](xs: [T], i: Int, j: Int) -> [T] {
   n = xs.size
-  assert 0 <= i && i <= j && j <= n
+  _ = xs[i...j] # bounds check
+  return xs if i == j
   copy(xs[i...n - (j - i)], xs[j...n])
   xs[0...n - (j - i)]
 }
 
 # `xs` without the elements `del` approves of, in place.
 pub def delete_func[T](xs: [T], del: (T) -> Bool) -> [T] {
-  w = 0
-  i = 0
-  while i < xs.size {
-    v = xs[i]
+  i = index_func(xs, del)
+  return xs if i == -1
+  j = i + 1
+  while j < xs.size {
+    v = xs[j]
     if !del(v) {
-      xs[w] = v
-      w += 1
+      xs[i] = v
+      i += 1
     }
-    i += 1
+    j += 1
   }
-  xs[0...w]
+  xs[0...i]
 }
 
-# Whether two slices have the same length and elements.
+# Whether two slices have the same length and elements (NaNs are unequal).
 pub def equal[T](a: [T], b: [T]) -> Bool {
   return false if a.size != b.size
   i = 0
@@ -183,6 +370,7 @@ pub def equal[T](a: [T], b: [T]) -> Bool {
   true
 }
 
+# `equal` with `eq` comparing the elements.
 pub def equal_func[E, F](a: [E], b: [F], eq: (E, F) -> Bool) -> Bool {
   return false if a.size != b.size
   i = 0
@@ -193,9 +381,10 @@ pub def equal_func[E, F](a: [E], b: [F], eq: (E, F) -> Bool) -> Bool {
   true
 }
 
-# Room for `n` more elements: a no-op here, `<<` grows geometrically.
+# Room for `n` more elements: only checks `n` here, `<<` grows
+# geometrically. Panics if n < 0.
 pub def grow[T](xs: [T], n: Int) -> [T] {
-  assert n >= 0
+  panic "cannot be negative" if n < 0
   xs
 }
 
@@ -209,6 +398,7 @@ pub def index[T](xs: [T], v: T) -> Int {
   -1
 }
 
+# Position of the first element satisfying `f`, or -1.
 pub def index_func[T](xs: [T], f: (T) -> Bool) -> Int {
   i = 0
   while i < xs.size {
@@ -218,10 +408,12 @@ pub def index_func[T](xs: [T], f: (T) -> Bool) -> Int {
   -1
 }
 
-# A new slice: `xs` with `vs` inserted before position `i`.
+# `xs` with `vs` inserted before position `i`: `xs` itself if `vs` is empty,
+# else a new slice. Panics if i is out of range.
 pub def insert[T](xs: [T], i: Int, vs: [T]) -> [T] {
   n = xs.size
-  assert 0 <= i && i <= n
+  _ = xs[i...n] # bounds check
+  return xs if vs.size == 0
   out = alloc(n + vs.size, xs, vs)
   copy(out[0...i], xs[0...i])
   copy(out[i...i + vs.size], vs)
@@ -231,33 +423,32 @@ pub def insert[T](xs: [T], i: Int, vs: [T]) -> [T] {
 
 # Whether `xs` is in non-descending order (NaNs first).
 pub def is_sorted[T](xs: [T]) -> Bool {
-  i = 1
-  while i < xs.size {
+  i = xs.size - 1
+  while i > 0 {
     return false if lt_nan(xs[i], xs[i - 1])
-    i += 1
+    i -= 1
   }
   true
 }
 
+# Whether `xs` is in non-descending order by `cmp`.
 pub def is_sorted_func[T](xs: [T], cmp: (T, T) -> Int) -> Bool {
-  i = 1
-  while i < xs.size {
+  i = xs.size - 1
+  while i > 0 {
     return false if cmp(xs[i], xs[i - 1]) < 0
-    i += 1
+    i -= 1
   }
   true
 }
 
-# The largest element; NaN if there is one. Panics on an empty slice.
+# The largest element (Go's builtin max: NaN if there is one, 0.0 over
+# -0.0). Panics on an empty slice.
 pub def max[T](xs: [T]) -> T {
-  assert xs.size > 0
+  panic "slices.Max: empty list" if xs.size < 1
   m = xs[0]
-  return m if m != m
   i = 1
   while i < xs.size {
-    v = xs[i]
-    return v if v != v
-    m = v if v > m
+    m = max2(m, xs[i])
     i += 1
   }
   m
@@ -265,7 +456,7 @@ pub def max[T](xs: [T]) -> T {
 
 # The first largest element by `cmp`. Panics on an empty slice.
 pub def max_func[T](xs: [T], cmp: (T, T) -> Int) -> T {
-  assert xs.size > 0
+  panic "slices.MaxFunc: empty list" if xs.size < 1
   m = xs[0]
   i = 1
   while i < xs.size {
@@ -275,16 +466,14 @@ pub def max_func[T](xs: [T], cmp: (T, T) -> Int) -> T {
   m
 }
 
-# The smallest element; NaN if there is one. Panics on an empty slice.
+# The smallest element (Go's builtin min: NaN if there is one, -0.0 over
+# 0.0). Panics on an empty slice.
 pub def min[T](xs: [T]) -> T {
-  assert xs.size > 0
+  panic "slices.Min: empty list" if xs.size < 1
   m = xs[0]
-  return m if m != m
   i = 1
   while i < xs.size {
-    v = xs[i]
-    return v if v != v
-    m = v if v < m
+    m = min2(m, xs[i])
     i += 1
   }
   m
@@ -292,7 +481,7 @@ pub def min[T](xs: [T]) -> T {
 
 # The first smallest element by `cmp`. Panics on an empty slice.
 pub def min_func[T](xs: [T], cmp: (T, T) -> Int) -> T {
-  assert xs.size > 0
+  panic "slices.MinFunc: empty list" if xs.size < 1
   m = xs[0]
   i = 1
   while i < xs.size {
@@ -302,28 +491,50 @@ pub def min_func[T](xs: [T], cmp: (T, T) -> Int) -> T {
   m
 }
 
-# A new slice: `xs` with xs[i...j] replaced by `vs`.
+# `xs` with xs[i...j] replaced by `vs`: in place when that doesn't grow
+# `xs`, else a new slice. Panics if xs[i...j] is out of range.
 pub def replace[T](xs: [T], i: Int, j: Int, vs: [T]) -> [T] {
   n = xs.size
-  assert 0 <= i && i <= j && j <= n
-  out = alloc(n - (j - i) + vs.size, xs, vs)
+  _ = xs[i...j] # bounds check
+  return insert(xs, i, vs) if i == j
+  tot = i + vs.size + (n - j)
+  if tot <= n {
+    copy(xs[i...i + vs.size], vs)
+    copy(xs[i + vs.size...tot], xs[j...n])
+    return xs[0...tot]
+  }
+  out = alloc(tot, xs, vs)
   copy(out[0...i], xs[0...i])
   copy(out[i...i + vs.size], vs)
-  copy(out[i + vs.size...out.size], xs[j...n])
+  copy(out[i + vs.size...tot], xs[j...n])
   out
 }
 
 # Reverses `xs` in place.
 pub def reverse[T](xs: [T]) {
-  reverse_range(xs, 0, xs.size)
+  i = 0
+  j = xs.size - 1
+  while i < j {
+    t = xs[i]
+    xs[i] = xs[j]
+    xs[j] = t
+    i += 1
+    j -= 1
+  }
 }
 
-# A new slice: `xs` repeated `count` times.
+MAX_INT = 9223372036854775807
+
+# A new slice: `xs` repeated `count` times. Panics if count < 0 or the
+# length overflows.
 pub def repeat[T](xs: [T], count: Int) -> [T] {
-  assert count >= 0
+  panic "cannot be negative" if count < 0
+  if count > 0 && xs.size > MAX_INT / count {
+    panic "the result of (len(x) * count) overflows"
+  }
   out = alloc(xs.size * count, xs, xs)
   k = 0
-  while k < count {
+  while k < count && xs.size > 0 {
     copy(out[k * xs.size...(k + 1) * xs.size], xs)
     k += 1
   }
@@ -335,6 +546,7 @@ pub def concat[T](ss: [[T]]) -> [T] {
   n = 0
   seed: [T] = []
   for s in ss {
+    panic "len out of range" if n > MAX_INT - s.size
     n += s.size
     seed = s if s.size > 0
   }
@@ -347,32 +559,25 @@ pub def concat[T](ss: [[T]]) -> [T] {
   out
 }
 
-# Sorts `xs` in place, ascending (NaNs first). Introsort: O(n log n) worst
-# case, O(n) on sorted or reverse-sorted input. Not stable.
+# Sorts `xs` in place, ascending (NaNs first). Go's pdqsort: not stable.
 pub def sort[T](xs: [T]) {
   n = xs.size
-  lo = 0
-  i = 0
-  while i < n {
-    if xs[i] != xs[i] {
-      t = xs[i]
-      xs[i] = xs[lo]
-      xs[lo] = t
-      lo += 1
-    }
-    i += 1
+  if T is Float {
+    pdqsort_ordered_nan(xs, 0, n, bits_len(n))
+  } else {
+    pdqsort_ordered(xs, 0, n, bits_len(n))
   }
-  sort_range(xs, lo, n)
 }
 
 # Sorts `xs` in place by `cmp(a, b)` (negative: a first, positive: b first).
-# Not stable.
+# Go's pdqsort: not stable.
 pub def sort_func[T](xs: [T], cmp: (T, T) -> Int) {
-  sort_range_func(xs, 0, xs.size, cmp)
+  n = xs.size
+  pdqsort_cmp_func(xs, 0, n, bits_len(n), cmp)
 }
 
-# Like `sort_func`, keeping equal elements in their original order (merge
-# sort with an n-element buffer).
+# Like `sort_func`, keeping equal elements in their original order (Go's
+# insertion sort + SymMerge, in place).
 pub def sort_stable_func[T](xs: [T], cmp: (T, T) -> Int) {
-  stable_sort_func(xs, cmp)
+  stable_sort_cmp_func(xs, xs.size, cmp)
 }

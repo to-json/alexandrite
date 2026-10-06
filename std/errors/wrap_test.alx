@@ -1,0 +1,199 @@
+#![test(external)]
+# Go's errors/wrap_test.go, translated.
+#
+# Not translated: the pointer cases of TestIs (`&errorUncomparable{}`: no
+# pointers to values), poser's As method and its TestAs/TestAsType cases
+# (Go's `As(any) bool` method has no counterpart: `as` takes a block),
+# TestAsValidation (bad targets can't be written: the block picks the
+# type), the timeout interface cases (an interface target: the os error has
+# no Timeout method here; the os.open case checks its type instead) and
+# the benchmarks' allocation counts.
+import "errors"
+import "os"
+
+error ErrorT {
+  T(s: Str)
+
+  def message -> Str {
+    case self {
+      T(s) => "errorT(#{s})"
+    }
+  }
+}
+
+error Wrapped {
+  W(msg: Str, err: Error?)
+
+  def message -> Str {
+    case self {
+      W(m, _) => m
+    }
+  }
+
+  def unwrap -> Error? {
+    case self {
+      W(_, e) => e
+    }
+  }
+}
+
+error MultiErr {
+  Multi(errs: [Error])
+
+  def message -> Str { "multiError" }
+
+  def unwrap -> [Error] {
+    case self {
+      Multi(es) => es
+    }
+  }
+}
+
+error Poser {
+  P(msg: Str, f: (Error) -> Bool)
+
+  def message -> Str {
+    case self {
+      P(m, _) => m
+    }
+  }
+
+  def is?(target: Error) -> Bool {
+    case self {
+      P(_, f) => f.call(target)
+    }
+  }
+}
+
+error Uncomparable {
+  U(f: [Str])
+
+  def message -> Str { "uncomparable error" }
+
+  def is?(target: Error) -> Bool {
+    case target {
+      Uncomparable => true
+      _ => false
+    }
+  }
+}
+
+#[track_caller]
+def check_is(err: Error?, target: Error?, want: Bool) {
+  assert errors.is?(err, target) == want, "Is(#{err}, #{target}) at #{caller_location}"
+}
+
+test "Is" {
+  err1 = errors.new("1")
+  erra: Error = Wrapped.W(msg: "wrap 2", err: err1)
+  errb: Error = Wrapped.W(msg: "wrap 3", err: erra)
+  err3 = errors.new("3")
+  poser: Error = Poser.P(msg: "either 1 or 3", f: ->(e: Error) -> Bool { e == err1 || e == err3 })
+  un: Error = Uncomparable.U(f: [])
+  check_is(none, none, true)
+  check_is(none, err1, false)
+  check_is(err1, none, false)
+  check_is(err1, err1, true)
+  check_is(erra, err1, true)
+  check_is(errb, err1, true)
+  check_is(err1, err3, false)
+  check_is(erra, err3, false)
+  check_is(errb, err3, false)
+  check_is(poser, err1, true)
+  check_is(poser, err3, true)
+  check_is(poser, erra, false)
+  check_is(poser, errb, false)
+  check_is(un, un, true)
+  check_is(un, err1, false)
+  check_is(MultiErr.Multi(errs: []), err1, false)
+  check_is(MultiErr.Multi(errs: [err1, err3]), err1, true)
+  check_is(MultiErr.Multi(errs: [err3, err1]), err1, true)
+  check_is(MultiErr.Multi(errs: [err1, err3]), errors.new("x"), false)
+  check_is(MultiErr.Multi(errs: [err3, errb]), errb, true)
+  check_is(MultiErr.Multi(errs: [err3, errb]), erra, true)
+  check_is(MultiErr.Multi(errs: [err3, errb]), err1, true)
+  check_is(MultiErr.Multi(errs: [errb, err3]), err1, true)
+  check_is(MultiErr.Multi(errs: [poser]), err1, true)
+  check_is(MultiErr.Multi(errs: [poser]), err3, true)
+  # Go's multiErr{nil}: the nones are dropped.
+  check_is(MultiErr.Multi(errs: []), none, false)
+}
+
+def as_t(err: Error?) -> Str? {
+  errors.as(err) { |e|
+    case e {
+      ErrorT.T(s) => s
+      _ => none
+    }
+  }
+}
+
+def as_path(err: Error?) -> os.FsFailure? {
+  errors.as(err) { |e|
+    case e {
+      os.FsError.NotExist(at) => at
+      _ => none
+    }
+  }
+}
+
+test "As" {
+  err_f = os.open("non-existing").err || errors.new("opened")
+  assert as_path(none) == none
+  assert_eq as_t(Wrapped.W(msg: "pitied the fool", err: ErrorT.T(s: "T"))), "T"
+  assert_eq as_path(err_f)?.path, "non-existing"
+  assert as_path(ErrorT.T(s: "")) == none
+  assert as_t(Wrapped.W(msg: "wrapped", err: none)) == none
+  assert as_t(errors.new("err")) == none
+  assert_eq as_path(Wrapped.W(msg: "path error", err: err_f))?.path, "non-existing"
+  assert as_t(MultiErr.Multi(errs: [])) == none
+  assert_eq as_t(MultiErr.Multi(errs: [errors.new("a"), ErrorT.T(s: "T")])), "T"
+  assert_eq as_t(MultiErr.Multi(errs: [t_err("T"), errors.new("a")])), "T"
+  assert_eq as_t(MultiErr.Multi(errs: [t_err("a"), ErrorT.T(s: "b")])), "a"
+  assert_eq as_t(MultiErr.Multi(errs: [multi([errors.new("a"), ErrorT.T(s: "a")]), ErrorT.T(s: "b")])), "a"
+  assert_eq as_path(MultiErr.Multi(errs: [Wrapped.W(msg: "path error", err: err_f)]))?.path, "non-existing"
+}
+
+# Go's TestAsType: the same cases, the block returning the error itself.
+test "AsType" {
+  pick_t = ->(e: Error) -> Error? {
+    case e {
+      ErrorT => e
+      _ => none
+    }
+  }
+  assert errors.as(none, pick_t) == none
+  got = errors.as(Wrapped.W(msg: "pitied the fool", err: ErrorT.T(s: "T")), pick_t)
+  assert got == ErrorT.T(s: "T")
+  assert errors.as(Wrapped.W(msg: "wrapped", err: none), pick_t) == none
+  assert errors.as(MultiErr.Multi(errs: []), pick_t) == none
+  assert errors.as(MultiErr.Multi(errs: [errors.new("a"), ErrorT.T(s: "T")]), pick_t) == ErrorT.T(s: "T")
+  assert errors.as(MultiErr.Multi(errs: [t_err("a"), ErrorT.T(s: "b")]), pick_t) == ErrorT.T(s: "a")
+  nested: Error = MultiErr.Multi(errs: [multi([errors.new("a"), ErrorT.T(s: "a")]), ErrorT.T(s: "b")])
+  assert errors.as(nested, pick_t) == ErrorT.T(s: "a")
+}
+
+test "Unwrap" {
+  err1 = errors.new("1")
+  erra: Error = Wrapped.W(msg: "wrap 2", err: err1)
+  assert errors.unwrap(none) == none
+  assert errors.unwrap(Wrapped.W(msg: "wrapped", err: none)) == none
+  assert errors.unwrap(err1) == none
+  assert errors.unwrap(erra) == err1
+  assert errors.unwrap(Wrapped.W(msg: "wrap 3", err: erra)) == erra
+  # The []error form isn't Unwrap's.
+  assert errors.unwrap(MultiErr.Multi(errs: [err1])) == none
+}
+
+test "wrap context is the same error" {
+  err1 = errors.new("1")
+  w = err1.wrap("ctx")
+  assert_eq w.message, "ctx: 1"
+  assert errors.is?(w, err1)
+  assert w == err1
+  assert_eq as_t(ErrorT.T(s: "x").wrap("ctx")), "x"
+}
+
+def t_err(s: Str) -> Error { ErrorT.T(s: s) }
+
+def multi(es: [Error]) -> Error { MultiErr.Multi(errs: es) }

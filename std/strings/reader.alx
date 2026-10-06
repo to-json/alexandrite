@@ -1,0 +1,175 @@
+# Go's strings.Reader: reads, seeks and reads-at over a string.
+#
+#   Go                                      alx
+#   NewReader(s) *Reader                    new_reader(s) -> Reader
+#   r.Len / Size                            r.len / size
+#   r.Read / ReadAt / ReadByte / ReadRune   r.read! / read_at / read_byte! / read_rune!
+#   r.UnreadByte / UnreadRune / Seek        r.unread_byte! / unread_rune! / seek!
+#   r.WriteTo(w) / Reset(s)                 r.write_to!(w) / reset!(s)
+#
+# Differences from Go (io's shape, GO-VS-RUBY F3): read! returns 0 at the
+# end; read_at returns a short count (0 at or past the end) instead of
+# io.EOF; read_byte! / read_rune! return none at the end. The Reader shares
+# its position across copies (D36) once made by new_reader or used. Error
+# texts use alx names ("strings.Reader.seek!: negative position").
+
+import "io"
+
+pub error ReaderError {
+  NegativeOffset
+  UnreadByteAtStart
+  UnreadRuneAtStart
+  UnreadRuneNotRune
+  InvalidWhence
+  NegativePosition
+
+  def message -> Str {
+    case self {
+      NegativeOffset => "strings.Reader.read_at: negative offset"
+      UnreadByteAtStart => "strings.Reader.unread_byte!: at beginning of string"
+      UnreadRuneAtStart => "strings.Reader.unread_rune!: at beginning of string"
+      UnreadRuneNotRune => "strings.Reader.unread_rune!: previous operation was not read_rune!"
+      InvalidWhence => "strings.Reader.seek!: invalid whence"
+      NegativePosition => "strings.Reader.seek!: negative position"
+    }
+  }
+}
+
+struct ReaderState {
+  s: Str
+  i: Int
+  prev_rune: Int
+}
+
+# A reader of a string (Go's strings.Reader); copies share the position.
+pub struct Reader {
+  st: [ReaderState]
+
+  # The zero Reader (Reader.new) reads an empty string.
+  def zero! {
+    self.st = [ReaderState.new(s: "", i: 0, prev_rune: -1)] if st.size == 0
+  }
+
+  # The number of unread bytes.
+  pub def len -> Int {
+    return 0 if st.size == 0
+    i = st[0].i
+    n = st[0].s.size
+    i >= n ? 0 : n - i
+  }
+
+  # The size of the underlying string (what read_at can reach).
+  pub def size -> Int { st.size == 0 ? 0 : st[0].s.size }
+
+  pub def read!(p: [Byte]) -> Int {
+    return 0 if st.size == 0
+    i = st[0].i
+    s = st[0].s
+    return 0 if i >= s.size
+    self.st[0].prev_rune = -1
+    n = copy(p, s[i...s.size].bytes)
+    self.st[0].i = i + n
+    n
+  }
+
+  # Reads at off without moving the position; a short count at the end.
+  pub def read_at(p: [Byte], off: Int) -> ~Int<ReaderError> {
+    fail ReaderError.NegativeOffset if off < 0
+    return 0 if st.size == 0
+    s = st[0].s
+    return 0 if off >= s.size
+    copy(p, s[off...s.size].bytes)
+  }
+
+  pub def read_byte! -> Byte? {
+    zero!
+    self.st[0].prev_rune = -1
+    i = st[0].i
+    return none if i >= st[0].s.size
+    self.st[0].i = i + 1
+    st[0].s[i]
+  }
+
+  pub def unread_byte! -> ~Unit<ReaderError> {
+    zero!
+    fail ReaderError.UnreadByteAtStart if st[0].i <= 0
+    self.st[0].prev_rune = -1
+    self.st[0].i -= 1
+  }
+
+  # The next rune and its width; none at the end. Invalid UTF-8 reads as
+  # (U+FFFD, 1).
+  pub def read_rune! -> (Rune, Int)? {
+    zero!
+    i = st[0].i
+    if i >= st[0].s.size {
+      self.st[0].prev_rune = -1
+      return none
+    }
+    self.st[0].prev_rune = i
+    v = dec(st[0].s, i)
+    self.st[0].i = i + (v & 7)
+    ((v >> 3).as_i32, v & 7)
+  }
+
+  pub def unread_rune! -> ~Unit<ReaderError> {
+    zero!
+    fail ReaderError.UnreadRuneAtStart if st[0].i <= 0
+    fail ReaderError.UnreadRuneNotRune if st[0].prev_rune < 0
+    self.st[0].i = st[0].prev_rune
+    self.st[0].prev_rune = -1
+  }
+
+  # Moves the position (whence: io.SEEK_START, SEEK_CURRENT, SEEK_END);
+  # returns it. Past the end is allowed (reads then return 0).
+  pub def seek!(offset: Int, whence: Int) -> ~Int<ReaderError> {
+    zero!
+    self.st[0].prev_rune = -1
+    abs = 0
+    if whence == io.SEEK_START {
+      abs = offset
+    } else if whence == io.SEEK_CURRENT {
+      abs = st[0].i + offset
+    } else if whence == io.SEEK_END {
+      abs = st[0].s.size + offset
+    } else {
+      fail ReaderError.InvalidWhence
+    }
+    fail ReaderError.NegativePosition if abs < 0
+    self.st[0].i = abs
+    abs
+  }
+
+  # Writes the unread bytes to w; returns the count.
+  pub def write_to![W](w: W) -> ~Int {
+    zero!
+    self.st[0].prev_rune = -1
+    i = st[0].i
+    s = st[0].s
+    return 0 if i >= s.size
+    rest = s[i...s.size]
+    m = 0
+    if W is io.StringWriter {
+      m = w.~write_string!(rest)
+    } else {
+      m = w.~write!(rest.bytes.to_a)
+    }
+    panic "strings.Reader.write_to!: invalid write_string! count" if m > rest.size
+    self.st[0].i = i + m
+    fail io.StreamError.ShortWrite if m != rest.size
+    m
+  }
+
+  # Starts over on s.
+  pub def reset!(s: Str) {
+    zero!
+    self.st[0].s = s
+    self.st[0].i = 0
+    self.st[0].prev_rune = -1
+  }
+}
+
+# A Reader of s.
+pub def new_reader(s: Str) -> Reader {
+  Reader.new(st: [ReaderState.new(s: s, i: 0, prev_rune: -1)])
+}

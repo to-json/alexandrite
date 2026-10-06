@@ -105,6 +105,9 @@
 #     is unused. A Ticker drops ticks the receiver is too slow to take. tick(d) never
 #     stops (use a Ticker); tick(d <= 0) is a channel that never receives (Go's nil).
 #     A nil or zero Timer, whose Stop and Reset panic in Go, can't be made.
+#     A Timer's shared state is Atomic[Int]s and channels (with a spin lock for the
+#     few steps that move values in and out of the channel), not a Mutex, which
+#     must not outlive the task that made it (port-issues #202).
 #   - Time layouts are Go's reference time (Mon Jan 2 15:04:05 MST 2006), unchanged.
 #
 # Tests: Go's time_test.go, format_test.go, mono_test.go, sleep_test.go, tick_test.go,
@@ -1110,61 +1113,59 @@ pub def tick(d: Duration) -> Chan[Time] {
   new_ticker(d).c
 }
 
-# The state a Timer's or Ticker's copies and tasks share: which arming is current
-# (`gen`, bumped by every reset) and whether it is pending (0), fired (1) or
-# stopped (2).
-struct TimerState {
-  gen: Int
-  status: Int
-  f: () -> Unit # after_func's function, kept here so that a Timer is shareable
+# The state a Timer's or Ticker's copies and tasks share is in Atomic[Int]s and
+# channels, which outlive the task that made them (a Mutex's storage belongs to
+# the region of the task that made it: port-issues #202): `st` is the arming
+# (`gen`, bumped by every reset) times 4 plus whether it is pending (0), fired (1)
+# or stopped (2); `lk` is a spin lock (0 free, 1 taken) around the state changes
+# that also move values in and out of the channel, which never block.
+def lock_spin(lk: Atomic[Int]) {
+  while !lk.compare_and_swap(0, 1) {}
 }
 
 # Takes a value left in the channel, so that nothing sent before a stop or reset
-# is received after it (Go 1.23's timers). True if there was one.
+# is received after it (Go 1.23's timers). True if there was one. Only the
+# timer's task sends, holding lk as the callers of drain do: a value seen in
+# the buffer is still there to take.
 def drain(ch: Chan[Time]) -> Bool {
-  got = false
-  select {
-    when _v = ch.recv => got = true
-    else => nil
-  }
-  got
+  return false if ch.size == 0
+  ch.recv
+  true
 }
-
-def new_timer_state(f: () -> Unit) -> Mutex[TimerState] { Mutex.new(TimerState.new(f: f.dup)) }
 
 # A one-shot timer: `c` receives the time once d has elapsed, unless stopped
 # (Go's Timer; after_func's runs a function instead).
 pub struct Timer {
   c: Chan[Time]
-  st: Mutex[TimerState]
+  st: Atomic[Int]
+  lk: Atomic[Int]
+  # after_func's function, in a channel so that the Timer is shareable
+  fc: Chan[() -> Unit]
   is_func: Bool
 
   # Prevents the timer from firing. True if this stopped it, false if it had
   # already fired or been stopped. A value it sent and nobody took is dropped,
   # and counts as not fired (Go 1.23: the channel is synchronous).
   pub def stop -> Bool {
-    ch = c
-    is_fn = is_func
-    st.lock { |s|
-      was = s.status == 0
-      s.status = 2
-      was = drain(ch) || was if !is_fn
-      was
-    }
+    lock_spin(lk)
+    s = st.load
+    was = s % 4 == 0
+    st.store(s - s % 4 + 2)
+    was = drain(c) || was if !is_func
+    lk.store(0)
+    was
   }
 
   # Changes the timer to fire after d (again, if it had fired or been stopped).
   # True if it had been pending. A value it sent and nobody took is dropped.
   pub def reset(d: Duration) -> Bool {
-    ch = c
-    is_fn = is_func
-    g, was = st.lock { |s|
-      w = s.status == 0
-      s.gen += 1
-      s.status = 0
-      w = drain(ch) || w if !is_fn
-      (s.gen, w)
-    }
+    lock_spin(lk)
+    s = st.load
+    was = s % 4 == 0
+    g = s / 4 + 1
+    st.store(g * 4)
+    was = drain(c) || was if !is_func
+    lk.store(0)
     self.arm(d, g)
     was
   }
@@ -1172,92 +1173,89 @@ pub struct Timer {
   # Starts the task that fires arming `g` after d.
   def arm(d: Duration, g: Int) {
     ch = c
-    mu = st
+    state = st
+    lock = lk
+    funcs = fc
     is_fn = is_func
     spawn {
       sleep(d)
       fired_at = now()
-      fire = mu.lock { |s|
-        ok = s.gen == g && s.status == 0
-        if ok {
-          s.status = 1
-          # the channel is empty: stop and reset drain it under the lock
-          ch << fired_at.dup if !is_fn
-        }
-        ok
+      lock_spin(lock)
+      fire = state.load == g * 4
+      if fire {
+        state.store(g * 4 + 1)
+        # the channel is empty: stop and reset drain it holding the lock
+        ch << fired_at if !is_fn
       }
+      lock.store(0)
       if fire && is_fn {
-        call_f = mu.lock { |s| s.f }
-        call_f.call()
+        f = funcs.recv.unwrap
+        funcs << f.dup
+        f.call()
       }
     }
   }
 }
 
-# A Timer whose channel receives the time after d (Go's NewTimer).
-pub def new_timer(d: Duration) -> Timer {
-  t = Timer.new(c: Chan[Time].new(1), st: new_timer_state(->() {}), is_func: false)
+def new_timer_of(d: Duration, f: () -> Unit, is_func: Bool) -> Timer {
+  fc = Chan[() -> Unit].new(1)
+  fc << f.dup
+  t = Timer.new(c: Chan[Time].new(1), st: Atomic.new(0), lk: Atomic.new(0), fc: fc, is_func: is_func)
   t.arm(d, 0)
   t
 }
 
+# A Timer whose channel receives the time after d (Go's NewTimer).
+pub def new_timer(d: Duration) -> Timer { new_timer_of(d, ->() {}, false) }
+
 # Calls f in its own task after d (Go's AfterFunc). The Timer's stop cancels the
 # call; reset schedules another. Its channel `c` is unused.
-pub def after_func(d: Duration, f: () -> Unit) -> Timer {
-  t = Timer.new(c: Chan[Time].new(1), st: new_timer_state(f), is_func: true)
-  t.arm(d, 0)
-  t
-}
+pub def after_func(d: Duration, f: () -> Unit) -> Timer { new_timer_of(d, f, true) }
 
 # A repeating timer: `c` receives the time every d until stopped. Ticks are
 # dropped when the receiver falls behind.
 pub struct Ticker {
   c: Chan[Time]
-  st: Mutex[TimerState]
+  st: Atomic[Int]
+  lk: Atomic[Int]
 
   # Turns the ticker off; no tick is received after it.
   pub def stop {
-    ch = c
-    st.lock { |s|
-      s.status = 2
-      drain(ch)
-    }
+    lock_spin(lk)
+    s = st.load
+    st.store(s - s % 4 + 2)
+    drain(c)
+    lk.store(0)
   }
 
   # Stops the ticker and restarts it with period d: the next tick comes d
   # from now. Panics if d <= 0.
   pub def reset(d: Duration) {
     assert d.ns > 0, "non-positive interval for Ticker.reset"
-    ch = c
-    g = st.lock { |s|
-      s.gen += 1
-      s.status = 0
-      drain(ch)
-      s.gen
-    }
+    lock_spin(lk)
+    g = st.load / 4 + 1
+    st.store(g * 4)
+    drain(c)
+    lk.store(0)
     self.run(d, g)
   }
 
   # The task that ticks for arming `g`.
   def run(d: Duration, g: Int) {
     ch = c
-    mu = st
+    state = st
+    lock = lk
     spawn {
       next_at = alx_mono_ns() + d.ns
       loop {
         wait = next_at - alx_mono_ns()
         alx_sleep_ns(wait) if wait > 0
         tick_at = now()
-        live = mu.lock { |s|
-          ok = s.gen == g && s.status == 0
-          if ok {
-            select {
-              when ch.send(tick_at.dup) => nil
-              else => nil
-            }
-          }
-          ok
-        }
+        lock_spin(lock)
+        live = state.load == g * 4
+        # a full buffer: the receiver is behind, drop the tick
+        ch << tick_at.dup if live && ch.size == 0
+        lock.store(0)
         break if !live
         next_at += d.ns
         # fell far behind (a long pause): resynchronize rather than burst
@@ -1272,7 +1270,7 @@ pub struct Ticker {
 # d <= 0.
 pub def new_ticker(d: Duration) -> Ticker {
   assert d.ns > 0, "non-positive interval for new_ticker"
-  t = Ticker.new(c: Chan[Time].new(1), st: new_timer_state(->() {}))
+  t = Ticker.new(c: Chan[Time].new(1), st: Atomic.new(0), lk: Atomic.new(0))
   t.run(d, 0)
   t
 }

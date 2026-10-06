@@ -129,7 +129,10 @@ fn apply_json_tag(v: &str, sp: Span, o: &mut Opts) -> Result<(), Diag> {
     };
     let mut parts = head.split(',');
     let name = parts.next().unwrap_or("");
-    if !name.is_empty() {
+    // Go's isValidTag: letters, digits and these punctuation characters (a
+    // name with quotes or a backslash is ignored: the field keeps its name)
+    let valid = !name.is_empty() && name.chars().all(|c| "!#$%&()*+-./:;<=>?@[]^_{|}~ ".contains(c) || c.is_alphabetic() || c.is_numeric());
+    if valid {
         o.rename = Some(name.to_string());
     }
     for p in parts {

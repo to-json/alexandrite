@@ -2,6 +2,7 @@
 //! the C and Rust-oracle emitters. Platform-free, so it also builds for
 //! wasm32 (the in-browser compiler in `web/`). The native driver and the
 //! Cranelift JIT live in the `alx` binary.
+pub mod analyze;
 pub mod ast;
 pub mod capture;
 pub mod cgen;

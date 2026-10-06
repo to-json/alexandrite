@@ -118,6 +118,35 @@ pub fn check_only(file: &str) -> ExitCode {
     }
 }
 
+/// `alx check --json`: one JSON object on stdout (check_json.rs). Exit 0 when
+/// complete, 3 after an internal error, 2 for bad arguments.
+pub fn check_json(file: &str, overlays: Option<&str>, unit: alx::analyze::Force) -> ExitCode {
+    use std::io::{Read, Write};
+    let map = match overlays {
+        None => Default::default(),
+        Some(src) => {
+            let mut text = String::new();
+            let r = if src == "-" { std::io::stdin().read_to_string(&mut text).map(|_| ()) } else { std::fs::read_to_string(src).map(|t| text = t) };
+            if let Err(e) = r {
+                eprintln!("alx: cannot read overlays `{src}`: {e}");
+                return ExitCode::from(2);
+            }
+            match alx::check_json::parse_overlays(&text) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("alx: {e}");
+                    return ExitCode::from(2);
+                }
+            }
+        }
+    };
+    let (json, code) = alx::check_json::check_json(Path::new(file), &map, unit);
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{json}");
+    let _ = out.flush();
+    ExitCode::from(code as u8)
+}
+
 /// `alx explain mem`: where each allocation lives, and why (R7).
 pub fn explain_mem(file: &str) -> ExitCode {
     match frontend(file) {

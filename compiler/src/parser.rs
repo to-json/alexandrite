@@ -72,7 +72,13 @@ pub struct Parser<'a> {
     /// A command literal that needed the parser's own `os/exec` import
     /// (`CMD_PKG`): the first one's span.
     cmd_own: Option<Span>,
+    /// Recovering mode: errors are recorded and parsing resumes at the next declaration.
+    recover: bool,
+    errors: Vec<Diag>,
 }
+
+/// The most syntax errors one file reports.
+pub const MAX_ERRORS: usize = 50;
 
 type PResult<T> = Result<T, Diag>;
 
@@ -82,21 +88,27 @@ const CMD_PKG: &str = "alxexec";
 
 pub fn parse(file: u32, toks: &[Token], next_id: &mut NodeId) -> PResult<Module> {
     let mut p = Parser::new(toks, next_id, vec![HashSet::new()]);
-    // A file that imports os/exec itself: its command literals use that import.
-    p.cmd_pkg = (0..toks.len()).find_map(|k| {
-        let line_start = k == 0 || matches!(toks[k - 1].tok, Tok::Newline | Tok::Op(";"));
-        match (&toks[k].tok, toks.get(k + 1).map(|t| &t.tok), toks.get(k + 2).map(|t| &t.tok)) {
-            (Tok::Ident(kw), Some(Tok::Str(p)), _) if line_start && kw == "import" && p == "os/exec" => Some(default_import_name(p)),
-            (Tok::Ident(kw), Some(Tok::Ident(a)), Some(Tok::Str(p))) if line_start && kw == "import" && p == "os/exec" => Some(a.clone()),
-            _ => None,
+    p.setup(toks);
+    p.finish(file)
+}
+
+/// Parse keeping going after a syntax error: one error per broken top-level
+/// declaration (at most `MAX_ERRORS`), resuming at the next declaration keyword.
+/// The first error equals the one `parse` returns. The module is partial when
+/// the list is not empty (derives are not expanded).
+pub fn parse_recovering(file: u32, toks: &[Token], next_id: &mut NodeId) -> (Module, Vec<Diag>) {
+    let mut p = Parser::new(toks, next_id, vec![HashSet::new()]);
+    p.recover = true;
+    p.setup(toks);
+    match p.finish(file) {
+        Ok(m) => (m, std::mem::take(&mut p.errors)),
+        Err(e) => {
+            let mut errs = std::mem::take(&mut p.errors);
+            errs.push(e);
+            let m = Module { file, overflow: Overflow::Abort, external_test: false, imports: vec![], public: Default::default(), defs: vec![], structs: vec![], enums: vec![], refines: vec![], ifaces: vec![], consts: vec![], main: vec![], tests: vec![] };
+            (m, errs)
         }
-    });
-    let mut m = p.module(file)?;
-    // Command literals call into os/exec (also from inside `#{...}`).
-    if let Some(span) = p.cmd_own {
-        m.imports.push(Import { alias: Some(CMD_PKG.into()), path: "os/exec".into(), span });
     }
-    Ok(m)
 }
 
 /// One expression (the whole token stream), for code the checker writes as
@@ -113,6 +125,27 @@ pub fn parse_expr(toks: &[Token], next_id: &mut NodeId, locals: &[String]) -> PR
 }
 
 impl<'a> Parser<'a> {
+    fn setup(&mut self, toks: &[Token]) {
+        // A file that imports os/exec itself: its command literals use that import.
+        self.cmd_pkg = (0..toks.len()).find_map(|k| {
+            let line_start = k == 0 || matches!(toks[k - 1].tok, Tok::Newline | Tok::Op(";"));
+            match (&toks[k].tok, toks.get(k + 1).map(|t| &t.tok), toks.get(k + 2).map(|t| &t.tok)) {
+                (Tok::Ident(kw), Some(Tok::Str(p)), _) if line_start && kw == "import" && p == "os/exec" => Some(default_import_name(p)),
+                (Tok::Ident(kw), Some(Tok::Ident(a)), Some(Tok::Str(p))) if line_start && kw == "import" && p == "os/exec" => Some(a.clone()),
+                _ => None,
+            }
+        });
+    }
+
+    fn finish(&mut self, file: u32) -> PResult<Module> {
+        let mut m = self.module(file)?;
+        // Command literals call into os/exec (also from inside `#{...}`).
+        if let Some(span) = self.cmd_own {
+            m.imports.push(Import { alias: Some(CMD_PKG.into()), path: "os/exec".into(), span });
+        }
+        Ok(m)
+    }
+
     fn new(toks: &'a [Token], next_id: &'a mut NodeId, scopes: Vec<HashSet<String>>) -> Self {
         Parser {
             toks,
@@ -132,6 +165,8 @@ impl<'a> Parser<'a> {
             gjobs: vec![],
             cmd_pkg: None,
             cmd_own: None,
+            recover: false,
+            errors: vec![],
         }
     }
     fn peek(&self) -> &Tok {
@@ -244,9 +279,34 @@ impl<'a> Parser<'a> {
             self.skip_newlines();
         }
         loop {
+            let start = self.pos;
+            match self.top_decl(&mut m) {
+                Ok(true) => break,
+                Ok(false) => {}
+                Err(e) => {
+                    if !self.recover {
+                        return Err(e);
+                    }
+                    self.errors.push(e);
+                    if self.errors.len() >= MAX_ERRORS {
+                        break;
+                    }
+                    self.resync(start);
+                }
+            }
+        }
+        if !self.errors.is_empty() {
+            return Ok(m);
+        }
+        self.expand_derives(&mut m)?;
+        Ok(m)
+    }
+
+    /// One top-level declaration or statement; `Ok(true)` at the end of the file.
+    fn top_decl(&mut self, m: &mut Module) -> PResult<bool> {
             self.skip_newlines();
             match self.peek().clone() {
-                Tok::Eof => break,
+                Tok::Eof => return Ok(true),
                 Tok::Kw(Kw::Require) => {
                     return Err(Diag::new(self.span(), "`require` is now `import \"path\"` (a package directory)"));
                 }
@@ -360,7 +420,7 @@ impl<'a> Parser<'a> {
                             self.skip_line_continuation();
                             let value = self.expr()?;
                             m.public.insert(name.clone());
-                            self.top_value(&mut m, name, sp, ty, value);
+                            self.top_value(m, name, sp, ty, value);
                         }
                         t => return Err(Diag::new(self.span(), format!("`pub` goes before a declaration, found {}", describe(&t)))),
                     }
@@ -419,7 +479,7 @@ impl<'a> Parser<'a> {
                     self.expect_op("=")?;
                     self.skip_line_continuation();
                     let value = self.expr()?;
-                    self.top_value(&mut m, name, sp, ty, value);
+                    self.top_value(m, name, sp, ty, value);
                 }
                 Tok::Directive(..) => return Err(Diag::new(self.span(), "directives must come first in the file")),
                 _ => {
@@ -427,9 +487,44 @@ impl<'a> Parser<'a> {
                     m.main.push(s);
                 }
             }
+        Ok(false)
+    }
+
+    /// Error recovery: move to the next top-level declaration keyword that starts a
+    /// line outside every brace, scanning from the declaration that failed.
+    fn resync(&mut self, start: usize) {
+        let mut depth = 0i32;
+        let from = self.pos.max(start + 1);
+        let mut k = start;
+        while k < self.toks.len() {
+            let t = &self.toks[k].tok;
+            match t {
+                Tok::Op("{") => depth += 1,
+                Tok::Op("}") => depth = (depth - 1).max(0),
+                Tok::Eof => break,
+                _ => {}
+            }
+            if k >= from && depth == 0 && k > start && matches!(self.toks[k - 1].tok, Tok::Newline | Tok::Op(";")) {
+                let decl = match t {
+                    Tok::Kw(Kw::Def | Kw::Fn | Kw::Struct | Kw::Enum | Kw::Interface) | Tok::Attr(_) | Tok::Directive(..) => true,
+                    Tok::Ident(kw) => matches!(kw.as_str(), "import" | "pub" | "error" | "refine" | "test" | "bench" | "example" | "extern"),
+                    Tok::Const(_) => matches!(self.toks.get(k + 1).map(|t| &t.tok), Some(Tok::Op("=") | Tok::Op(":"))),
+                    _ => false,
+                };
+                if decl {
+                    break;
+                }
+            }
+            k += 1;
         }
-        self.expand_derives(&mut m)?;
-        Ok(m)
+        self.pos = k.min(self.toks.len().saturating_sub(1));
+        self.scopes.truncate(1);
+        self.in_cond = false;
+        self.extern_mode = false;
+        self.cur_derives.clear();
+        self.cur_asn1 = Default::default();
+        self.cur_data_name = None;
+        self.cur_transparent = false;
     }
 
     /// `#[embed("pattern", ...)] [pub] NAME: Type` (Go's `//go:embed`): a

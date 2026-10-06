@@ -1,187 +1,420 @@
-# Sorting kernels, instantiated three ways by gen_sort.py (see the header of
-# the generated file): ordered (`<`), `cmp` (a function returning an Int that
-# is negative, zero or positive) and `less` (a function returning a Bool).
-# LT(a, b) is "a sorts before b". All ranges are [lo, hi).
+# Go's sorting kernels (sort/gen_sort_variants.go, generated there as
+# slices/zsortordered.go, zsortanyfunc.go and sort/zsortfunc.go,
+# zsortinterface.go), instantiated by tools/gen_sort.alx. Pattern-defeating
+# quicksort for the unstable sorts and insertion sort + SymMerge for the stable
+# ones, step for step, so unstable sorts leave equal elements where Go leaves
+# them. LESS(i, j) is "data[i] sorts before data[j]"; SWAP(i, j) exchanges them.
+# {TP} are the type parameters, {DP} the data parameter, {P} the extra
+# parameter (the comparison function) and {A} its argument.
 
-# Insertion sort. Stable: an element moves past only strictly greater ones.
-def insertion_sort{S}[T](xs: [T], lo: Int, hi: Int{P}) {
-  i = lo + 1
-  while i < hi {
-    v = xs[i]
+# Sorts data[a...b] using insertion sort.
+def insertion_sort{S}{TP}({DP}, a: Int, b: Int{P}) {
+  i = a + 1
+  while i < b {
     j = i
-    while j > lo && LT(v, xs[j - 1]) {
-      xs[j] = xs[j - 1]
+    while j > a && LESS(j, j - 1) {
+      SWAP(j, j - 1)
       j -= 1
     }
-    xs[j] = v
     i += 1
   }
 }
 
-def sift_down{S}[T](xs: [T], lo: Int, first: Int, n: Int{P}) {
-  root = first
-  while true {
+# Implements the heap property on data[lo...hi]; first is an offset into the
+# array where the root of the heap lies.
+def sift_down{S}{TP}({DP}, lo: Int, hi: Int, first: Int{P}) {
+  root = lo
+  loop {
     child = 2 * root + 1
-    break if child >= n
-    child += 1 if child + 1 < n && LT(xs[lo + child], xs[lo + child + 1])
-    break if !LT(xs[lo + root], xs[lo + child])
-    t = xs[lo + root]
-    xs[lo + root] = xs[lo + child]
-    xs[lo + child] = t
+    break if child >= hi
+    if child + 1 < hi && LESS(first + child, first + child + 1) {
+      child += 1
+    }
+    return if !LESS(first + root, first + child)
+    SWAP(first + root, first + child)
     root = child
   }
 }
 
-# The fallback that bounds the worst case at O(n log n).
-def heap_sort{S}[T](xs: [T], lo: Int, hi: Int{P}) {
-  n = hi - lo
-  i = (n - 1) / 2
+def heap_sort{S}{TP}({DP}, a: Int, b: Int{P}) {
+  first = a
+  lo = 0
+  hi = b - a
+  # Build heap with greatest element at top.
+  i = (hi - 1) / 2
   while i >= 0 {
-    sift_down{S}(xs, lo, i, n{A})
+    sift_down{S}(data, i, hi, first{A})
     i -= 1
   }
-  i = n - 1
-  while i >= 1 {
-    t = xs[lo]
-    xs[lo] = xs[lo + i]
-    xs[lo + i] = t
-    sift_down{S}(xs, lo, 0, i{A})
+  # Pop elements, largest first, into end of data.
+  i = hi - 1
+  while i >= 0 {
+    SWAP(first, first + i)
+    sift_down{S}(data, lo, i, first{A})
     i -= 1
   }
 }
 
-# The index of the median of xs[a], xs[b], xs[c].
-def median3{S}[T](xs: [T], a: Int, b: Int, c: Int{P}) -> Int {
-  if LT(xs[a], xs[b]) {
-    return b if LT(xs[b], xs[c])
-    return c if LT(xs[a], xs[c])
-    return a
-  }
-  return a if LT(xs[a], xs[c])
-  return c if LT(xs[b], xs[c])
-  b
-}
-
-# Moves a median-of-3 (median of medians for long ranges) pivot to xs[lo].
-def choose_pivot{S}[T](xs: [T], lo: Int, hi: Int{P}) {
-  n = hi - lo
-  m = lo + n / 2
-  p = 0
-  if n > 100 {
-    s = n / 8
-    a = median3{S}(xs, lo, lo + s, lo + 2 * s{A})
-    b = median3{S}(xs, m - s, m, m + s{A})
-    c = median3{S}(xs, hi - 1 - 2 * s, hi - 1 - s, hi - 1{A})
-    p = median3{S}(xs, a, b, c{A})
-  } else {
-    p = median3{S}(xs, lo, m, hi - 1{A})
-  }
-  t = xs[lo]
-  xs[lo] = xs[p]
-  xs[p] = t
-}
-
-# Introsort: Hoare-partition quicksort (equal keys stop both scans, so runs of
-# duplicates split evenly), insertion sort for short ranges, heapsort when the
-# recursion gets deeper than 2 log2 n. Recurses into the shorter side.
-def quick_sort{S}[T](xs: [T], lo: Int, hi: Int, limit: Int{P}) -> Unit {
-  while hi - lo > 12 {
-    if limit == 0 {
-      heap_sort{S}(xs, lo, hi{A})
+# Sorts data[a...b]. The algorithm is based on pattern-defeating quicksort
+# (pdqsort), but without the optimizations from BlockQuicksort
+# (https://github.com/orlp/pdqsort). limit is the number of allowed bad
+# (very unbalanced) pivots before falling back to heapsort.
+def pdqsort{S}{TP}({DP}, a: Int, b: Int, limit: Int{P}) -> Unit {
+  max_insertion = 12
+  # whether the last partitioning was reasonably balanced
+  was_balanced = true
+  # whether the slice was already partitioned
+  was_partitioned = true
+  loop {
+    length = b - a
+    if length <= max_insertion {
+      insertion_sort{S}(data, a, b{A})
       return
     }
-    limit -= 1
-    choose_pivot{S}(xs, lo, hi{A})
-    pv = xs[lo]
-    i = lo - 1
-    j = hi
-    while true {
-      i += 1
-      while LT(xs[i], pv) { i += 1 }
-      j -= 1
-      while LT(pv, xs[j]) { j -= 1 }
-      break if i >= j
-      t = xs[i]
-      xs[i] = xs[j]
-      xs[j] = t
+    # Fall back to heapsort if too many bad choices were made.
+    if limit == 0 {
+      heap_sort{S}(data, a, b{A})
+      return
     }
-    if j + 1 - lo < hi - j - 1 {
-      quick_sort{S}(xs, lo, j + 1, limit{A})
-      lo = j + 1
+    # If the last partitioning was imbalanced, we need to break patterns.
+    if !was_balanced {
+      break_patterns{S}(data, a, b{A})
+      limit -= 1
+    }
+    pivot, hint = choose_pivot{S}(data, a, b{A})
+    if hint == DECREASING_HINT {
+      reverse_range{S}(data, a, b{A})
+      # The chosen pivot was pivot-a elements after the start of the array.
+      # After reversing it is pivot-a elements before the end of the array.
+      # The idea came from Rust's implementation.
+      pivot = (b - 1) - (pivot - a)
+      hint = INCREASING_HINT
+    }
+    # The slice is likely already sorted.
+    if was_balanced && was_partitioned && hint == INCREASING_HINT {
+      return if partial_insertion_sort{S}(data, a, b{A})
+    }
+    # Probably the slice contains many duplicate elements, partition the
+    # slice into elements equal to and elements greater than the pivot.
+    if a > 0 && !LESS(a - 1, pivot) {
+      a = partition_equal{S}(data, a, b, pivot{A})
+      next
+    }
+    mid, already_partitioned = partition{S}(data, a, b, pivot{A})
+    was_partitioned = already_partitioned
+    left_len = mid - a
+    right_len = b - mid
+    balance_threshold = length / 8
+    if left_len < right_len {
+      was_balanced = left_len >= balance_threshold
+      pdqsort{S}(data, a, mid, limit{A})
+      a = mid + 1
     } else {
-      quick_sort{S}(xs, j + 1, hi, limit{A})
-      hi = j + 1
+      was_balanced = right_len >= balance_threshold
+      pdqsort{S}(data, mid + 1, b, limit{A})
+      b = mid
     }
   }
-  insertion_sort{S}(xs, lo, hi{A})
 }
 
-def reverse_range{S}[T](xs: [T], lo: Int, hi: Int) {
-  i = lo
-  j = hi - 1
+# Does one quicksort partition. Let p = data[pivot]. Moves elements in
+# data[a...b] around, so that data[i] < p and data[j] >= p for i < newpivot
+# and j > newpivot. On return, data[newpivot] = p.
+def partition{S}{TP}({DP}, a: Int, b: Int, pivot: Int{P}) -> (Int, Bool) {
+  SWAP(a, pivot)
+  i = a + 1
+  j = b - 1 # i and j are inclusive of the elements remaining to be partitioned
+  while i <= j && LESS(i, a) { i += 1 }
+  while i <= j && !LESS(j, a) { j -= 1 }
+  if i > j {
+    SWAP(j, a)
+    return (j, true)
+  }
+  SWAP(i, j)
+  i += 1
+  j -= 1
+  loop {
+    while i <= j && LESS(i, a) { i += 1 }
+    while i <= j && !LESS(j, a) { j -= 1 }
+    break if i > j
+    SWAP(i, j)
+    i += 1
+    j -= 1
+  }
+  SWAP(j, a)
+  (j, false)
+}
+
+# Partitions data[a...b] into elements equal to data[pivot] followed by
+# elements greater than data[pivot]. It assumes that data[a...b] does not
+# contain elements smaller than the data[pivot].
+def partition_equal{S}{TP}({DP}, a: Int, b: Int, pivot: Int{P}) -> Int {
+  SWAP(a, pivot)
+  i = a + 1
+  j = b - 1 # i and j are inclusive of the elements remaining to be partitioned
+  loop {
+    while i <= j && !LESS(a, i) { i += 1 }
+    while i <= j && LESS(a, j) { j -= 1 }
+    break if i > j
+    SWAP(i, j)
+    i += 1
+    j -= 1
+  }
+  i
+}
+
+# Partially sorts a slice, returns true if the slice is sorted at the end.
+def partial_insertion_sort{S}{TP}({DP}, a: Int, b: Int{P}) -> Bool {
+  # maximum number of adjacent out-of-order pairs that will get shifted
+  max_steps = 5
+  # don't shift any elements on short arrays
+  shortest_shifting = 50
+  i = a + 1
+  step = 0
+  while step < max_steps {
+    while i < b && !LESS(i, i - 1) { i += 1 }
+    return true if i == b
+    return false if b - a < shortest_shifting
+    SWAP(i, i - 1)
+    # Shift the smaller one to the left.
+    if i - a >= 2 {
+      j = i - 1
+      while j >= 1 {
+        break if !LESS(j, j - 1)
+        SWAP(j, j - 1)
+        j -= 1
+      }
+    }
+    # Shift the greater one to the right.
+    if b - i >= 2 {
+      j = i + 1
+      while j < b {
+        break if !LESS(j, j - 1)
+        SWAP(j, j - 1)
+        j += 1
+      }
+    }
+    step += 1
+  }
+  false
+}
+
+# Scatters some elements around in an attempt to break some patterns that
+# might cause imbalanced partitions in quicksort.
+def break_patterns{S}{TP}({DP}, a: Int, b: Int{P}) {
+  length = b - a
+  if length >= 8 {
+    random = length.as_u64 # Go's xorshift
+    modulus = next_power_of_two(length)
+    idx = a + (length / 4) * 2 - 1
+    while idx <= a + (length / 4) * 2 + 1 {
+      random ^= random << 13
+      random ^= random >> 7
+      random ^= random << 17
+      other = (random & (modulus - 1)).as_i64
+      other -= length if other >= length
+      SWAP(idx, a + other)
+      idx += 1
+    }
+  }
+}
+
+# Chooses a pivot in data[a...b]: the median of 3, or the Tukey ninther
+# (median of medians) for slices of 50 or more. Also returns a hint about
+# the order: INCREASING_HINT if no swaps were needed (possibly sorted),
+# DECREASING_HINT if all were (possibly reverse sorted), else UNKNOWN_HINT.
+def choose_pivot{S}{TP}({DP}, a: Int, b: Int{P}) -> (Int, Int) {
+  shortest_ninther = 50
+  max_swaps = 4 * 3
+  l = b - a
+  swaps = 0
+  i = a + l / 4 * 1
+  j = a + l / 4 * 2
+  k = a + l / 4 * 3
+  if l >= 8 {
+    if l >= shortest_ninther {
+      # Tukey ninther method, the idea came from Rust's implementation.
+      i, swaps = median_adjacent{S}(data, i, swaps{A})
+      j, swaps = median_adjacent{S}(data, j, swaps{A})
+      k, swaps = median_adjacent{S}(data, k, swaps{A})
+    }
+    # Find the median among i, j, k and stores it into j.
+    j, swaps = median{S}(data, i, j, k, swaps{A})
+  }
+  return (j, INCREASING_HINT) if swaps == 0
+  return (j, DECREASING_HINT) if swaps == max_swaps
+  (j, UNKNOWN_HINT)
+}
+
+# Returns (x, y, swaps) where data[x] <= data[y], with (x, y) one of (a, b)
+# and (b, a).
+def order2{S}{TP}({DP}, a: Int, b: Int, swaps: Int{P}) -> (Int, Int, Int) {
+  return (b, a, swaps + 1) if LESS(b, a)
+  (a, b, swaps)
+}
+
+# Returns x where data[x] is the median of data[a], data[b], data[c], with x
+# one of a, b, c, and the updated swap count.
+def median{S}{TP}({DP}, a: Int, b: Int, c: Int, swaps: Int{P}) -> (Int, Int) {
+  a, b, swaps = order2{S}(data, a, b, swaps{A})
+  b, _, swaps = order2{S}(data, b, c, swaps{A})
+  _, b, swaps = order2{S}(data, a, b, swaps{A})
+  (b, swaps)
+}
+
+# Finds the median of data[a - 1], data[a], data[a + 1] and stores the
+# index into a.
+def median_adjacent{S}{TP}({DP}, a: Int, swaps: Int{P}) -> (Int, Int) {
+  median{S}(data, a - 1, a, a + 1, swaps{A})
+}
+
+def reverse_range{S}{TP}({DP}, a: Int, b: Int{P}) {
+  i = a
+  j = b - 1
   while i < j {
-    t = xs[i]
-    xs[i] = xs[j]
-    xs[j] = t
+    SWAP(i, j)
     i += 1
     j -= 1
   }
 }
 
-# Sorts xs[lo...hi]: O(n) when it is already sorted or strictly descending.
-def sort_range{S}[T](xs: [T], lo: Int, hi: Int{P}) {
-  return if hi - lo < 2
-  i = lo + 1
-  while i < hi && !LT(xs[i], xs[i - 1]) { i += 1 }
-  return if i == hi
-  j = lo + 1
-  while j < hi && LT(xs[j], xs[j - 1]) { j += 1 }
-  if j == hi {
-    reverse_range{S}(xs, lo, hi)
-    return
-  }
-  limit = 0
-  n = hi - lo
-  while n > 0 {
-    limit += 2
-    n = n / 2
-  }
-  quick_sort{S}(xs, lo, hi, limit{A})
-}
-
-# Stable merge sort; `buf` is scratch space the size of xs.
-def merge_sort{S}[T](xs: [T], buf: [T], lo: Int, hi: Int{P}) -> Unit {
-  if hi - lo <= 12 {
-    insertion_sort{S}(xs, lo, hi{A})
-    return
-  }
-  mid = lo + (hi - lo) / 2
-  merge_sort{S}(xs, buf, lo, mid{A})
-  merge_sort{S}(xs, buf, mid, hi{A})
-  return if !LT(xs[mid], xs[mid - 1])
-  copy(buf[lo...mid], xs[lo...mid])
-  i = lo
-  j = mid
-  k = lo
-  while i < mid && j < hi {
-    if LT(xs[j], buf[i]) {
-      xs[k] = xs[j]
-      j += 1
-    } else {
-      xs[k] = buf[i]
-      i += 1
-    }
-    k += 1
-  }
-  while i < mid {
-    xs[k] = buf[i]
+def swap_range{S}{TP}({DP}, a: Int, b: Int, n: Int{P}) {
+  i = 0
+  while i < n {
+    SWAP(a + i, b + i)
     i += 1
-    k += 1
   }
 }
 
-def stable_sort{S}[T](xs: [T]{P}) {
-  return if xs.size < 2
-  buf = xs.dup
-  merge_sort{S}(xs, buf, 0, xs.size{A})
+# Insertion sort on blocks of 20, then SymMerge on doubling block sizes: a
+# stable sort with O(n*log(n)) calls to LESS and O(n*log(n)*log(n)) calls to
+# SWAP, in place.
+def stable_sort{S}{TP}({DP}, n: Int{P}) {
+  block_size = 20 # must be > 0
+  a = 0
+  b = block_size
+  while b <= n {
+    insertion_sort{S}(data, a, b{A})
+    a = b
+    b += block_size
+  }
+  insertion_sort{S}(data, a, n{A})
+  while block_size < n {
+    a = 0
+    b = 2 * block_size
+    while b <= n {
+      sym_merge{S}(data, a, a + block_size, b{A})
+      a = b
+      b += 2 * block_size
+    }
+    m = a + block_size
+    if m < n {
+      sym_merge{S}(data, a, m, n{A})
+    }
+    block_size *= 2
+  }
+}
+
+# Merges the two sorted subsequences data[a...m] and data[m...b] using the
+# SymMerge algorithm from Pok-Son Kim and Arne Kutzner, "Stable Minimum
+# Storage Merging by Symmetric Comparisons", in Susanne Albers and Tomasz
+# Radzik, editors, Algorithms - ESA 2004, volume 3221 of Lecture Notes in
+# Computer Science, pages 714-723. Springer, 2004.
+def sym_merge{S}{TP}({DP}, a: Int, m: Int, b: Int{P}) -> Unit {
+  # Avoid unnecessary recursions of sym_merge by direct insertion of
+  # data[a] into data[m...b] if data[a...m] only contains one element.
+  if m - a == 1 {
+    # Use binary search to find the lowest index i such that
+    # data[i] >= data[a] for m <= i < b. Exit the search loop with i == b in
+    # case no such index exists.
+    i = m
+    j = b
+    while i < j {
+      h = (i + j) / 2
+      if LESS(h, a) {
+        i = h + 1
+      } else {
+        j = h
+      }
+    }
+    # Swap values until data[a] reaches the position before i.
+    k = a
+    while k < i - 1 {
+      SWAP(k, k + 1)
+      k += 1
+    }
+    return
+  }
+  # Avoid unnecessary recursions of sym_merge by direct insertion of
+  # data[m] into data[a...m] if data[m...b] only contains one element.
+  if b - m == 1 {
+    # Use binary search to find the lowest index i such that
+    # data[i] > data[m] for a <= i < m. Exit the search loop with i == m in
+    # case no such index exists.
+    i = a
+    j = m
+    while i < j {
+      h = (i + j) / 2
+      if !LESS(m, h) {
+        i = h + 1
+      } else {
+        j = h
+      }
+    }
+    # Swap values until data[m] reaches the position i.
+    k = m
+    while k > i {
+      SWAP(k, k - 1)
+      k -= 1
+    }
+    return
+  }
+  mid = (a + b) / 2
+  n = mid + m
+  start = 0
+  r = 0
+  if m > mid {
+    start = n - b
+    r = mid
+  } else {
+    start = a
+    r = m
+  }
+  p = n - 1
+  while start < r {
+    c = (start + r) / 2
+    if !LESS(p - c, c) {
+      start = c + 1
+    } else {
+      r = c
+    }
+  }
+  end = n - start
+  if start < m && m < end {
+    rotate{S}(data, start, m, end{A})
+  }
+  if a < start && start < mid {
+    sym_merge{S}(data, a, start, mid{A})
+  }
+  if mid < end && end < b {
+    sym_merge{S}(data, mid, end, b{A})
+  }
+}
+
+# Rotates two consecutive blocks u = data[a...m] and v = data[m...b]:
+# data[a...b] becomes v + u. Uses at most b - a swaps.
+def rotate{S}{TP}({DP}, a: Int, m: Int, b: Int{P}) {
+  i = m - a
+  j = b - m
+  while i != j {
+    if i > j {
+      swap_range{S}(data, m - i, m, j{A})
+      i -= j
+    } else {
+      swap_range{S}(data, m - i, m + j - i, i{A})
+      j -= i
+    }
+  }
+  # i == j
+  swap_range{S}(data, m - i, m, i{A})
 }

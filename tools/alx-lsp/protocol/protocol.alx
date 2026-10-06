@@ -1,0 +1,210 @@
+# Package protocol: the LSP types the server reads and writes, as
+# `#[derive(Json)]` structs, plus file:// URI conversion.
+#
+# Decoding ignores unknown fields (as Go's does), so each struct lists only
+# what the server uses. A missing field decodes as its zero value; optional
+# fields are `T?`.
+
+import "alx.dev/lsp/jsonrpc"
+import "encoding/json"
+import "strings"
+
+pub SEVERITY_ERROR = 1
+pub SEVERITY_WARNING = 2
+pub SEVERITY_INFO = 3
+pub SEVERITY_HINT = 4
+
+pub MSG_ERROR = 1
+pub MSG_WARNING = 2
+pub MSG_INFO = 3
+pub MSG_LOG = 4
+
+#[derive(Json)]
+pub struct Position {
+  line: Int
+  character: Int
+}
+
+#[derive(Json)]
+pub struct Range {
+  start: Position
+  end: Position
+}
+
+#[derive(Json)]
+pub struct Diagnostic {
+  range: Range
+  severity: Int
+  source: Str
+  message: Str
+}
+
+#[derive(Json)]
+pub struct PublishDiagnosticsParams {
+  uri: Str
+  #[json(omit_empty)] version: Int?
+  diagnostics: [Diagnostic]
+}
+
+#[derive(Json)]
+pub struct LogMessageParams {
+  #[json("type")] kind: Int
+  message: Str
+}
+
+#[derive(Json)]
+pub struct TextDocumentItem {
+  uri: Str
+  version: Int
+  text: Str
+}
+
+#[derive(Json)]
+pub struct TextDocumentIdentifier {
+  uri: Str
+}
+
+#[derive(Json)]
+pub struct VersionedTextDocumentIdentifier {
+  uri: Str
+  version: Int
+}
+
+#[derive(Json)]
+pub struct DidOpenParams {
+  textDocument: TextDocumentItem
+}
+
+# Full sync: the last change carries the whole text.
+#[derive(Json)]
+pub struct ContentChange {
+  text: Str
+}
+
+#[derive(Json)]
+pub struct DidChangeParams {
+  textDocument: VersionedTextDocumentIdentifier
+  contentChanges: [ContentChange]
+}
+
+#[derive(Json)]
+pub struct DidSaveParams {
+  textDocument: TextDocumentIdentifier
+}
+
+#[derive(Json)]
+pub struct DidCloseParams {
+  textDocument: TextDocumentIdentifier
+}
+
+#[derive(Json)]
+pub struct GeneralCaps {
+  positionEncodings: [Str]
+}
+
+#[derive(Json)]
+pub struct ClientCaps {
+  general: GeneralCaps?
+}
+
+#[derive(Json)]
+pub struct InitializeParams {
+  rootUri: Str?
+  capabilities: ClientCaps?
+  initializationOptions: json.Value?
+}
+
+#[derive(Json)]
+pub struct SyncOptions {
+  openClose: Bool
+  change: Int
+  save: Bool
+}
+
+#[derive(Json)]
+pub struct ServerCaps {
+  positionEncoding: Str
+  textDocumentSync: SyncOptions
+}
+
+#[derive(Json)]
+pub struct ServerInfo {
+  name: Str
+  version: Str
+}
+
+#[derive(Json)]
+pub struct InitializeResult {
+  capabilities: ServerCaps
+  serverInfo: ServerInfo
+}
+
+# file:///a/b%20c.alx -> /a/b c.alx ("" when not a file URI).
+pub def uri_to_path(uri: Str) -> Str {
+  return "" unless uri.start_with?("file://")
+  rest = uri[7...uri.size]
+  unless rest.start_with?("/") {
+    k = strings.index(rest, "/")
+    rest = k < 0 ? "" : rest[k...rest.size]
+  }
+  out: [Byte] = []
+  i = 0
+  while i < rest.size {
+    c = rest[i]
+    if c == 37 && i + 2 < rest.size && hex(rest[i + 1]) >= 0 && hex(rest[i + 2]) >= 0 {
+      out << (hex(rest[i + 1]) * 16 + hex(rest[i + 2])).as_u8
+      i += 3
+    } else {
+      out << c
+      i += 1
+    }
+  }
+  Str.from_bytes(out)
+}
+
+def hex(c: Byte) -> Int {
+  return (c - 48).to_i if c >= 48 && c <= 57
+  return (c - 97).to_i + 10 if c >= 97 && c <= 102
+  return (c - 65).to_i + 10 if c >= 65 && c <= 70
+  -1
+}
+
+# /a/b c.alx -> file:///a/b%20c.alx
+pub def path_to_uri(path: Str) -> Str {
+  digits = "0123456789ABCDEF"
+  out: [Byte] = []
+  for c in path.bytes {
+    ok = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 45 || c == 46 || c == 95 || c == 126 || c == 47
+    if ok {
+      out << c
+    } else {
+      out << 37
+      out << digits[(c / 16).to_i]
+      out << digits[(c % 16).to_i]
+    }
+  }
+  "file://" + Str.from_bytes(out)
+}
+
+# ---- encoding by hand
+#
+# The derived `to_json` keeps the value it encodes alive for the life of the
+# process (the encoder's shared buffer pins it to the program region), which a
+# server publishing after every edit cannot afford. These write the same JSON
+# as the derives would.
+
+pub def diagnostics_json(uri: Str, version: Int?, ds: [Diagnostic]) -> Str {
+  parts: [Str] = []
+  for d in ds {
+    parts << "{\"range\":{\"start\":{\"line\":#{d.range.start.line},\"character\":#{d.range.start.character}},\"end\":{\"line\":#{d.range.end.line},\"character\":#{d.range.end.character}}},\"severity\":#{d.severity},\"source\":#{jsonrpc.quote(d.source)},\"message\":#{jsonrpc.quote(d.message)}}"
+  }
+  v = ""
+  if n = version {
+    v = "\"version\":#{n},"
+  }
+  "{\"uri\":#{jsonrpc.quote(uri)},#{v}\"diagnostics\":[#{parts.join(",")}]}"
+}
+
+pub def log_json(kind: Int, message: Str) -> Str {
+  "{\"type\":#{kind},\"message\":#{jsonrpc.quote(message)}}"
+}

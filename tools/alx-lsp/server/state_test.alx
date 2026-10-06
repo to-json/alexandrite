@@ -1,0 +1,65 @@
+import "alx.dev/lsp/compiler"
+import "alx.dev/lsp/position"
+import "encoding/json"
+
+def d(file: Str, phase: Str, lo: Int, hi: Int) -> compiler.Diag {
+  compiler.Diag.new(file: file, phase: phase, severity: "error", lo: lo, hi: hi, line: 0, col: lo, end_line: 0, end_col: hi, message: "m#{lo}", notes: [])
+}
+
+test "parse_opts: nested, flat, absent, bad unit" {
+  v = ~json.parse("{\"alx\":{\"path\":\"/a/alx\",\"stdDir\":\"/s\",\"unit\":\"package\"}}")
+  o = parse_opts(v)
+  assert_eq o.path, "/a/alx"
+  assert_eq o.std_dir, "/s"
+  assert_eq o.unit, "package"
+  o2 = parse_opts(~json.parse("{\"path\":\"/p\",\"unit\":\"weird\"}"))
+  assert_eq o2.path, "/p"
+  assert_eq o2.unit, ""
+  assert_eq parse_opts(none).path, ""
+}
+
+test "shift_diags moves only the edited file's diagnostics" {
+  e = position.diff("abcdef", "abXXcdef")
+  out = shift_diags([d("/a", "check", 4, 6), d("/b", "check", 4, 6), d("/a", "check", 0, 1)], "/a", e)
+  assert_eq out[0].lo, 6
+  assert_eq out[0].hi, 8
+  assert_eq out[1].lo, 4
+  assert_eq out[2].lo, 0
+}
+
+test "merge keeps semantic diagnostics only beside a syntax error" {
+  prev = [d("/a", "check", 1, 2), d("/a", "internal", 3, 4)]
+  fresh_ok = [d("/a", "warning", 5, 6)]
+  assert_eq merge(prev, fresh_ok, "/a").size, 1
+  broken = [d("/a", "parse", 7, 8)]
+  m = merge(prev, broken, "/a")
+  assert_eq m.size, 2
+  assert_eq m[0].phase, "parse"
+  assert_eq m[1].phase, "check"
+  # a syntax error in some other file does not freeze the focused one
+  assert_eq merge(prev, [d("/b", "parse", 0, 1)], "/a").size, 1
+}
+
+test "plan: the edited buffer, plus buffers of the same unit or listing it" {
+  docs = ["file:///w/a.alx", "file:///w/b.alx", "file:///x/c.alx", "file:///y/d.alx"]
+  results: Map[Str, Entry] = {
+    "file:///w/b.alx" => entry_of("/w/b.alx", "/w", []),
+    "file:///x/c.alx" => entry_of("/x/c.alx", "/x", [d("/w/a.alx", "check", 0, 1)]),
+    "file:///y/d.alx" => entry_of("/y/d.alx", "/y", [])
+  }
+  got = plan(docs, results, ["file:///w/a.alx"])
+  assert_eq got, ["file:///w/a.alx", "file:///w/b.alx", "file:///x/c.alx"]
+}
+
+test "lsp_diags: open buffer uses offsets, dedupes, joins notes" {
+  ds = [d("/a", "check", 2, 4), d("/a", "check", 2, 4), d("/b", "check", 0, 1)]
+  out = lsp_diags(ds, "/a", "xxéz", position.UTF16)
+  assert_eq out.size, 1
+  assert_eq out[0].range.start.character, 2
+  assert_eq out[0].range.end.character, 3
+}
+
+test "std_dir_for" {
+  assert_eq std_dir_for("/set", "", "/q/std/a.alx"), "/set"
+  assert_eq std_dir_for("", "", "/nowhere/a.alx"), ""
+}

@@ -1,0 +1,227 @@
+# Package compiler: how the server runs the alx compiler's analysis mode.
+#
+# `Client` is the seam: `ExecClient` runs `alx check --json --overlays F FILE`
+# through os/exec (the overlay JSON, every open buffer, is written to F first:
+# a file, not the child's stdin, so the texts never enter the Cmd), `FakeClient` answers from canned rules for tests.
+#
+# The JSON schema is the compiler's (docs/notes/lsp-plan.md 1.1): one object
+# {unit, root, diagnostics: [{file, phase, severity, lo, hi, line, col,
+# end_line, end_col, message, notes}]}; `line` is 0-based, `col` a byte column.
+#
+# Output that is not valid JSON is not an error here: the Outcome carries
+# `failure` (what to show) and the child's stderr, and the server turns that
+# into one diagnostic and a log line.
+
+import "alx.dev/lsp/jsonrpc"
+import "encoding/json"
+import "os"
+import "os/exec"
+import "path"
+import "strings"
+import "time"
+
+#[derive(Json)]
+pub struct Diag {
+  file: Str
+  phase: Str
+  severity: Str
+  lo: Int
+  hi: Int
+  line: Int
+  col: Int
+  end_line: Int
+  end_col: Int
+  message: Str
+  notes: [Str]
+
+  # A syntax-level problem (the buffer does not parse or load).
+  pub def syntax? -> Bool { phase == "parse" || phase == "load" }
+}
+
+#[derive(Json)]
+pub struct Report {
+  unit: Str
+  root: Str
+  diagnostics: [Diag]
+}
+
+# What a check is about. The unsaved texts are not in it: the caller writes
+# them (`overlays_json`) to `overlay_file`, so a request stays small (a request
+# is handed to an unknown callee, which the region analysis must treat as
+# keeping it forever: the texts must not be reachable from it).
+pub struct Request {
+  alx: Str          # the compiler binary (ExecClient)
+  file: Str         # the focused file (absolute path)
+  unit: Str         # "" (auto), "script" or "package"
+  std_dir: Str      # "" or the ALX_STD_DIR for the child
+  overlay_file: Str # the overlay JSON {abs path: text}, for `--overlays FILE`
+}
+
+pub struct Outcome {
+  report: Report?
+  failure: Str # why there is no report: non-JSON output, spawn failure, timeout
+  stderr: Str
+}
+
+pub interface Client {
+  def check!(req: Request) -> Outcome
+}
+
+# ---------------------------------------------------------------- exec client
+
+pub struct ExecClient {
+  unused: Int
+
+  pub def check!(req: Request) -> Outcome {
+    args = ["check", "--json", "--overlays", req.overlay_file]
+    if req.unit != "" {
+      args << "--unit"
+      args << req.unit
+    }
+    args << req.file
+    c = exec.command(req.alx, args)
+    c.check = false
+    c.env = os.environ + ["ALX_STD_DIR=#{req.std_dir}"] if req.std_dir != ""
+    r = run(c)
+    if r.err != none {
+      msg = r.err.unwrap.message
+      return Outcome.new(report: none, failure: "cannot run #{req.alx}: #{msg}", stderr: "")
+    }
+    cap = r.unwrap
+    parsed = Report.from_json(cap.stdout)
+    if parsed.ok? {
+      return Outcome.new(report: parsed.unwrap, failure: "", stderr: cap.stderr)
+    }
+    why = cap.state.success ? "output is not JSON" : "exit #{cap.state.exit_code}"
+    Outcome.new(report: none, failure: "alx check failed (#{why}): #{first_line(cap.stderr == "" ? cap.stdout : cap.stderr)}", stderr: cap.stderr)
+  }
+}
+
+# The ONE place the child is run; it gets a timeout so a hung compiler cannot
+# stall the server (the failure shows as a diagnostic: "cannot run alx: ...").
+def run(c: exec.Cmd) -> ~exec.Captured {
+  c.timeout = time.Duration.new(CHECK_TIMEOUT_NS)
+  c.~capture
+}
+
+CHECK_TIMEOUT_NS = 20000000000
+
+def first_line(s: Str) -> Str {
+  t = strings.trim_space(s)
+  i = strings.index(t, "\n")
+  l = i < 0 ? t : t[0...i]
+  l.size > 300 ? l[0...300] : l
+}
+
+# {"/abs/path": "text", ...} (built by hand: encoding/json's encoder pins
+# its buffers to the program region, which a 100 KB text per check cannot afford)
+pub def overlays_json(m: Map[Str, Str]) -> Str {
+  parts: [Str] = []
+  for k, v in m {
+    parts << jsonrpc.quote(k) + ":" + jsonrpc.quote(v)
+  }
+  "{" + parts.join(",") + "}"
+}
+
+# `alx` named by the setting, else beside `self_path` (the server binary),
+# else on PATH.
+pub def find_alx(setting: Str, self_path: Str) -> Str {
+  return setting if setting != ""
+  beside = path.join([path.dir(self_path), "alx"])
+  return beside if os.stat(beside).ok?
+  l = exec.look_path("alx")
+  l.ok? ? l.unwrap : "alx"
+}
+
+# The alexandrite repo (a directory with std/ and compiler/) at or above a
+# path, "" if there is none.
+pub def find_repo(p: Str) -> Str {
+  d = p
+  loop {
+    if os.stat(path.join([d, "std"])).ok? && os.stat(path.join([d, "compiler"])).ok? {
+      return d
+    }
+    up = path.dir(d)
+    return "" if up == d || up == "" || up == "."
+    d = up
+  }
+}
+
+# ---------------------------------------------------------------- fake client
+
+# One canned answer: used when the focused file's overlay text contains
+# `contains` ("" matches anything). In `result`, a diagnostic whose file is
+# "$FILE" is reported on the focused file.
+#[derive(Json)]
+pub struct Rule {
+  contains: Str
+  result: Report
+  stderr: Str
+  raw: Str # if non-empty: this text is the compiler's stdout instead of `result`
+}
+
+pub struct FakeClient {
+  rules: [Rule]
+  calls: [Int] # calls[0] counts check calls (shared by copies)
+
+  pub def check!(req: Request) -> Outcome {
+    self.calls[0] += 1
+    text = jsonrpc.string_at(os.read_file_string(req.overlay_file).unwrap_or(""), [req.file]) || ""
+    file = copy_str(req.file)
+    for r in rules {
+      if r.contains == "" || strings.contains(text, r.contains) {
+        return fail_outcome(r) if r.raw != ""
+        ds = r.result.diagnostics.map { |d|
+          Diag.new(file: d.file == "$FILE" ? file : d.file, phase: d.phase, severity: d.severity, lo: d.lo, hi: d.hi, line: d.line, col: d.col, end_line: d.end_line, end_col: d.end_col, message: d.message, notes: d.notes)
+        }
+        return Outcome.new(report: Report.new(unit: r.result.unit, root: r.result.root, diagnostics: ds), failure: "", stderr: r.stderr)
+      }
+    }
+    Outcome.new(report: Report.new(unit: "script", root: path.dir(req.file), diagnostics: []), failure: "", stderr: "")
+  }
+}
+
+def fail_outcome(r: Rule) -> Outcome {
+  Outcome.new(report: none, failure: "alx check failed (output is not JSON): #{first_line(r.raw)}", stderr: r.stderr)
+}
+
+pub def new_fake(rules: [Rule]) -> FakeClient {
+  FakeClient.new(rules: rules, calls: [0])
+}
+
+# Loads canned rules from a JSON file: an array of Rule objects.
+pub def load_fake(file: Str) -> ~FakeClient {
+  text = ~os.read_file_string(file)
+  rules = ~json_rules(text)
+  new_fake(rules)
+}
+
+def json_rules(text: Str) -> ~[Rule] {
+  v = ~json.parse(text)
+  out: [Rule] = []
+  for i in 0...v.size {
+    out << ~Rule.from_json((v.at(i) || json.Value.json_zero).to_s)
+  }
+  out
+}
+
+# `alx --version`, for the log ("" if it cannot be run).
+pub def version(alx: Str) -> Str {
+  r = exec.command(alx, ["--version"]).capture
+  return "" unless r.ok?
+  strings.trim_space(r.unwrap.stdout)
+}
+
+# The same from the text of a rules file.
+pub def load_fake_text(text: Str) -> ~FakeClient {
+  new_fake(~json_rules(text))
+}
+
+# A copy sharing nothing with its source (keeps region placement local).
+def copy_str(s: Str) -> Str {
+  out: [Byte] = []
+  for c in s.bytes {
+    out << c
+  }
+  Str.from_bytes(out)
+}

@@ -1,0 +1,181 @@
+import "alx.dev/lsp/compiler"
+import "alx.dev/lsp/jsonrpc"
+import "bufio"
+import "bytes"
+import "os"
+import "strings"
+
+RULES = <<~'EOS'
+  [
+    {"contains":"BROKEN","result":{"unit":"script","root":"/w","diagnostics":[{"file":"$FILE","phase":"parse","severity":"error","lo":6,"hi":12,"line":0,"col":6,"end_line":0,"end_col":12,"message":"unexpected BROKEN","notes":[]}]}},
+    {"contains":"TYPEERR","result":{"unit":"script","root":"/w","diagnostics":[{"file":"$FILE","phase":"check","severity":"error","lo":8,"hi":15,"line":1,"col":4,"end_line":1,"end_col":11,"message":"type mismatch","notes":["expected Int"]}]}},
+    {"contains":"GARBAGE","raw":"thread panicked","stderr":"trace here"}
+  ]
+EOS
+
+# A reader that hands out one frame per read call, so the buffer is empty
+# after every message (a check follows each one).
+struct Chunks {
+  st: [ChunkState]
+
+  def read!(p: [Byte]) -> Int {
+    s = self.st[0]
+    return 0 if s.i >= s.frames.size
+    f = s.frames[s.i]
+    n = 0
+    while n < p.size && s.off + n < f.size {
+      p[n] = f[s.off + n]
+      n += 1
+    }
+    self.st[0].off = s.off + n
+    if s.off + n >= f.size {
+      self.st[0].i = s.i + 1
+      self.st[0].off = 0
+    }
+    n
+  }
+}
+
+struct ChunkState {
+  frames: [Str]
+  i: Int
+  off: Int
+}
+
+def init_msg(enc: Str) -> Str {
+  "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"rootUri\":\"file:///w\",\"capabilities\":{\"general\":{\"positionEncodings\":[#{enc}]}}}}"
+}
+
+def open_msg(uri: Str, v: Int, text: Str) -> Str {
+  "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"#{uri}\",\"languageId\":\"alexandrite\",\"version\":#{v},\"text\":#{jsonrpc.json_string(text)}}}}"
+}
+
+def change_msg(uri: Str, v: Int, text: Str) -> Str {
+  "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\"#{uri}\",\"version\":#{v}},\"contentChanges\":[{\"text\":#{jsonrpc.json_string(text)}}]}}"
+}
+
+def close_msg(uri: Str) -> Str {
+  "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didClose\",\"params\":{\"textDocument\":{\"uri\":\"#{uri}\"}}}"
+}
+
+SHUTDOWN = "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"shutdown\"}"
+EXIT = "{\"jsonrpc\":\"2.0\",\"method\":\"exit\"}"
+
+# Runs a session; returns (exit code, output bodies, check calls).
+def session(msgs: [Str], chunked: Bool) -> ~(Int, [Str], Int) {
+  fake = ~compiler.load_fake_text(RULES)
+  tmp = ~os.mkdir_temp("", "alx-lsp-test")
+  frames = msgs.map { jsonrpc.frame(it) }
+  r = bufio.new_reader(strings.new_reader(frames.join("")))
+  if chunked {
+    r = bufio.new_reader(Chunks.new(st: [ChunkState.new(frames: frames, i: 0, off: 0)]))
+  }
+  buf = bytes.new_buffer([])
+  w = bufio.new_writer(buf)
+  code = ~serve(r, w, fake, "/x/alx-lsp", tmp, false, false)
+  out = buf.string
+  rr = bufio.new_reader(strings.new_reader(out))
+  bodies: [Str] = []
+  loop {
+    b = ~jsonrpc.read_frame(rr) || break
+    bodies << b
+  }
+  (code, bodies, fake.calls[0])
+}
+
+def diag_pubs(bodies: [Str], uri: Str) -> [Str] {
+  bodies.select { strings.contains(it, "publishDiagnostics") && strings.contains(it, "\"uri\":\"#{uri}\"") }
+}
+
+test "initialize negotiates utf-8, shuts down cleanly" {
+  code, bodies, _n = ~session([init_msg("\"utf-8\",\"utf-16\""), "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}", SHUTDOWN, EXIT], false)
+  assert_eq code, 0
+  assert strings.contains(bodies[0], "\"positionEncoding\":\"utf-8\"")
+  assert strings.contains(bodies[0], "\"id\":1")
+  assert strings.contains(bodies[1], "window/logMessage")
+  assert strings.contains(bodies[2], "\"id\":9")
+}
+
+test "utf-16 when the client does not offer utf-8; exit without shutdown is 1" {
+  code, bodies, _n = ~session([init_msg("\"utf-16\""), EXIT], false)
+  assert_eq code, 1
+  assert strings.contains(bodies[0], "\"positionEncoding\":\"utf-16\"")
+}
+
+test "unknown request gets MethodNotFound, unknown notification is dropped" {
+  _c, bodies, _n = ~session([init_msg(""), "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"textDocument/hover\",\"params\":{}}", "{\"jsonrpc\":\"2.0\",\"method\":\"$/whatever\"}", SHUTDOWN, EXIT], false)
+  assert_eq bodies.size, 3
+  assert strings.contains(bodies[1], "\"id\":5")
+  assert strings.contains(bodies[1], "-32601")
+}
+
+test "requests before initialize are refused" {
+  _c, bodies, _n = ~session([SHUTDOWN, EXIT], false)
+  assert strings.contains(bodies[0], "-32002")
+}
+
+test "broken file, then a fix: diagnostics appear and clear" {
+  u = "file:///w/a.alx"
+  _c, bodies, n = ~session([init_msg("\"utf-8\""), open_msg(u, 1, "x = 1 BROKEN\n"), change_msg(u, 2, "x = 1\n"), SHUTDOWN, EXIT], true)
+  pubs = diag_pubs(bodies, u)
+  assert_eq pubs.size, 2
+  assert strings.contains(pubs[0], "\"version\":1")
+  assert strings.contains(pubs[0], "\"range\":{\"start\":{\"line\":0,\"character\":6},\"end\":{\"line\":0,\"character\":12}}")
+  assert strings.contains(pubs[0], "unexpected BROKEN")
+  assert strings.contains(pubs[1], "\"diagnostics\":[]")
+  assert strings.contains(pubs[1], "\"version\":2")
+  assert_eq n, 2
+}
+
+test "batched messages are checked once" {
+  u = "file:///w/a.alx"
+  _c, bodies, n = ~session([init_msg("\"utf-8\""), open_msg(u, 1, "x = 1 BROKEN\n"), change_msg(u, 2, "x = 1\n"), SHUTDOWN, EXIT], false)
+  assert_eq n, 1
+  assert_eq diag_pubs(bodies, u).size, 0 # the final state is clean: nothing to publish
+}
+
+test "semantic diagnostics survive a syntax error, shifted through edits" {
+  u = "file:///w/a.alx"
+  typeerr = "x = 1\ny = TYPEERR\n"
+  # a new first line moves the type error down; a syntax error elsewhere keeps it
+  broken = "# top\nx = 1\ny = TYPEERR BROKEN\n"
+  _c, bodies, _n = ~session([init_msg("\"utf-8\""), open_msg(u, 1, typeerr), change_msg(u, 2, "# top\n" + typeerr), change_msg(u, 3, broken), SHUTDOWN, EXIT], true)
+  pubs = diag_pubs(bodies, u)
+  assert_eq pubs.size, 3
+  # check 1: lo 8..15 on line 1 of "x = 1\ny = TYPEERR": offsets 8..15 = "TYPEERR"? (y at 6) -> col 2..9 by offsets
+  assert strings.contains(pubs[0], "type mismatch")
+  assert strings.contains(pubs[0], "\"start\":{\"line\":1,\"character\":2}")
+  # check 2: the fake answers the same canned offsets (8..15) for the new text
+  assert strings.contains(pubs[1], "type mismatch")
+  # check 3: BROKEN wins in the fake, but the earlier semantic diagnostic is kept beside the syntax error
+  assert strings.contains(pubs[2], "unexpected BROKEN")
+  assert strings.contains(pubs[2], "type mismatch")
+}
+
+test "non-JSON compiler output: one diagnostic on the file and a log line" {
+  u = "file:///w/a.alx"
+  _c, bodies, _n = ~session([init_msg("\"utf-8\""), open_msg(u, 1, "GARBAGE\n"), SHUTDOWN, EXIT], false)
+  pubs = diag_pubs(bodies, u)
+  assert_eq pubs.size, 1
+  assert strings.contains(pubs[0], "thread panicked")
+  logs = bodies.select { strings.contains(it, "window/logMessage") && strings.contains(it, "trace here") }
+  assert_eq logs.size, 1
+}
+
+test "didClose clears the file's diagnostics" {
+  u = "file:///w/a.alx"
+  _c, bodies, _n = ~session([init_msg("\"utf-8\""), open_msg(u, 1, "x = 1 BROKEN\n"), close_msg(u), SHUTDOWN, EXIT], true)
+  pubs = diag_pubs(bodies, u)
+  assert_eq pubs.size, 2
+  assert strings.contains(pubs[1], "\"diagnostics\":[]")
+}
+
+test "utf-16 conversion of columns" {
+  u = "file:///w/a.alx"
+  # "é" is 2 bytes, 1 unit: BROKEN's byte offsets 6..12 become columns 5..11
+  _c, bodies, _n = ~session([init_msg("\"utf-16\""), open_msg(u, 1, "x = é BROKEN\n"), SHUTDOWN, EXIT], false)
+  pubs = diag_pubs(bodies, u)
+  assert_eq pubs.size, 1
+  assert strings.contains(pubs[0], "\"start\":{\"line\":0,\"character\":5}")
+  assert strings.contains(pubs[0], "\"end\":{\"line\":0,\"character\":11}")
+}

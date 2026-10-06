@@ -1,0 +1,104 @@
+# Package jsonrpc: LSP base protocol framing (Content-Length) and JSON-RPC 2.0
+# envelopes.
+#
+# Envelopes are parsed into `Message`; ids may be numbers or strings, so an id
+# is kept as its raw JSON text (`1`, `"abc"`) and echoed back verbatim.
+# Responses are built as text around a result that is already JSON text (a
+# derived `to_json`): no value tree is rebuilt.
+#
+# Memory: nothing here keeps state. The caller owns the reader and writer.
+
+import "bufio"
+import "io"
+import "strconv"
+import "strings"
+
+pub struct Message {
+  id: Str?    # raw JSON text of the id; none for a notification
+  method: Str # "" for a response from the client
+  params: Str # raw JSON text of the params ("" if absent); see scan.alx
+
+  pub def request? -> Bool { id != none && method != "" }
+  pub def notification? -> Bool { id == none && method != "" }
+}
+
+pub error RpcErr {
+  BadFraming(why: Str)
+  BadMessage(why: Str)
+  def message -> Str {
+    case self {
+      BadFraming(w) => "bad framing: #{w}"
+      BadMessage(w) => "bad message: #{w}"
+    }
+  }
+}
+
+pub PARSE_ERROR = -32700
+pub INVALID_REQUEST = -32600
+pub METHOD_NOT_FOUND = -32601
+pub INVALID_PARAMS = -32602
+pub INTERNAL_ERROR = -32603
+pub SERVER_NOT_INITIALIZED = -32002
+
+# Reads one framed body. none at a clean end of input.
+pub def read_frame(r: bufio.Reader) -> ~Str? {
+  n = -1
+  loop {
+    line = ~r.read_line! || return none
+    line = strings.trim_space(line)
+    break if line == ""
+    low = strings.to_lower(line)
+    if low.start_with?("content-length:") {
+      v = strings.trim_space(line[15...line.size])
+      rn = strconv.atoi(v)
+      fail RpcErr.BadFraming(why: "Content-Length #{v}") unless rn.ok?
+      n = rn.unwrap
+    }
+  }
+  fail RpcErr.BadFraming(why: "no Content-Length") if n < 0
+  buf: [Byte] = [0; n]
+  ~io.read_full(r, buf)
+  Str.from_bytes(buf)
+}
+
+# Parses an envelope (by scanning: see scan.alx).
+pub def parse(body: Str) -> ~Message<RpcErr> {
+  t = strings.trim_space(body)
+  fail RpcErr.BadMessage(why: "not an object") unless t.start_with?("{")
+  id: Str? = none
+  if i = raw(t, ["id"]) {
+    id = copy_of(i) unless i == "null"
+  }
+  method = string_at(t, ["method"]) || ""
+  params = copy_of(raw(t, ["params"]) || "")
+  Message.new(id: id, method: method, params: params)
+}
+
+# Frames a body.
+pub def frame(body: Str) -> Str {
+  "Content-Length: #{body.size}\r\n\r\n#{body}"
+}
+
+pub def write_frame(w: bufio.Writer, body: Str) -> ~Unit {
+  ~w.write_string!(frame(body))
+  ~w.flush!
+}
+
+pub def response(id: Str, result_json: Str) -> Str {
+  "{\"jsonrpc\":\"2.0\",\"id\":#{id},\"result\":#{result_json}}"
+}
+
+pub def error_response(id: Str, code: Int, msg: Str) -> Str {
+  m = json_string(msg)
+  "{\"jsonrpc\":\"2.0\",\"id\":#{id},\"error\":{\"code\":#{code},\"message\":#{m}}}"
+}
+
+pub def notification(method: Str, params_json: Str) -> Str {
+  m = json_string(method)
+  "{\"jsonrpc\":\"2.0\",\"method\":#{m},\"params\":#{params_json}}"
+}
+
+# A Str as JSON text.
+pub def json_string(s: Str) -> Str {
+  quote(s)
+}

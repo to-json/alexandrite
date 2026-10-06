@@ -1,0 +1,146 @@
+# Package position: byte offsets, (line, column) pairs, and the client's
+# column encoding. The only package that knows about UTF-16.
+#
+# The compiler reports byte offsets and (0-based line, byte column). A client
+# that negotiated "utf-8" wants byte columns; otherwise LSP's default is UTF-16
+# code units. `Index` holds a text and its line starts so a batch of
+# conversions costs one scan.
+#
+# `diff` / `Edit.shift` map an offset in an old text to the new text after an
+# edit (full-text sync: the edit is found as the common prefix and suffix).
+
+pub UTF8 = 0
+pub UTF16 = 1
+
+pub struct Index {
+  text: Str
+  starts: [Int] # byte offset of the start of each line
+
+  pub def line_count -> Int { starts.size }
+
+  # The byte range of a line, without its newline.
+  def line_range(line: Int) -> (Int, Int) {
+    l = clamp(line, 0, starts.size - 1)
+    lo = starts[l]
+    hi = l + 1 < starts.size ? starts[l + 1] - 1 : text.size
+    hi -= 1 if hi > lo && text[hi - 1] == 13 && l + 1 < starts.size
+    (lo, hi)
+  }
+
+  # (line, byte column) of a byte offset (clamped to the text).
+  pub def line_col(off: Int) -> (Int, Int) {
+    o = clamp(off, 0, text.size)
+    lo = 0
+    hi = starts.size - 1
+    while lo < hi {
+      mid = (lo + hi + 1) / 2
+      if starts[mid] <= o { lo = mid } else { hi = mid - 1 }
+    }
+    (lo, o - starts[lo])
+  }
+
+  # The client column of a byte column on a line.
+  pub def to_client(line: Int, bytecol: Int, enc: Int) -> Int {
+    return bytecol if enc == UTF8
+    lo, hi = line_range(line)
+    stop = clamp(lo + bytecol, lo, hi)
+    n = 0
+    i = lo
+    while i < stop {
+      c = text[i]
+      if c < 0x80 {
+        n += 1
+        i += 1
+      } else if c < 0xE0 {
+        n += 1
+        i += 2
+      } else if c < 0xF0 {
+        n += 1
+        i += 3
+      } else {
+        n += 2
+        i += 4
+      }
+    }
+    n
+  }
+
+  # The byte column of a client column on a line.
+  pub def from_client(line: Int, col: Int, enc: Int) -> Int {
+    lo, hi = line_range(line)
+    return clamp(col, 0, hi - lo) if enc == UTF8
+    n = 0
+    i = lo
+    while i < hi && n < col {
+      c = text[i]
+      if c < 0x80 {
+        n += 1
+        i += 1
+      } else if c < 0xE0 {
+        n += 1
+        i += 2
+      } else if c < 0xF0 {
+        n += 1
+        i += 3
+      } else {
+        n += 2
+        i += 4
+      }
+    }
+    clamp(i, lo, hi) - lo
+  }
+
+  # A byte offset as a client position.
+  pub def position(off: Int, enc: Int) -> (Int, Int) {
+    l, c = line_col(off)
+    (l, to_client(l, c, enc))
+  }
+}
+
+def clamp(x: Int, lo: Int, hi: Int) -> Int {
+  return lo if x < lo
+  return hi if x > hi
+  x
+}
+
+pub def index(text: Str) -> Index {
+  starts = [0]
+  i = 0
+  n = text.size
+  while i < n {
+    starts << i + 1 if text[i] == 10
+    i += 1
+  }
+  Index.new(text: text, starts: starts)
+}
+
+# What changed between two texts: bytes [p, old_end) of the old text became
+# [p, new_end) of the new one.
+pub struct Edit {
+  p: Int
+  old_end: Int
+  new_end: Int
+
+  pub def none? -> Bool { old_end == p && new_end == p }
+
+  # Where an offset of the old text is in the new one. Inside the replaced
+  # range it goes to the start of the edit.
+  pub def shift(off: Int) -> Int {
+    return off if off <= p
+    return off + (new_end - old_end) if off >= old_end
+    p
+  }
+}
+
+pub def diff(old: Str, new: Str) -> Edit {
+  n = old.size < new.size ? old.size : new.size
+  p = 0
+  while p < n && old[p] == new[p] {
+    p += 1
+  }
+  s = 0
+  while s < n - p && old[old.size - 1 - s] == new[new.size - 1 - s] {
+    s += 1
+  }
+  Edit.new(p: p, old_end: old.size - s, new_end: new.size - s)
+}

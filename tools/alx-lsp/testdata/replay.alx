@@ -1,0 +1,66 @@
+# Replays a scripted LSP session against a built alx-lsp and prints what it
+# did, in a form fit to diff against an expected file.
+#
+#   replay SERVER SCRIPT FAKE_RULES
+#
+# SCRIPT has one JSON message per line (blank lines and `#` lines skipped).
+# All input is sent at once, so the server batches what it finds queued; the
+# output therefore lists only what does not depend on batching: responses,
+# the LAST diagnostics published per file (in order of that last publish),
+# log messages, and the exit code.
+
+import "alx.dev/lsp/jsonrpc"
+import "alx.dev/lsp/protocol"
+import "bufio"
+import "os"
+import "os/exec"
+import "strings"
+
+def run -> ~Unit {
+  server = os.args[1]
+  script = ~os.read_file_string(os.args[2])
+  frames: [Str] = []
+  for line in script.split("\n") {
+    t = strings.trim_space(line)
+    next if t == "" || t.start_with?("#")
+    frames << jsonrpc.frame(t)
+  }
+  c = exec.command(server, [])
+  c.stdin = frames.join("")
+  c.env = os.environ + ["ALX_LSP_FAKE=#{os.args[3]}"]
+  cap = ~c.capture
+  rr = bufio.new_reader(strings.new_reader(cap.stdout))
+  order: [Str] = []
+  last: Map[Str, Str] = {}
+  lines: [Str] = []
+  loop {
+    b = ~jsonrpc.read_frame(rr) || break
+    m = ~jsonrpc.parse(b)
+    if m.method == "textDocument/publishDiagnostics" {
+      p = ~protocol.PublishDiagnosticsParams.from_json(m.params.to_s)
+      desc: [Str] = []
+      for d in p.diagnostics {
+        desc << "  #{d.range.start.line}:#{d.range.start.character}-#{d.range.end.line}:#{d.range.end.character} sev#{d.severity} #{strings.replace_all(d.message, "\n", " / ")}"
+      }
+      order = order.select { it != p.uri }
+      order << p.uri
+      last[p.uri] = "diagnostics #{p.uri} v#{p.version || -1}: #{p.diagnostics.size}\n" + desc.join("\n")
+    } else if m.method == "window/logMessage" {
+      pl = ~protocol.LogMessageParams.from_json(m.params.to_s)
+      lines << "log: #{pl.message}" unless pl.message.start_with?("alx-lsp ")
+    } else if m.method == "" {
+      lines << "response #{m.id || "?"}"
+    }
+  }
+  for u in order {
+    lines << (last[u] || "")
+  }
+  lines << "exit #{cap.state.exit_code}"
+  puts lines.join("\n")
+}
+
+r = run
+if r.err != none {
+  puts "replay failed: #{r.err.unwrap.message}"
+  os.exit(2)
+}

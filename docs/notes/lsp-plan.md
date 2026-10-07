@@ -87,6 +87,21 @@ One JSON object on stdout; exit 0 whenever the JSON is complete (errors are data
    "message": "...", "notes": ["..."]}]}
 ```
 
+**M2.5 (type data, compiler/src/typemap.rs):** two more keys after `diagnostics`, for member completion. Old clients ignore them.
+
+```json
+"types": [{"lo": 412, "hi": 413, "name": "r", "type": "bufio.Reader", "kind": "local"}],
+"members": {"bufio.Reader": [{"name": "read_line!", "kind": "method", "sig": "-> ~Str?"},
+                             {"name": "cell", "kind": "field", "type": "[bufio.ReaderState]"}]}
+```
+
+- `types`: the focused file only, sorted by `lo`. `kind`: `local` | `param` (span = the name) | `self` (span = the method's def) | `it` (an implicit block parameter `it`/`_1`; span = the block) | `recv` (an expression written before `.` or `?.`: a method call's or field access's receiver; `name` is its source text, e.g. `make(1)`, `a.b`, `p` of `p.move!(1)`).
+- `type` is the source spelling: `Str`, `[Int]`, `Map[Str, Int]`, `T?`, `~T`, `Unit`, another package's type by its import name (`tls.Config`, not `crypto/tls.Config`). A `!` method's `self` is `T`, not the `[T]` view.
+- Only instances that checked are walked: a def that failed reports nothing; the rest still do. A parse or load failure gives `"types":[],"members":{}`.
+- Generics: every instance is walked; a span whose instances disagree on the type is dropped (a generic def used at one type reports that type).
+- `members`: one key per distinct `type` in `types` and per named type nested in it (`[net.Conn]` also gives `net.Conn`). Structs: fields (`type`) then methods; enums: methods; interfaces: their methods (`sig` from types: `(ResponseWriter, Request)`); builtins (`Str`, `[T]`, `Map`, ints, `T?`, `~T`, `Error`): the names check.rs's suggestion lists hold (`check::builtin_method_names`), `sig` `""`. A method's `sig` is its source text after the name, whitespace collapsed (`(dx: Int)`, `-> Int`, `""` for none). Another package's methods only when `pub`; static methods (`def self.m`) are left out.
+- Binding spans are found in the text near the node that introduces the local (the typed tree keeps no name spans), at a position where a name is bound (`x =`, `x, y =`, `x: T =`, `|x|`, `for x in`, `Variant(x) =>`, `->(x: T)`); a local not found that way is left out.
+
 `line` 0-based, `col` a byte offset in the line; the server converts to the client's encoding. `phase`: `load | parse | check | prove | warning | internal`. Warnings share the list. Diagnostics are in emission order; the first is the one fail-fast mode would have reported.
 
 ### 1.2 Overlays
@@ -231,5 +246,5 @@ Decision (owner): **feature logic goes in alx.** Rust provides data and test ora
 | M2.2 | Test oracle: `alx parse --decls FILE` (Rust, wraps `parser::parse_recovering`; prints kind, name, line per top-level decl and method) and an `LSP` acceptance check: the outline equals the oracle on every tracked `.alx` file that parses | ~60 Rust + 40 alx | gates M2.3 |
 | M2.3 | Server: per-URI `index: Map[Str, [Sym]]` rebuilt on didOpen/didChange (same memory discipline as `docs`); `textDocument/documentSymbol`; `textDocument/definition` for top-level names (open buffers + the unit's files on disk + std when resolvable through `import`); `textDocument/completion` = keywords + index names + `pkg.` names of imported packages + import paths (std dirs, alx.mod); JSON built by hand (#176); soak burst of 10k completions | ~400 alx | M2.2 |
 | M2.4 | Compiler, port-issues #177: an index/map-get view aliases the receiver's nodes only (not the key argument); pointer-free locals ignored in `owners`; `for k in m.keys` yields fresh keys. Then the server drops `uris` and the `fresh` copies that only worked around it | 50-100 Rust + mem cases | parallel |
-| M2.5 | `alx check --json` adds `types: [{lo, hi, name, type}]` for the focused file's locals, params and fields (a tast walk; data only), and `methods: {Type: [name...]}` for types reachable from the focused file if cheap | ~150 Rust | none |
+| M2.5 | (done: see 1.1, "M2.5") `alx check --json` adds `types: [{lo, hi, name, type}]` for the focused file's locals, params and fields (a tast walk; data only), and `methods: {Type: [name...]}` for types reachable from the focused file if cheap | ~150 Rust | none |
 | M2.6 | Member completion after `.` in alx: receiver type from the last successful check's `types` (shifted through edits), members from the outline index / `methods`; fall back to nothing rather than noise | ~200 alx | M2.1, M2.5 |

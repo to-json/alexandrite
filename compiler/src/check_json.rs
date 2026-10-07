@@ -166,7 +166,37 @@ pub fn render(r: &Report, focused: &Path) -> String {
     for it in &r.items {
         diags.push(item_json(r, it, focused));
     }
-    format!("{{\"unit\":{},\"root\":{},\"diagnostics\":[{}]}}", quote(r.unit), quote(&path_str(&norm(&r.root))), diags.join(","))
+    format!("{{\"unit\":{},\"root\":{},\"diagnostics\":[{}],{}}}", quote(r.unit), quote(&path_str(&norm(&r.root))), diags.join(","), types_json(&r.types))
+}
+
+/// `"types":[{lo,hi,name,type,kind}],"members":{"T":[{name,kind,sig|type}]}` (M2.5).
+fn types_json(t: &crate::typemap::TypeMap) -> String {
+    let mut o = String::with_capacity(64 * t.types.len() + 32);
+    o.push_str("\"types\":[");
+    for (i, b) in t.types.iter().enumerate() {
+        if i > 0 {
+            o.push(',');
+        }
+        o.push_str(&format!("{{\"lo\":{},\"hi\":{},\"name\":{},\"type\":{},\"kind\":\"{}\"}}", b.lo, b.hi, quote(&b.name), quote(&b.ty), b.kind));
+    }
+    o.push_str("],\"members\":{");
+    for (i, (ty, ms)) in t.members.iter().enumerate() {
+        if i > 0 {
+            o.push(',');
+        }
+        o.push_str(&quote(ty));
+        o.push_str(":[");
+        for (j, m) in ms.iter().enumerate() {
+            if j > 0 {
+                o.push(',');
+            }
+            let key = if m.kind == "field" { "type" } else { "sig" };
+            o.push_str(&format!("{{\"name\":{},\"kind\":\"{}\",\"{key}\":{}}}", quote(&m.name), m.kind, quote(&m.sig)));
+        }
+        o.push(']');
+    }
+    o.push('}');
+    o
 }
 
 fn item_json(r: &Report, it: &Item, focused: &Path) -> String {

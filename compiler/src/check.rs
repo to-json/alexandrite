@@ -1924,6 +1924,23 @@ const FMT_BUILTINS: &[&str] = &[
 ];
 const STR_METHODS: &[&str] = &["chars", "bytes", "runes", "size", "length", "reverse", "delete", "split", "to_i", "to_s", "strip", "lstrip", "rstrip", "lines", "start_with?", "end_with?", "include?", "byteindex"];
 
+/// The builtin methods a type offers, by name (the lists above; editor completion, typemap.rs).
+pub fn builtin_method_names(t: &Ty) -> Vec<&'static str> {
+    match t {
+        Ty::Int | Ty::IntK(_) => INT_METHODS.to_vec(),
+        Ty::Float => FLOAT_METHODS.to_vec(),
+        Ty::Str => STR_METHODS.to_vec(),
+        Ty::Array(_) => SEQ_METHODS.iter().chain(ARRAY_EXTRA).copied().collect(),
+        Ty::Range | Ty::Seq(..) | Ty::Gen(_) => SEQ_METHODS.to_vec(),
+        Ty::Map(..) => vec!["size", "length", "empty?", "key?", "fetch", "delete", "keys", "values", "dup", "each"],
+        Ty::Tuple(_) => vec!["first", "last"],
+        Ty::Opt(_) => vec!["present?", "some?", "none?", "unwrap", "unwrap_or"],
+        Ty::Result(_) => vec!["ok", "err", "ok?", "err?", "unwrap", "unwrap_or", "rescue"],
+        Ty::Error => vec!["message", "wrap"],
+        _ => vec![],
+    }
+}
+
 fn lev(a: &str, b: &str) -> usize {
     let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
     let mut prev: Vec<usize> = (0..=b.len()).collect();

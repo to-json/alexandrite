@@ -30,3 +30,4 @@ pub mod rgen;
 pub mod sharing;
 pub mod strgen;
 pub mod tast;
+pub mod typemap;

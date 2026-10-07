@@ -54,6 +54,9 @@ pub struct Report {
     pub items: Vec<Item>,
     /// Resolves every `Diag`'s span (`Span::default()` has no file when the load itself failed).
     pub sm: SourceMap,
+    /// The focused file's bindings and receivers with their types, and the members
+    /// of the types they name (typemap.rs). Empty when nothing was checked.
+    pub types: crate::typemap::TypeMap,
 }
 
 pub type ReadFn<'a> = &'a dyn Fn(&Path) -> std::io::Result<String>;
@@ -137,7 +140,7 @@ pub fn analyze(file: &Path, force: Force, read: ReadFn, list: ListFn) -> Report 
     };
     let (psm, perrs) = parse_errors(&own_files, read);
     if !perrs.is_empty() {
-        return Report { unit, root, items: perrs, sm: psm };
+        return Report { unit, root, items: perrs, sm: psm, types: Default::default() };
     }
     let mut items = vec![];
     let loaded = if package {
@@ -150,15 +153,21 @@ pub fn analyze(file: &Path, force: Force, read: ReadFn, list: ListFn) -> Report 
     };
     let l = match loaded {
         Ok(l) => l,
-        Err((sm, d)) => return Report { unit, root, items: vec![Item { diag: d, phase: Phase::Load, error: true }], sm },
+        Err((sm, d)) => return Report { unit, root, items: vec![Item { diag: d, phase: Phase::Load, error: true }], sm, types: Default::default() },
     };
+    let mut types = crate::typemap::TypeMap::default();
     {
         let own = |f: u32| match l.sm.files.get(f as usize).and_then(|sf| sf.path.as_deref()) {
             Some(p) if package => p.parent() == Some(dir.as_path()),
             Some(p) => p == file,
             None => false,
         };
-        crate::front::check_collect(&l, &own, &mut items);
+        let focused = l.sm.files.iter().position(|sf| sf.path.as_deref() == Some(file)).map(|i| i as u32);
+        crate::front::check_collect_with(&l, &own, &mut items, &mut |w| {
+            if let Some(f) = focused {
+                types = crate::typemap::build(w, f);
+            }
+        });
     }
-    Report { unit, root, items, sm: l.sm }
+    Report { unit, root, items, sm: l.sm, types }
 }

@@ -518,7 +518,7 @@ fn def_info(d: &Def, overflow: Overflow, pkg: &str) -> Result<DefInfo, Diag> {
 /// `externs`: the interface of packages compiled separately (whose
 /// declarations are then left out).
 pub fn check_program(l: &Loaded, externs: Vec<DefInfo>) -> Result<TProgram, Diag> {
-    check_program_impl(l, externs, None).map(|p| p.expect("a normal check returns a program"))
+    check_program_impl(l, externs, None, None).map(|p| p.expect("a normal check returns a program"))
 }
 
 /// Editor analysis (analyze.rs): `check_program` in collect mode. Every
@@ -526,13 +526,19 @@ pub fn check_program(l: &Loaded, externs: Vec<DefInfo>) -> Result<TProgram, Diag
 /// `check_program` would return); `own` says which files belong to the unit,
 /// whose defs are checked even when nothing calls them.
 pub fn check_collect(l: &Loaded, own: &dyn Fn(u32) -> bool, out: &mut Vec<Item>) {
-    if let Err(d) = check_program_impl(l, vec![], Some((own, out))) {
+    check_collect_with(l, own, out, &mut |_| {});
+}
+
+/// `check_collect`, then `seen` gets the checker's state once the bodies are
+/// checked (the instances that succeeded; typemap.rs reads types from it).
+pub fn check_collect_with(l: &Loaded, own: &dyn Fn(u32) -> bool, out: &mut Vec<Item>, seen: &mut dyn FnMut(&World)) {
+    if let Err(d) = check_program_impl(l, vec![], Some((own, out)), Some(seen)) {
         // Only an early failure that has no collecting path (e.g. a duplicate def name).
         out.push(Item { diag: d, phase: Phase::Check, error: true });
     }
 }
 
-fn check_program_impl(l: &Loaded, externs: Vec<DefInfo>, mut collect: Option<(&dyn Fn(u32) -> bool, &mut Vec<Item>)>) -> Result<Option<TProgram>, Diag> {
+fn check_program_impl(l: &Loaded, externs: Vec<DefInfo>, mut collect: Option<(&dyn Fn(u32) -> bool, &mut Vec<Item>)>, seen: Option<&mut dyn FnMut(&World)>) -> Result<Option<TProgram>, Diag> {
     let ov = |file: u32| l.overflow.get(&file).copied().unwrap_or(Overflow::Abort);
     let ext: HashSet<String> = externs.iter().map(|d| d.pkg.clone()).collect();
     let ext_names: Vec<String> = externs.iter().map(|d| d.def.name.clone()).collect();
@@ -642,6 +648,9 @@ fn check_program_impl(l: &Loaded, externs: Vec<DefInfo>, mut collect: Option<(&d
             }
             let _ = w.message_instances();
             let _ = w.iface_eq_instances();
+            if let Some(f) = seen {
+                f(&w);
+            }
         }
     } else {
         main = w.check_main(&l.main.main, l.main.overflow, Span { file: l.main.file, lo: 0, hi: 0 })?;

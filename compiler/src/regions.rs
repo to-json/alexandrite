@@ -413,8 +413,9 @@ impl<'a> Graph<'a> {
                         }
                         for s in &b.body {
                             let sv = self.stmt(s);
-                            // A `lock` block's value is copied out.
-                            if *m != M::Lock {
+                            // A `lock` block's value is copied out, but a copy
+                            // shares the locks it holds (see `holds_lock`).
+                            if *m != M::Lock || (placing() && holds_lock(&e.ty)) {
                                 v.extend(sv);
                             }
                         }
@@ -426,12 +427,19 @@ impl<'a> Graph<'a> {
                 // A task handle doesn't share its captures' storage (they
                 // went to the task, through Global).
                 // A copy of a flat slice or map is fresh storage, and so is a
-                // function value's (its captures are copied deeply).
+                // function value's (its captures are copied deeply). For
+                // placement, not one that holds a lock (a Mutex, a boxed
+                // Atomic): the copy shares it, so it must live as long as
+                // the copy (port-issues #202: `g = f.dup; spawn { g() }`
+                // with f capturing a Mutex freed with f's frame). The
+                // sharing check still sees fresh storage: the lock is the
+                // synchronization.
                 let flat_copy = *m == M::Dup
+                    && !(placing() && holds_lock(&e.ty))
                     && match &e.ty {
                         Ty::Array(t) => !has_storage(t),
                         Ty::Map(k, t) => !has_storage(k) && !has_storage(t),
-                        Ty::Fn(..) | Ty::Struct(..) => true,
+                        Ty::Fn(..) | Ty::Struct(..) | Ty::Iface(_) => true,
                         _ => false,
                     };
                 // A map lookup's value is one of the map's values (or the
@@ -526,7 +534,14 @@ impl<'a> Graph<'a> {
                 self.flow(&v, &[Node::Ret]);
                 vec![]
             }
-            // Errors are copied out when they leave the function.
+            // Errors are copied out when they leave the function, but the
+            // copy shares the locks they hold, which may then live anywhere
+            // up the callers.
+            TStmt::Fail(e, _) if placing() && holds_lock(&e.ty) => {
+                let v = self.expr(e);
+                self.flow(&v, &[Node::Global]);
+                vec![]
+            }
             TStmt::Fail(e, _) | TStmt::Break(Some(e), _) | TStmt::Defer(e) => {
                 self.expr(e);
                 vec![]
@@ -585,6 +600,7 @@ fn graph<'a>(f: &'a TFunc, sums: &'a [Summary], ifaces: &'a Ifaces) -> Graph<'a>
 
 /// Placement for every function of the program.
 pub fn analyze(p: &TProgram) -> Vec<FnPlacement> {
+    PLACING.with(|c| c.set(true));
     let sums = summaries(p);
     analyze_with(p, &sums)
 }
@@ -594,8 +610,9 @@ pub fn analyze(p: &TProgram) -> Vec<FnPlacement> {
 /// shares. Aliasing in either direction counts; the paths stop at returns,
 /// globals and callers.
 pub fn aliases(p: &TProgram) -> Vec<HashMap<LocalId, (Vec<LocalId>, Vec<LocalId>)>> {
+    PLACING.with(|c| c.set(false));
     let sums = summaries(p);
-    p.funcs
+    let out = p.funcs
         .iter()
         .map(|f| {
             let mut out = HashMap::new();
@@ -641,13 +658,82 @@ pub fn aliases(p: &TProgram) -> Vec<HashMap<LocalId, (Vec<LocalId>, Vec<LocalId>
             }
             out
         })
-        .collect()
+        .collect();
+    PLACING.with(|c| c.set(true));
+    out
 }
 
 thread_local! {
     /// Function types (by Debug text) whose every lambda keeps its
     /// parameters to itself: nothing they're given escapes the call.
     static CLEAN_FNS: std::cell::RefCell<std::collections::HashSet<String>> = std::cell::RefCell::new(Default::default());
+}
+
+thread_local! {
+    /// The graph is built for placement (`analyze`, `explain`), not for the
+    /// sharing check (`aliases`): copies that share a lock alias it.
+    static PLACING: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// Function types (by Debug text) some lambda of which captures a lock,
+    /// interfaces some implementor of which holds one, and whether some
+    /// error type does (`holds_lock`).
+    static LOCK_TYS: std::cell::RefCell<(std::collections::HashSet<String>, std::collections::HashSet<String>, bool)> = std::cell::RefCell::new(Default::default());
+}
+
+fn placing() -> bool {
+    PLACING.with(|p| p.get())
+}
+
+/// Does a value of this type hold a lock: a Mutex, or an Atomic of anything
+/// but an Int or a Bool (a lock and its value)? Their storage is an array
+/// in some region that every copy shares (`.dup`, a `lock` block's value,
+/// an Atomic's `load` copy the rest deeply), so a copy can't outlive it.
+/// Channels and Int / Bool atomics are runtime handles outside every region.
+pub fn holds_lock(t: &Ty) -> bool {
+    match t {
+        Ty::Mutex(_) => true,
+        Ty::Atomic(t) => t.atomic_boxed(),
+        Ty::Rec(n) => with_rec(n, false, holds_lock),
+        Ty::Array(t) | Ty::Fixed(t, _) | Ty::Opt(t) | Ty::Result(t) | Ty::Pool(t) => holds_lock(t),
+        Ty::Map(k, v) => holds_lock(k) || holds_lock(v),
+        Ty::Tuple(ts) => ts.iter().any(holds_lock),
+        Ty::Struct(_, fs) => fs.iter().any(|(_, t)| holds_lock(t)),
+        Ty::Enum(_, vs) => vs.iter().any(|(_, fs)| fs.iter().any(|(_, t)| holds_lock(t))),
+        Ty::Fn(..) => LOCK_TYS.with(|l| l.borrow().0.contains(&format!("{t:?}"))),
+        Ty::Iface(n) => LOCK_TYS.with(|l| l.borrow().1.contains(n)),
+        Ty::Error => LOCK_TYS.with(|l| l.borrow().2),
+        _ => false,
+    }
+}
+
+/// `LOCK_TYS` for this program (a fixpoint: closures capture closures,
+/// implementors hold interface values).
+fn learn_lock_tys(p: &TProgram) {
+    LOCK_TYS.with(|l| *l.borrow_mut() = Default::default());
+    loop {
+        let mut changed = false;
+        for f in &p.funcs {
+            for (_, ty, caps) in &f.lambdas {
+                let key = format!("{ty:?}");
+                if !LOCK_TYS.with(|l| l.borrow().0.contains(&key)) && caps.iter().any(|c| holds_lock(&f.locals[*c].ty)) {
+                    LOCK_TYS.with(|l| l.borrow_mut().0.insert(key));
+                    changed = true;
+                }
+            }
+        }
+        for (k, imps) in &p.ifaces {
+            if !LOCK_TYS.with(|l| l.borrow().1.contains(k)) && imps.iter().any(|(t, _)| holds_lock(t)) {
+                LOCK_TYS.with(|l| l.borrow_mut().1.insert(k.clone()));
+                changed = true;
+            }
+        }
+        if !LOCK_TYS.with(|l| l.borrow().2) && p.errors.iter().any(holds_lock) {
+            LOCK_TYS.with(|l| l.borrow_mut().2 = true);
+            changed = true;
+        }
+        if !changed {
+            break;
+        }
+    }
 }
 
 fn clean_fn(t: &Ty) -> bool {
@@ -691,6 +777,7 @@ fn clean_fn_types(p: &TProgram, sums: &[Summary]) -> std::collections::HashSet<S
 }
 
 fn summaries(p: &TProgram) -> Vec<Summary> {
+    learn_lock_tys(p);
     CLEAN_FNS.with(|c| c.borrow_mut().clear());
     let first = summaries_with(p);
     let clean = clean_fn_types(p, &first);
@@ -1029,7 +1116,9 @@ fn owners(f: &TFunc, g: &Graph, fresh: &HashMap<usize, std::collections::HashSet
     }
     for (c, def_site) in &g.defs {
         let loc = &f.locals[*c];
-        if loc.reassigned > 0 || f.params.contains(c) || !matches!(loc.ty, Ty::Map(..) | Ty::Pool(_)) {
+        // Compaction copies the contents and frees the old region, but a
+        // copy keeps the locks it holds: they'd point into the freed region.
+        if loc.reassigned > 0 || f.params.contains(c) || !matches!(loc.ty, Ty::Map(..) | Ty::Pool(_)) || holds_lock(&loc.ty) {
             continue;
         }
         if g.defs.iter().filter(|(l, _)| l == c).count() != 1 || out.sites.get(def_site) != Some(&Place::Frame) {
@@ -1167,6 +1256,7 @@ fn expr_spans(e: &TExpr, l: LocalId, out: &mut Vec<crate::diag::Span>) {
 /// `alx explain mem`: every allocation site of the program's own code,
 /// the region it goes in, and why.
 pub fn explain(p: &TProgram, sm: &crate::diag::SourceMap, files: &[u32]) -> String {
+    PLACING.with(|c| c.set(true));
     let sums = summaries(p);
     let placement = analyze_with(p, &sums);
     let mut out = String::new();

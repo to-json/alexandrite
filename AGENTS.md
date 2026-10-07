@@ -123,6 +123,8 @@ ch = Chan[Int].new(4); ch << 1; v = ch.recv
 mu = Mutex.new(0); mu.lock { |v| v += 1 }   # assigning v updates it; the block's value is lock's result
 pub HITS = Atomic.new(0)             # top level: package state only as Atomic[T] (any T; load copies) or Mutex[T],
 REG = Mutex[Map[Str, Int]].new({})   #   set before main runs; read as HITS / pkg.HITS (R11)
+#[shareable]                         # its values go to tasks without .dup; every implementor
+interface Signal { def fire -> Int } #   keeps its state under a Mutex/Atomic/Chan (D88)
 
 # Lambdas, shell, FFI, tests --------------------------------------------------------
 add = ->(a: Int, b: Int) -> Int { a + b }; add.call(1, 2)

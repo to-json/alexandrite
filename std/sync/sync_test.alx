@@ -1,7 +1,10 @@
 # Go's sync tests (waitgroup_test.go, once_test.go, oncefunc_test.go,
 # mutex_test.go, rwmutex_test.go, cond_test.go, map_test.go, pool_test.go,
-# example_test.go), translated. Every test is deterministic: tasks are
-# coordinated with channels and WaitGroups, never with sleeps.
+# example_test.go), translated. Tasks are coordinated with channels and
+# WaitGroups; only the fairness test sleeps (as Go's). Untranslated tests
+# are listed in sync.alx's header.
+
+import "time"
 
 # Whether running f in its own task panics (Go's recover becomes a task's
 # wait), and the panic's message.
@@ -113,6 +116,32 @@ test "wait group go" {
   assert_eq i.load, 11
 }
 
+# Go's TestIssue76126: a panic in a task started by `go` doesn't let `wait`
+# return normally (Go's ends the process; alx's `wait` panics with it).
+test "wait group go panic" {
+  assert_panics("test") {
+    wg = new_wait_group
+    wg.go { panic "test" }
+    wg.wait
+  }
+}
+
+# Go's example's http.Get, which fetches nothing.
+def http_get(_url: Str) {
+}
+
+example "wait group" {
+  wg = new_wait_group
+  urls = ["http://www.golang.org/", "http://www.google.com/", "http://www.example.com/"]
+  for url in urls {
+    # Launch a task to fetch the URL.
+    u = url
+    wg.go { http_get(u) }
+  }
+  # Wait for all fetches to complete.
+  wg.wait
+} outputs ""
+
 example "wait group add and done" {
   wg = new_wait_group
   results = Mutex.new(0)
@@ -165,6 +194,52 @@ example "once" {
   }
   (0...10).each { |_| done.recv }
 } outputs "Only once\n"
+
+# Go's TestOncePanic: a panicking function still counts as run.
+test "once panic" {
+  once = new_once
+  assert_panics("failed") { once.do { panic "failed" } }
+  again = Atomic.new(false)
+  once.do { again.store(true) }
+  assert !again.load, "Once.Do called twice"
+  assert once.done?
+}
+
+# Go's TestOnceFuncPanic / TestOnceValuePanic / TestOnceValuesPanic: every
+# call after the function panicked panics too (alx can't recover Go's panic
+# value, so later calls have their own message), and the function ran once.
+test "once func panic" {
+  calls = Atomic.new(0)
+  f = once_func {
+    calls.add(1)
+    panic "x"
+  }
+  assert_panics("x") { f() }
+  (0...3).each { |_| assert_panics("sync: the once function panicked") { f() } }
+  assert_eq calls.load, 1
+}
+
+test "once value panic" {
+  calls = Atomic.new(0)
+  f = once_value {
+    panic "x" if calls.add(1) > 0
+    42
+  }
+  assert_panics("x") { f() }
+  (0...3).each { |_| assert_panics("sync: the once function panicked") { f() } }
+  assert_eq calls.load, 1
+}
+
+test "once values panic" {
+  calls = Atomic.new(0)
+  f = once_values {
+    panic "x" if calls.add(1) > 0
+    (42, 13)
+  }
+  assert_panics("x") { f() }
+  (0...3).each { |_| assert_panics("sync: the once function panicked") { f() } }
+  assert_eq calls.load, 1
+}
 
 test "once func" {
   calls = Atomic.new(0)
@@ -225,6 +300,27 @@ example "once value" {
   }
   (0...10).each { |_| done.recv }
 } outputs "Computed once: 499500\n"
+
+example "once values" {
+  once = once_values {
+    puts "Reading file once"
+    data: [Byte] = [1, 2, 3]
+    e: Error? = none
+    (data, e)
+  }
+  done = Chan[Bool].new
+  (0...10).each { |_|
+    o = once.dup
+    spawn {
+      _data, err = o()
+      if e = err {
+        puts "error: #{e}"
+      }
+      done << true
+    }
+  }
+  (0...10).each { |_| done.recv }
+} outputs "Reading file once\n"
 
 # ----------------------------------------------------------------------- Lock
 
@@ -300,6 +396,38 @@ test "mutex handed over" {
   t.wait
   assert m.try_lock?
   m.unlock
+}
+
+# Go's TestMutexFairness: a task that keeps re-taking the lock doesn't
+# starve another (10 acquisitions within 10 s).
+test "mutex fairness" {
+  mu = new_lock
+  stop = Chan[Bool].new
+  spawn {
+    loop {
+      mu.lock
+      time.sleep(time.microsecond * 100)
+      mu.unlock
+      break if ready?(stop)
+    }
+  }
+  done = Chan[Bool].new(1)
+  spawn {
+    (0...10).each { |_|
+      time.sleep(time.microsecond * 100)
+      mu.lock
+      mu.unlock
+    }
+    done << true
+  }
+  late = false
+  t = time.after(time.second * 10)
+  select {
+    when _ = done.recv => late = false
+    when _ = t.recv => late = true
+  }
+  stop.close
+  assert !late, "can't acquire Mutex in 10 seconds"
 }
 
 # -------------------------------------------------------------------- RWMutex
@@ -636,6 +764,46 @@ test "cond over rlocker" {
   woke.recv
 }
 
+# Go's TestCondSignalStealing: a Broadcast must wake only the tasks
+# already waiting, not one that starts waiting after it (100 rounds; Go
+# runs 1000).
+test "cond signal stealing" {
+  (0...100).each { |_|
+    m = new_lock
+    cond = new_cond(m)
+    # A task that waits, and signals once woken.
+    ch = Chan[Bool].new
+    spawn {
+      m.lock
+      ch << true
+      cond.wait
+      m.unlock
+      ch << true
+    }
+    ch.recv
+    m.lock
+    m.unlock
+    # The waiter is now parked in cond.wait. Broadcast, while another task
+    # starts waiting: the broadcast must wake the first.
+    done = Atomic.new(false)
+    spawn { cond.broadcast }
+    spawn {
+      m.lock
+      while !done.load {
+        cond.wait
+      }
+      m.unlock
+    }
+    # The first waiter was woken.
+    ch.recv
+    # Release the second.
+    m.lock
+    done.store(true)
+    m.unlock
+    cond.broadcast
+  }
+}
+
 # ------------------------------------------------------------------ SharedMap
 
 test "shared map" {
@@ -681,7 +849,7 @@ test "shared map matches a plain map" {
   ref: Map[Int, Int] = {}
   (0...3000).each { |_|
     seed = (seed *% 6364136223846793005 +% 1442695040888963407)
-    op = (seed >> 33) % 9
+    op = (seed >> 33) % 10
     k = (seed >> 40) % 8
     v = (seed >> 20) % 5
     case op {
@@ -722,6 +890,12 @@ test "shared map matches a plain map" {
         want = ref[k] == v
         assert_eq m.compare_and_delete(k, v), want
         ref.delete(k) if want
+      }
+      8 => {
+        m.clear
+        for kk in ref.keys {
+          ref.delete(kk)
+        }
       }
       _ => {
         got: Map[Int, Int] = {}

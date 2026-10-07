@@ -4,6 +4,8 @@
 # method twins are below. The `magic32` guards around each field test Go's
 # memory layout and are dropped.
 
+import "time"
+
 # ---------------------------------------------------------------------- Swap
 
 test "swap int32" {
@@ -44,6 +46,18 @@ test "swap int64" {
 
 test "swap uint64" {
   x = new_uint64(0)
+  j: U64 = 0
+  delta: U64 = 1
+  while delta +% delta > delta {
+    k = x.swap(delta)
+    assert x.load == delta && k == j, "delta=#{delta}"
+    j = delta
+    delta = delta +% delta
+  }
+}
+
+test "swap uintptr" {
+  x = new_uintptr(0)
   j: U64 = 0
   delta: U64 = 1
   while delta +% delta > delta {
@@ -129,6 +143,22 @@ test "add uint64" {
   assert_eq y.add(^(c - 1)), 18446744073709551615
 }
 
+test "add uintptr" {
+  x = new_uintptr(0)
+  j: U64 = 0
+  delta: U64 = 1
+  while delta +% delta > delta {
+    k = x.add(delta)
+    j = j +% delta
+    assert x.load == j && k == j, "delta=#{delta}"
+    delta = delta +% delta
+  }
+  y = new_uintptr(18446744073709551615)
+  assert_eq y.add(1), 0
+  c: U64 = 1
+  assert_eq y.add(^(c - 1)), 18446744073709551615
+}
+
 # ----------------------------------------------------------------------- And
 
 test "and int32" {
@@ -172,6 +202,19 @@ test "and int64" {
 
 test "and uint64" {
   x = new_uint64(18446744073709551615)
+  j = x.load
+  mask: U64 = 1
+  while mask != 0 {
+    old = x.load
+    k = x.and(^mask)
+    j = j & ^mask
+    assert x.load == j && k == old, "mask=#{mask}"
+    mask = mask << 1
+  }
+}
+
+test "and uintptr" {
+  x = new_uintptr(18446744073709551615)
   j = x.load
   mask: U64 = 1
   while mask != 0 {
@@ -237,6 +280,19 @@ test "or uint64" {
   }
 }
 
+test "or uintptr" {
+  x = new_uintptr(0)
+  j = x.load
+  mask: U64 = 1
+  while mask != 0 {
+    old = x.load
+    k = x.or(mask)
+    j = j | mask
+    assert x.load == j && k == old, "mask=#{mask}"
+    mask = mask << 1
+  }
+}
+
 # ------------------------------------------------------------ CompareAndSwap
 
 test "compare and swap int32" {
@@ -283,6 +339,20 @@ test "compare and swap int64" {
 
 test "compare and swap uint64" {
   x = new_uint64(0)
+  val: U64 = 1
+  while val +% val > val {
+    x.store(val)
+    assert x.compare_and_swap(val, val + 1)
+    assert_eq x.load, val + 1
+    x.store(val + 1)
+    assert !x.compare_and_swap(val, val + 2)
+    assert_eq x.load, val + 1
+    val = val +% val
+  }
+}
+
+test "compare and swap uintptr" {
+  x = new_uintptr(0)
   val: U64 = 1
   while val +% val > val {
     x.store(val)
@@ -358,6 +428,19 @@ test "load uint64" {
   }
 }
 
+test "load uintptr" {
+  x = new_uintptr(0)
+  want: U64 = 0
+  delta: U64 = 1
+  while delta +% delta > delta {
+    k = x.load
+    assert_eq k, want
+    x.store(k +% delta)
+    want = k +% delta
+    delta = delta +% delta
+  }
+}
+
 test "store int32" {
   x = new_int32(0)
   v: I32 = 0
@@ -396,6 +479,18 @@ test "store int64" {
 
 test "store uint64" {
   x = new_uint64(0)
+  v: U64 = 0
+  delta: U64 = 1
+  while delta +% delta > delta {
+    x.store(v)
+    assert_eq x.load, v
+    v = v +% delta
+    delta = delta +% delta
+  }
+}
+
+test "store uintptr" {
+  x = new_uintptr(0)
   v: U64 = 0
   delta: U64 = 1
   while delta +% delta > delta {
@@ -701,3 +796,104 @@ example "value read mostly" {
   insert("b", "2")
   puts (m.load || {})["b"] || "?"
 } outputs "2\n"
+
+# Go's TestStoreLoadRelAcq32 / 64: a reader that sees the signal sees the
+# data written before it. Go's data fields are plain memory; alx shares
+# memory between tasks only through atomics and locks, so the data sit in
+# Int cells and the test checks the order of the signal against them
+# (N = 100, Go's -short).
+def check_rel_acq(wide: Bool) {
+  n = 100
+  c = Chan[Bool].new(2)
+  signal32 = new_int32(0)
+  signal64 = new_int64(0)
+  data1 = new_int64(0)
+  data2 = Atomic.new(0.0)
+  bad = new_bool(false)
+  (0...2).each { |p|
+    spawn {
+      i = 1
+      while i < n {
+        if (i + p) % 2 == 0 {
+          data1.store(i)
+          data2.store(i.to_f)
+          if wide {
+            signal64.store(i)
+          } else {
+            signal32.store(i.to_i32)
+          }
+        } else {
+          w = 1
+          while (wide ? signal64.load : signal32.load.to_i) != i {
+            if w % 1000 == 0 {
+              t = spawn { 0 }
+              t.wait
+            }
+            w += 1
+          }
+          if data1.load != i || data2.load != i.to_f {
+            bad.store(true)
+            break
+          }
+        }
+        i += 1
+      }
+      c << true
+    }
+  }
+  c.recv
+  c.recv
+  assert !bad.load, "incorrect data"
+}
+
+test "store load rel acq 32" {
+  check_rel_acq(false)
+}
+
+test "store load rel acq 64" {
+  check_rel_acq(true)
+}
+
+# Go's Value_CompareAndSwapTests case {init: nil, new: true, old: nil}: on
+# an empty Value, none (Go's nil) matches.
+test "value compare and swap on empty" {
+  v: Value[Bool] = new_value
+  assert v.compare_and_swap(none, true)
+  assert_eq v.load, true
+  assert !v.compare_and_swap(none, false)
+  assert v.compare_and_swap(true, false)
+  assert_eq v.load, false
+}
+
+struct Config {
+  version: Int
+}
+
+def load_config(version: Int) -> Config {
+  Config.new(version: version)
+}
+
+# Go's ExampleValue_config: a configuration replaced while readers use the
+# latest one (Go's runs forever; this reloads 3 times and serves 10
+# requests per worker).
+example "value config" {
+  config: Value[Config] = new_value
+  config.store(load_config(0))
+  reloader = spawn {
+    (1..3).each { |v|
+      time.sleep(time.millisecond)
+      config.store(load_config(v))
+    }
+  }
+  workers = (0...10).map { |_|
+    spawn {
+      (0...10).each { |_r|
+        c = config.load || load_config(-1)
+        assert c.version >= 0
+      }
+    }
+  }.to_a
+  workers.each { it.wait }
+  reloader.wait
+  puts config.load?.version
+} outputs "3\n"

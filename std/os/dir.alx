@@ -1,0 +1,459 @@
+# Directories and paths: read_dir, mkdir(_all), remove(_all), rename, links,
+# chmod / chown / chtimes, temp files and directories.
+
+# An entry of a directory listing (Go's DirEntry). `kind` is 1 regular,
+# 2 directory, 3 symlink, 4 other.
+pub struct DirEntry {
+  name: Str
+  dir: Str
+  kind: Int
+
+  pub def is_dir -> Bool { kind == 2 }
+  pub def is_regular -> Bool { kind == 1 }
+  pub def is_symlink -> Bool { kind == 3 }
+  # The directory joined with the name.
+  pub def path -> Str { path.join([dir, name]) }
+  # The entry's FileInfo (not following a symlink).
+  pub def info -> ~FileInfo<FsError> {
+    ~lstat(path.join([dir, name]))
+  }
+  # Go's DirEntry.Type: the type bits of st_mode (MODE_DIR, ...), 0 for a
+  # regular file.
+  pub def type -> Int {
+    case kind {
+      2 => MODE_DIR
+      3 => MODE_SYMLINK
+      4 => other_type
+      _ => 0
+    }
+  }
+
+  def other_type -> Int {
+    r = lstat(path.join([dir, name]))
+    return 0 if r.err?
+    r.unwrap.mode & MODE_TYPE
+  }
+
+  # Go's fs.FormatDirEntry: "d name/", "- name", "L name".
+  pub def to_s -> Str {
+    t = "-"
+    t = "d" if kind == 2
+    t = "L" if kind == 3
+    t = "?" if kind == 4
+    s = "#{t} #{name}"
+    s += "/" if kind == 2
+    s
+  }
+}
+
+def by_name(a: DirEntry, b: DirEntry) -> Int {
+  return -1 if a.name < b.name
+  return 1 if a.name > b.name
+  0
+}
+
+# The entries of a directory, sorted by name ("." and ".." left out).
+pub def read_dir(name: Str) -> ~[DirEntry]<FsError> {
+  fail ferr("open" + " " + name, c("EINVAL")) if nul?(name)
+  h = alx_sys_dir_open(name)
+  fail ferr("open" + " " + name, -h) if h < 0
+  out: [DirEntry] = []
+  kind = zeros(1)
+  loop {
+    p = alx_sys_dir_next(h, kind)
+    break if p.null?
+    en = Str.from_cstr(p)
+    out << DirEntry.new(name: en, dir: name, kind: entry_kind(name, en, kind[0].to_i))
+  }
+  alx_sys_dir_close(h)
+  slices.sort_func(out, by_name)
+  out
+}
+
+# Creates a directory; its parent must exist.
+pub def mkdir(name: Str, perm: Int) -> ~Unit<FsError> {
+  fail ferr("mkdir" + " " + name, c("EINVAL")) if nul?(name)
+  r = c_mkdir(name, perm.to_i32)
+  fail ferr("mkdir" + " " + name, C.errno) if r != 0
+  # BSD mkdir drops the sticky bit: set it afterwards (Go's setStickyBit).
+  if (perm & MODE_STICKY) != 0 && darwin? {
+    fi = ~stat(name)
+    ~chmod(name, (fi.mode & 0o7777) | MODE_STICKY)
+  }
+}
+
+# Creates a directory and any missing parents; nothing to do if it exists.
+pub def mkdir_all(name: Str, perm: Int) -> ~Unit<FsError> {
+  s = stat(name)
+  if i = s.ok {
+    fail ferr("mkdir" + " " + name, c("ENOTDIR")) if !i.is_dir
+    return
+  }
+  # The parent: name without its last element (and trailing slashes).
+  i = name.size - 1
+  while i >= 0 && name[i] == 47 {
+    i -= 1
+  }
+  while i >= 0 && name[i] != 47 {
+    i -= 1
+  }
+  i = 0 if i < 0
+  if i > 0 {
+    parent = name[0...i]
+    ~mkdir_all(parent, perm)
+  }
+  r = c_mkdir(name, perm.to_i32)
+  if r != 0 {
+    code = C.errno
+    l = lstat(name)
+    return if l.ok? && l.unwrap.is_dir
+    fail ferr("mkdir" + " " + name, code)
+  }
+}
+
+# Removes a file or an empty directory.
+pub def remove(name: Str) -> ~Unit<FsError> {
+  fail ferr("remove" + " " + name, c("EINVAL")) if nul?(name)
+  return if c_unlink(name) == 0
+  e1 = C.errno
+  return if c_rmdir(name) == 0
+  e2 = C.errno
+  code = e1
+  code = e2 if e2 != c("ENOTDIR")
+  fail ferr("remove" + " " + name, code)
+}
+
+# Removes the path and everything below it; not an error if it doesn't
+# exist. Go's algorithm (removeall_at.go): directories are walked through
+# descriptors (openat / unlinkat), so paths of any length work; everything
+# removable is removed, and the first failure is returned, named by its
+# path ("unlinkat /t/b/y: permission denied").
+pub def remove_all(name: Str) -> ~Unit<FsError> {
+  return if name == ""
+  fail ferr("RemoveAll" + " " + name, c("EINVAL")) if ends_with_dot(name) || nul?(name)
+  r = remove(name)
+  return if r.ok? || is_not_exist(r.err.unwrap)
+  parent, base = split_path(name)
+  pfd = alx_sys_open(parent, (c("O_RDONLY") | c("O_CLOEXEC")).to_i32, 0)
+  if pfd < 0 {
+    code = C.errno
+    return if code == c("ENOENT")
+    fail ferr("open" + " " + parent, code)
+  }
+  res = remove_all_from(pfd.to_i, base, parent + "/")
+  alx_fd_close(pfd.to_i)
+  ~res
+}
+
+def ends_with_dot(p: Str) -> Bool {
+  return true if p == "."
+  p.size >= 2 && p[p.size - 1] == 46 && p[p.size - 2] == 47
+}
+
+# Go's splitPath: (directory, last element), trailing slashes dropped.
+def split_path(p0: Str) -> (Str, Str) {
+  p = p0
+  dirname = "."
+  while p.size > 1 && p[0] == 47 && p[1] == 47 {
+    p = p[1...p.size]
+  }
+  i = p.size - 1
+  while i > 0 && p[i] == 47 {
+    p = p[0...i]
+    i -= 1
+  }
+  basename = p
+  i -= 1
+  while i >= 0 {
+    if p[i] == 47 {
+      dirname = i == 0 ? p[0...1] : p[0...i]
+      basename = p[i + 1...p.size]
+      break
+    }
+    i -= 1
+  }
+  (dirname, basename)
+}
+
+# Removes `base` in the directory open as `parent` and everything below it
+# (Go's removeAllFrom); errors name `shown` + the path below the parent.
+def remove_all_from(parent: Int, base: Str, shown: Str) -> ~Unit<FsError> {
+  return if c_unlinkat(parent.to_i32, base, 0) == 0
+  uerr = C.errno
+  return if uerr == c("ENOENT")
+  if uerr != c("EISDIR") && uerr != c("EPERM") && uerr != c("EACCES") {
+    fail ferr("unlinkat " + shown + base, uerr)
+  }
+  first: FsError? = none
+  flags = c("O_RDONLY") | c("O_DIRECTORY") | c("O_NOFOLLOW") | c("O_CLOEXEC")
+  fd = c_openat(parent.to_i32, base, flags.to_i32).to_i
+  if fd < 0 {
+    code = C.errno
+    return if code == c("ENOENT")
+    fail ferr("unlinkat " + shown + base, uerr) if code == c("ENOTDIR")
+    # A symlink (O_NOFOLLOW): report why unlinking it failed.
+    code = uerr if code == c("ELOOP") || code == c("EMLINK")
+    first = ferr("openfdat " + shown + base, code)
+  } else {
+    names: [Str] = []
+    h = alx_sys_dir_fdopen(fd)
+    if h >= 0 {
+      kind = zeros(1)
+      loop {
+        p = alx_sys_dir_next(h, kind)
+        break if p.null?
+        names << Str.from_cstr(p)
+      }
+      alx_sys_dir_close(h)
+    } else {
+      first = ferr("readdirnames " + shown + base, -h)
+    }
+    for n in names {
+      r = remove_all_from(fd, n, shown + base + "/")
+      first = r.err if first == none
+    }
+    alx_fd_close(fd)
+  }
+  return if c_unlinkat(parent.to_i32, base, c("AT_REMOVEDIR").to_i32) == 0
+  rerr = C.errno
+  return if rerr == c("ENOENT")
+  if e = first {
+    fail e
+  }
+  fail ferr("unlinkat " + shown + base, rerr)
+}
+
+# Moves (renames) old to new, replacing a file at new; a directory at new is
+# an error (Go's rename).
+pub def rename(old: Str, new: Str) -> ~Unit<FsError> {
+  fail link_error("rename", old, new, c("EINVAL")) if nul?(old) || nul?(new)
+  ni = lstat(new)
+  if nfi = ni.ok {
+    if nfi.is_dir {
+      oi = lstat(old)
+      if oi.err? {
+        fail link_error("rename", old, new, oi.err.unwrap.errno)
+      }
+      fail link_error("rename", old, new, c("EEXIST")) if new == old || !same_file(nfi, oi.unwrap)
+    }
+  }
+  r = c_rename(old, new)
+  fail link_error("rename", old, new, C.errno) if r != 0
+}
+
+pub def chmod(name: Str, mode: Int) -> ~Unit<FsError> {
+  fail ferr("chmod" + " " + name, c("EINVAL")) if nul?(name)
+  r = c_chmod(name, mode.to_i32)
+  fail ferr("chmod" + " " + name, C.errno) if r != 0
+}
+
+# Go's Chown: -1 leaves an id as it is.
+pub def chown(name: Str, uid: Int, gid: Int) -> ~Unit<FsError> {
+  fail ferr("chown" + " " + name, c("EINVAL")) if nul?(name)
+  r = c_chown(name, uid.to_i32, gid.to_i32)
+  fail ferr("chown" + " " + name, C.errno) if r != 0
+}
+
+# Go's Lchown: of a symlink itself.
+pub def lchown(name: Str, uid: Int, gid: Int) -> ~Unit<FsError> {
+  fail ferr("lchown" + " " + name, c("EINVAL")) if nul?(name)
+  r = c_lchown(name, uid.to_i32, gid.to_i32)
+  fail ferr("lchown" + " " + name, C.errno) if r != 0
+}
+
+# Go's Chtimes: the access and modification times, in nanoseconds since the
+# epoch; none leaves one as it is (Go's zero time.Time).
+pub def chtimes(name: Str, atime: Int?, mtime: Int?) -> ~Unit<FsError> {
+  fail ferr("chtimes" + " " + name, c("EINVAL")) if nul?(name)
+  ts = zeros(32)
+  put_time(ts, 0, atime)
+  put_time(ts, 2, mtime)
+  r = c_utimensat(c("AT_FDCWD").to_i32, name, ts, 0)
+  fail ferr("chtimes" + " " + name, C.errno) if r != 0
+}
+
+def put_time(ts: [Byte], k: Int, t: Int?) {
+  if v = t {
+    s = v / 1_000_000_000
+    ns = v % 1_000_000_000
+    if ns < 0 {
+      s -= 1
+      ns += 1_000_000_000
+    }
+    put64(ts, k, s)
+    put64(ts, k + 1, ns)
+  } else {
+    put64(ts, k, 0)
+    put64(ts, k + 1, c("UTIME_OMIT"))
+  }
+}
+
+pub def truncate(name: Str, size: Int) -> ~Unit<FsError> {
+  fail ferr("truncate" + " " + name, c("EINVAL")) if nul?(name)
+  r = c_truncate(name, size)
+  fail ferr("truncate" + " " + name, C.errno) if r != 0
+}
+
+# A hard link `new` to `old`.
+pub def link(old: Str, new: Str) -> ~Unit<FsError> {
+  fail link_error("link", old, new, c("EINVAL")) if nul?(old) || nul?(new)
+  r = c_link(old, new)
+  fail link_error("link", old, new, C.errno) if r != 0
+}
+
+# A symbolic link at `new` pointing to `old`.
+pub def symlink(old: Str, new: Str) -> ~Unit<FsError> {
+  fail link_error("symlink", old, new, c("EINVAL")) if nul?(old) || nul?(new)
+  r = c_symlink(old, new)
+  fail link_error("symlink", old, new, C.errno) if r != 0
+}
+
+# The target of a symbolic link.
+pub def readlink(name: Str) -> ~Str<FsError> {
+  fail ferr("readlink" + " " + name, c("EINVAL")) if nul?(name)
+  size = 128
+  loop {
+    buf = zeros(size)
+    n = c_readlink(name, buf, size)
+    fail ferr("readlink" + " " + name, C.errno) if n < 0
+    return Str.from_bytes(buf[0...n]) if n < size
+    size *= 2
+  }
+}
+
+# A new directory in `dir` (the temp dir if ""), named pattern with its last
+# `*` replaced by a random string (or the string appended). Returns its path.
+pub def mkdir_temp(dir: Str, pattern: Str) -> ~Str<FsError> {
+  base = dir
+  base = temp_dir if base.size == 0
+  fail ferr("mkdirtemp " + pattern, ERR_PATTERN_SEP) if pattern.bytes.any? { |b| b == 47 }
+  fail ferr("mkdirtemp " + pattern, c("EINVAL")) if nul?(pattern) || nul?(base)
+  prefix, suffix = prefix_and_suffix(pattern)
+  prefix = join_path(base, prefix)
+  tries = 0
+  loop {
+    name = prefix + next_random + suffix
+    r = c_mkdir(name, 0o700)
+    return name if r == 0
+    code = C.errno
+    if code == c("EEXIST") {
+      tries += 1
+      next if tries < 10000
+      fail ferr("mkdirtemp " + prefix + "*" + suffix, ERR_EXIST)
+    }
+    if code == c("ENOENT") {
+      s = stat(base)
+      ~s if s.err? && is_not_exist(s.err.unwrap)
+    }
+    fail ferr("mkdir" + " " + name, code)
+  }
+}
+
+# Creates and opens (read-write, 0o600) a new file the same way; see
+# mkdir_temp.
+pub def create_temp(dir: Str, pattern: Str) -> ~File<FsError> {
+  base = dir
+  base = temp_dir if base.size == 0
+  fail ferr("createtemp " + pattern, ERR_PATTERN_SEP) if pattern.bytes.any? { |b| b == 47 }
+  fail ferr("createtemp " + pattern, c("EINVAL")) if nul?(pattern) || nul?(base)
+  prefix, suffix = prefix_and_suffix(pattern)
+  prefix = join_path(base, prefix)
+  tries = 0
+  loop {
+    name = prefix + next_random + suffix
+    fd = alx_sys_open(name, native_flags(O_RDWR | O_CREATE | O_EXCL).to_i32, 0o600)
+    return file_of(fd.to_i, name) if fd >= 0
+    code = C.errno
+    if code == c("EEXIST") {
+      tries += 1
+      next if tries < 10000
+      fail ferr("createtemp " + prefix + "*" + suffix, ERR_EXIST)
+    }
+    fail ferr("open" + " " + name, code)
+  }
+}
+
+# The pattern's parts before and after its last "*" (all of it before, if
+# none).
+def prefix_and_suffix(pattern: Str) -> (Str, Str) {
+  i = pattern.size - 1
+  while i >= 0 {
+    return (pattern[0...i], pattern[i + 1...pattern.size]) if pattern[i] == 42
+    i -= 1
+  }
+  (pattern, "")
+}
+
+def join_path(dir: Str, name: Str) -> Str {
+  return dir + name if dir.size > 0 && dir[dir.size - 1] == 47
+  dir + "/" + name
+}
+
+RAND = Atomic.new(0)
+
+# A random uint32 in decimal (Go's nextRandom).
+def next_random -> Str {
+  s = RAND.load
+  s = alx_mono_ns ^ (alx_wall_ns << 13) ^ (getpid << 32) if s == 0
+  # xorshift64*
+  s = s ^ (s >> 12)
+  s = s ^ (s << 25)
+  s = s ^ (s >> 27)
+  RAND.store(s)
+  ((s *% 2685821657736338717) >> 32 & 0xffffffff).to_s
+}
+
+# ------------------------------------------------------------------ CopyFS
+
+# Go's CopyFS: copies the file system fsys (an io/fs FS: fs.dir_fs(...), an
+# fstest.MapFS, ...) into dir, creating it if needed. Files are created with
+# O_EXCL (an existing file fails with ErrExist) and mode 0o666 | the source
+# file's permissions; symlinks are recreated as symlinks to the same target;
+# anything else fails ("CopyFS x: invalid argument"). Generic over the file
+# system (os can't import io/fs, which imports os): F has io/fs's FS methods.
+pub def copy_fs[F](dir: Str, fsys: F) -> ~Unit {
+  ~mkdir_all(dir, 0o777)
+  ~copy_fs_dir(dir, fsys, ".")
+}
+
+def copy_fs_dir[F](dir: Str, fsys: F, name: Str) -> ~Unit {
+  for d in fsys.~read_dir(name) {
+    p = name == "." ? d.name : name + "/" + d.name
+    new_path = join_path(dir, p)
+    t = d.type.bits
+    if t == (1 << 31) {
+      ~mkdir_all(new_path, 0o777)
+      ~copy_fs_dir(dir, fsys, p)
+    } elsif t == (1 << 27) {
+      target = fsys.~read_link(p)
+      ~symlink(target, new_path)
+    } elsif t == 0 {
+      r = fsys.~open(p)
+      info = r.~stat
+      perm = (info.mode.bits & 0o777).to_i
+      w = ~open_file(new_path, O_CREATE | O_EXCL | O_WRONLY, 0o666 | perm)
+      buf = zeros(32 * 1024)
+      loop {
+        n = r.read!(buf)
+        if e = n.err {
+          _ = w.close!
+          _ = r.close!
+          fail ferr("Copy " + new_path, code_of_any(e))
+        }
+        k = n.unwrap
+        break if k == 0
+        ~w.write!(buf[0...k])
+      }
+      _ = r.close!
+      ~w.close!
+    } else {
+      fail ferr("CopyFS " + p, ERR_INVALID)
+    }
+  }
+}
+
+# The FsError's code, or EIO for another error.
+def code_of_any(e: Error) -> Int {
+  k = code_of(e)
+  k == 0 ? c("EIO") : k
+}

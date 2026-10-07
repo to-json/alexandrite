@@ -1,14 +1,77 @@
-# Package context: Go's context — cancellation and deadlines that flow
-# from a parent to everything derived from it.
+# Package context: Go's context — cancellation, deadlines and request-scoped
+# values that flow from a parent to everything derived from it.
 #
 #   ctx, cancel = context.with_cancel(context.background)
 #   spawn { work(ctx) }        # work selects on ctx.done
 #   cancel()
 #
-# A Context is a handle: copies share its state, and it can be captured by
-# tasks. A derived context watches its parent with a small task of its own
-# (a select on the parent's `done` and its own), so cancelling a parent
-# cancels every context derived from it. Not shipped: values (`with_value`).
+#   Go                                   alx
+#   Context (interface)                  Context (interface): deadline -> time.Time?,
+#                                          done -> Chan[Bool], err -> Error?,
+#                                          value(key: Key) -> Any?; defaults
+#                                          cancelable?, done?, after_func, to_s
+#   Background() / TODO()                background / todo
+#   WithCancel(p)                        with_cancel(p) -> (Context, () -> Unit)
+#   WithCancelCause(p)                   with_cancel_cause(p) -> (Context, (Error?) -> Unit)
+#   WithDeadline(p, t) / ...Cause        with_deadline(p, t) / with_deadline_cause(p, t, cause)
+#   WithTimeout(p, d) / ...Cause         with_timeout(p, d) / with_timeout_cause(p, d, cause)
+#   WithValue(p, k, v)                   with_value(p, k, v) (generic over k's and v's types)
+#   ctx.Value(k).(V)                     context.value(ctx, k) -> V? (`v: Str? = value(ctx, k)`)
+#   ctx.Value(k) (any)                   ctx.value(key_of(k)) -> Any? (from_any(a) -> V?)
+#   WithoutCancel(p)                     without_cancel(p)
+#   AfterFunc(ctx, f)                    after_func(ctx, f) -> () -> Bool (the stop func)
+#   Cause(c)                             cause(c) -> Error?
+#   Canceled / DeadlineExceeded          ContextError.Canceled / ContextError.DeadlineExceeded
+#     (DeadlineExceeded.Timeout())         (.timeout?, .temporary?)
+#   CancelFunc / CancelCauseFunc         () -> Unit / (Error?) -> Unit
+#   fmt.Sprint(ctx) (String)             "#{ctx}" / ctx.to_s (Go's texts)
+#
+# The derived contexts are Go's: a cancel context registers with the nearest
+# cancel context above it (found through `value`, as Go's parentCancelCtx
+# does), so cancelling a parent cancels its children synchronously, without
+# a task per context; a parent that offers `after_func` (Go's afterFuncer)
+# is asked for a callback; any other cancelable parent is watched by a task.
+# A context is a handle: copies share its state, and tasks may capture it.
+#
+# Differences from Go:
+#  - `done` is never nil: a context that can't be cancelled (background,
+#    todo, without_cancel) returns a channel that is never closed, and
+#    `cancelable?` is false for it (Go's `ctx.Done() == nil`). A custom
+#    Context that never cancels should say so with `cancelable?`, or a
+#    child will watch its channel with a task until the child is done.
+#  - Keys and values are boxed into the interfaces `Key` and `Any` (alx has
+#    no `any`): `key_of(k)`, `any_of(v)`, `from_any(a)`. Keys compare with
+#    `==` (same type and equal values); a key type without `==` is refused at
+#    compile time (Go panics "key is not comparable"). Go's nil key and nil
+#    parent panics can't happen (no nil). A value stored as a `V?` is found
+#    only as a `V?` (Go's `WithValue(c, k, nil)` shadows: store `none`
+#    typed as the optional and look it up as the optional).
+#  - String forms: Go's stringify prints a non-Stringer, non-string key or
+#    value as its type name (reflection); alx prints the value (`"#{v}"`),
+#    and `none` as "none" (Go "<nil>"). A custom Context without `to_s`
+#    shows as "context" (Go: its type name).
+#  - Optional interfaces are default methods on Context (as database/sql's
+#    drivers do): `after_func` (Go's afterFuncer) returns none unless the
+#    implementation overrides it.
+#  - `done?` (err != none) and `cancelable?` are additions.
+#  - Deadline timers: a deadline is a task that sleeps until it and then
+#    cancels; cancelling earlier makes it do nothing when it wakes (Go stops
+#    the timer). The sleeping task lives until the deadline.
+#  - DeadlineExceeded is not a net.Error here (net_test.go's
+#    TestDeadlineExceededIsNetError): it has `timeout?` and `temporary?`.
+#  - The package's contexts keep closures, keys, values and deadlines
+#    under their locks: Context is `#[shareable]`, so a Context can be handed
+#    to tasks without `.dup`, and a custom Context must keep its state the
+#    same way (holding a slice or closure in a plain field is a compile error).
+#
+# Tests: Go's context_test.go (internal XTests), x_test.go, afterfunc_test.go
+# and example_test.go are translated; vec_context_test.alx holds trees of
+# derived contexts generated by Go (String, Value, Err, Cause after random
+# cancels). Not translated: TestAllocs (allocation counts),
+# TestWithValueChecksKey and TestInvalidDerivedFail (nil keys and parents;
+# a non-comparable key is a compile error), TestDeadlineExceededIsNetError
+# (no net.Error), ExampleAfterFunc_connection (net.Conn has no read
+# deadlines), benchmark_test.go.
 
 import "time"
 
@@ -25,123 +88,480 @@ pub error ContextError {
       DeadlineExceeded => "context deadline exceeded"
     }
   }
+
+  # Go's deadlineExceededError.Timeout / Temporary (true for
+  # DeadlineExceeded; Canceled has neither in Go).
+  pub def timeout? -> Bool { self == ContextError.DeadlineExceeded }
+  pub def temporary? -> Bool { self == ContextError.DeadlineExceeded }
 }
 
-pub struct Context {
-  st: Mutex[CtxState]
-  # Unix nanoseconds; 0 = no deadline.
-  deadline_ns: Int
-  # `background`/`todo`: never cancelled.
-  root: Bool
+# ------------------------------------------------------------ keys and values
 
-  # A channel closed when the context is cancelled (or its deadline
-  # passes); receiving from it then gives none at once.
-  pub def done -> Chan[Bool] {
-    st.lock { |s| s.done }
-  }
+# A boxed context key (Go's `key any`): `key_of(k)`. Two keys are equal when
+# they box the same type and equal values.
+pub interface Key {
+  def context_key_str -> Str
+}
 
-  # Why it was cancelled; none while it's live.
-  pub def err -> ContextError? {
-    st.lock { |s|
-      s.why == 1 ? ContextError.Canceled : (s.why == 2 ? ContextError.DeadlineExceeded : none)
-    }
-  }
+# A boxed context value (Go's `val any`): `any_of(v)`, taken back out with
+# `from_any`.
+pub interface Any {
+  def context_any_str -> Str
+}
 
-  # The deadline, if it has one (Unix nanoseconds).
-  pub def deadline -> Int? {
-    deadline_ns == 0 ? none : deadline_ns
+struct KeyOf[T] {
+  v: T
+
+  def context_key_str -> Str { "#{v}" }
+}
+
+struct AnyOf[T] {
+  v: T
+
+  def context_any_str -> Str { "#{v}" }
+}
+
+# `k` as a Key.
+pub def key_of[K](k: K) -> Key {
+  KeyOf[K].new(v: k)
+}
+
+# `v` as an Any.
+pub def any_of[V](v: V) -> Any {
+  AnyOf[V].new(v: v)
+}
+
+# The value inside `a` if it is a V (Go's `a.(V)`).
+pub def from_any[V](a: Any?) -> V? {
+  x = a || return none
+  b: AnyOf[V]? = unbox_any(x)
+  b?.v
+}
+
+def unbox_any[B](a: Any) -> B? {
+  case a {
+    B(b) => { return b }
+    _ => { return none }
   }
+}
+
+# --------------------------------------------------------------------- Context
+
+# Go's Context: a deadline, a cancellation signal and values, safe to use
+# from many tasks. `#[shareable]`: a Context may be handed to tasks anywhere
+# (no `.dup`), so an implementation keeps its state under locks, in
+# atomics or behind channels (the compiler checks every implementation).
+#[shareable]
+pub interface Context {
+  # When the work should be cancelled, if ever.
+  def deadline -> time.Time?
+  # A channel closed when the context is cancelled. Receiving from it then
+  # gives none at once. Never closed if the context can't be cancelled.
+  def done -> Chan[Bool]
+  # none until `done` is closed; then why (ContextError.Canceled or
+  # ContextError.DeadlineExceeded).
+  def err -> Error?
+  # The value stored for `key` here or in a parent, if any.
+  def value(key: Key) -> Any?
+
+  # Whether `done` can ever be closed (Go's `ctx.Done() != nil`).
+  def cancelable? -> Bool { true }
 
   # Whether it has been cancelled.
-  pub def done? -> Bool {
-    st.lock { |s| s.why != 0 }
-  }
+  def done? -> Bool { err != none }
 
-  # Whether it can ever be cancelled (Go's `ctx.Done() != nil`): false for
-  # `background` and `todo`.
-  pub def cancelable? -> Bool { !root }
+  # Go's optional afterFuncer: arrange for `f` to run (in a task) once the
+  # context is done, and return the function that stops that. none: not
+  # supported (the default).
+  def after_func(f: () -> Unit) -> (() -> Bool)? { none }
+
+  # Go's String (fmt.Sprint(ctx)).
+  def to_s -> Str { "context" }
 }
 
-struct CtxState {
-  done: Chan[Bool]
-  # 0 live, 1 cancelled, 2 deadline exceeded.
-  why: Int
+# The never-closed channel of contexts that can't be cancelled.
+NEVER = Atomic.new(Chan[Bool].new)
+# Unique ids for cancel contexts (their place in a parent's children).
+NEXT_ID = Atomic.new(0)
+# Watcher tasks started (Go's `goroutines` counter, for the tests).
+GOROUTINES = Atomic.new(0)
+
+# background and todo.
+struct EmptyCtx {
+  name: Str
+
+  def deadline -> time.Time? { none }
+  def done -> Chan[Bool] { NEVER.load }
+  def err -> Error? { none }
+  def value(key: Key) -> Any? { none }
+  def cancelable? -> Bool { false }
+  def to_s -> Str { name }
 }
 
-def fresh(deadline_ns: Int, root: Bool) -> Context {
-  Context.new(st: Mutex.new(CtxState.new(done: Chan[Bool].new, why: 0)), deadline_ns: deadline_ns, root: root)
-}
-
-# Cancel `c` for reason `why` (the first reason sticks).
-def stop(c: Context, why: Int) {
-  c.st.lock { |s|
-    if s.why == 0 {
-      s.why = why
-      s.done.close
-    }
-  }
-}
-
-# The root context: never cancelled, no deadline.
+# The root context: never cancelled, no deadline, no values.
 pub def background -> Context {
-  fresh(0, true)
+  EmptyCtx.new(name: "context.Background")
 }
 
 # Same as `background`, for code that hasn't decided yet (Go's TODO).
 pub def todo -> Context {
-  fresh(0, true)
+  EmptyCtx.new(name: "context.TODO")
+}
+
+# The key under which a cancel context answers `value` with itself (Go's
+# &cancelCtxKey).
+struct CancelCtxKey {
+}
+
+def cancel_key -> Key {
+  key_of(CancelCtxKey.new)
+}
+
+# Kinds of CancelCtx (Go's cancelCtx, timerCtx and afterFuncCtx).
+KIND_CANCEL = 0
+KIND_TIMER = 1
+KIND_AFTER = 2
+
+struct CancelState {
+  done: Chan[Bool]
+  # Set by the first cancel.
+  err: Error?
+  cause: Error?
+  # Contexts to cancel with this one, by id (Go's children set).
+  children: Map[Int, (Error, Error?) -> Unit]
+  # The stop function a parent's after_func returned (Go's stopCtx).
+  stop: (() -> Bool)?
+  # KIND_AFTER: the function to run; none once it has started or been
+  # stopped (Go's afterFuncCtx.once). It lives here, under the lock, so a
+  # context holds no closure of its own and can be handed to tasks.
+  f: (() -> Unit)?
+  # KIND_TIMER: the deadline (here, under the lock, because a Time holds
+  # its Location's tables).
+  at: time.Time
+}
+
+# Go's cancelCtx (and timerCtx, afterFuncCtx by `kind`).
+struct CancelCtx {
+  parent: Context
+  st: Mutex[CancelState]
+  id: Int
+  kind: Int
+
+  def deadline -> time.Time? {
+    return st.lock { |s| s.at } if kind == KIND_TIMER
+    parent.deadline
+  }
+
+  def done -> Chan[Bool] {
+    st.lock { |s| s.done }
+  }
+
+  def err -> Error? {
+    st.lock { |s| s.err }
+  }
+
+  def value(key: Key) -> Any? {
+    return any_of(self) if key == cancel_key
+    lookup(parent, key)
+  }
+
+  def to_s -> Str {
+    if kind == KIND_TIMER {
+      at = st.lock { |s| s.at }
+      return "#{parent}.WithDeadline(#{at} [#{time.until(at)}])"
+    }
+    "#{parent}.WithCancel"
+  }
+}
+
+def new_cancel_ctx(parent: Context, kind: Int, at: time.Time, f: (() -> Unit)?) -> CancelCtx {
+  kids: Map[Int, (Error, Error?) -> Unit] = {}
+  st = CancelState.new(done: Chan[Bool].new, err: none, cause: none, children: kids, stop: none, f: none, at: at.dup)
+  if x = f {
+    st.f = x.dup
+  }
+  CancelCtx.new(parent: parent, st: Mutex.new(st), id: NEXT_ID.add(1), kind: kind)
+}
+
+# Takes the after-func out of `c` (none if it was taken before).
+def take_f(c: CancelCtx) -> (() -> Unit)? {
+  c.st.lock { |s|
+    g = s.f
+    s.f = none
+    g
+  }
+}
+
+# Cancel `c`: close its channel, cancel its children, and (if asked) take
+# it out of its parent's children. The first call wins (Go's cancel).
+def cancel(c: CancelCtx, remove: Bool, err: Error, cause0: Error?) {
+  why = cause0 || err
+  kids = c.st.lock { |s|
+    if s.err != none {
+      none
+    } else {
+      s.err = err
+      s.cause = why
+      s.done.close
+      fns = s.children.values
+      s.children = {}
+      fns
+    }
+  }
+  if ks = kids {
+    ks.each { |k| k.call(err, why) }
+  }
+  remove_child(c) if remove
+  if f = take_f(c) {
+    g = f.dup
+    _ = spawn { g() }
+  }
+}
+
+# Go's removeChild: through the after_func stop, or out of the parent
+# cancel context's children.
+def remove_child(c: CancelCtx) {
+  stop = c.st.lock { |s| s.stop }
+  if f = stop {
+    _ = f()
+    return
+  }
+  if p = parent_cancel_ctx(c.parent) {
+    id = c.id
+    p.st.lock { |s| s.children.delete(id) }
+  }
+}
+
+# Go's parentCancelCtx: the cancel context `parent` is or wraps, if its
+# `done` is that context's own channel (a wrapper with a channel of its own
+# must be watched instead).
+def parent_cancel_ctx(parent: Context) -> CancelCtx? {
+  return none if !parent.cancelable?
+  done = parent.done
+  pc: CancelCtx? = from_any(parent.value(cancel_key))
+  p = pc || return none
+  pdone = p.done
+  return none if pdone != done
+  p
+}
+
+# Go's propagateCancel: arrange for `c` to be cancelled with `parent`.
+def propagate_cancel(c: CancelCtx, parent: Context) {
+  return if !parent.cancelable?
+  done = parent.done
+  closed = false
+  select {
+    when _ = done.recv => closed = true
+    else => closed = false
+  }
+  if closed {
+    cancel(c, false, parent.err || ContextError.Canceled, cause(parent))
+    return
+  }
+  if p = parent_cancel_ctx(parent) {
+    child = c
+    id = c.id
+    already = p.st.lock { |s|
+      if e = s.err {
+        (e, s.cause)
+      } else {
+        s.children[id] = ->(e: Error, why: Error?) { cancel(child, false, e, why) }
+        none
+      }
+    }
+    if a = already {
+      cancel(c, false, a[0], a[1])
+    }
+    return
+  }
+  child = c
+  par = parent
+  if stop = parent.after_func(->() { cancel(child, false, par.err || ContextError.Canceled, cause(par)) }) {
+    c.st.lock { |s| s.stop = stop }
+    return
+  }
+  GOROUTINES.add(1)
+  cd = c.done
+  on_parent = ->() { cancel(child, false, par.err || ContextError.Canceled, cause(par)) }
+  g = on_parent.dup
+  _ = spawn {
+    select {
+      when _ = done.recv => g()
+      when _ = cd.recv => {}
+    }
+  }
 }
 
 # A child of `parent` and the function that cancels it (and what derives
 # from it). Calling the function again does nothing.
 pub def with_cancel(parent: Context) -> (Context, () -> Unit) {
-  c = derive(parent, parent.deadline_ns)
-  (c, ->() { stop(c, 1) })
+  c = new_cancel_ctx(parent, KIND_CANCEL, time.Time.new, none)
+  propagate_cancel(c, parent)
+  (c, ->() { cancel(c, true, ContextError.Canceled, none) })
 }
 
-# A child that is cancelled at `deadline_ns` (Unix nanoseconds) at the
-# latest.
-pub def with_deadline(parent: Context, deadline_ns: Int) -> (Context, () -> Unit) {
-  d = parent.deadline_ns != 0 && parent.deadline_ns < deadline_ns ? parent.deadline_ns : deadline_ns
-  c = derive(parent, d)
-  wait = d - time.now.unix_nano
-  if wait <= 0 {
-    stop(c, 2)
-  } else {
-    timer = time.after(time.duration(wait))
-    done = c.done
-    spawn {
-      select {
-        when timer.recv => stop(c, 2)
-        when done.recv => {}
-      }
+# Like with_cancel, but the function takes the cause: `cause(ctx)` returns
+# it (or Canceled if it is none) once the context is cancelled by it.
+pub def with_cancel_cause(parent: Context) -> (Context, (Error?) -> Unit) {
+  c = new_cancel_ctx(parent, KIND_CANCEL, time.Time.new, none)
+  propagate_cancel(c, parent)
+  (c, ->(why: Error?) { cancel(c, true, ContextError.Canceled, why) })
+}
+
+# Why `c` was cancelled: the cause given to the cancel function of the
+# context that cancelled it (with_cancel_cause, with_deadline_cause, ...),
+# else `c.err`; none while it is live.
+pub def cause(c: Context) -> Error? {
+  e = c.err || return none
+  cc: CancelCtx? = from_any(c.value(cancel_key))
+  if x = cc {
+    why = x.st.lock { |s| s.cause }
+    if w = why {
+      return w
     }
   }
-  (c, ->() { stop(c, 1) })
+  e
+}
+
+# A child cancelled at `d` at the latest (sooner if the parent's deadline is
+# sooner, or when the returned function is called).
+pub def with_deadline(parent: Context, d: time.Time) -> (Context, () -> Unit) {
+  with_deadline_cause(parent, d, none)
+}
+
+# with_deadline, with `why` as the cause when the deadline passes.
+pub def with_deadline_cause(parent: Context, d: time.Time, why: Error?) -> (Context, () -> Unit) {
+  if cur = parent.deadline {
+    return with_cancel(parent) if cur.before(d)
+  }
+  c = new_cancel_ctx(parent, KIND_TIMER, d, none)
+  propagate_cancel(c, parent)
+  dur = time.until(d)
+  if dur.nanoseconds <= 0 {
+    cancel(c, true, ContextError.DeadlineExceeded, why)
+    return (c, ->() { cancel(c, false, ContextError.Canceled, none) })
+  }
+  if c.err == none {
+    fire = ->() { cancel(c, true, ContextError.DeadlineExceeded, why) }
+    g = fire.dup
+    _ = spawn {
+      time.sleep(dur)
+      g()
+    }
+  }
+  (c, ->() { cancel(c, true, ContextError.Canceled, none) })
 }
 
 # A child cancelled after `timeout` at the latest.
 pub def with_timeout(parent: Context, timeout: time.Duration) -> (Context, () -> Unit) {
-  with_deadline(parent, time.now.unix_nano + timeout.nanoseconds)
+  with_deadline(parent, time.now.add(timeout))
 }
 
-# A child that follows its parent's cancellation.
-def derive(parent: Context, deadline_ns: Int) -> Context {
-  c = fresh(deadline_ns, false)
-  if parent.done? {
-    stop(c, parent.st.lock { |s| s.why })
-    return c
+# with_timeout, with `why` as the cause when the time is up.
+pub def with_timeout_cause(parent: Context, timeout: time.Duration, why: Error?) -> (Context, () -> Unit) {
+  with_deadline_cause(parent, time.now.add(timeout), why)
+}
+
+# Go's AfterFunc: run `f` in its own task once `ctx` is done (at once if it
+# already is). The returned function stops that: it returns true if it
+# stopped f from running, false if f has started or was stopped before.
+pub def after_func(ctx: Context, f: () -> Unit) -> () -> Bool {
+  g = f.dup
+  a = new_cancel_ctx(ctx, KIND_AFTER, time.Time.new, g)
+  propagate_cancel(a, ctx)
+  ->() -> Bool {
+    stopped = take_f(a) != none
+    cancel(a, true, ContextError.Canceled, none) if stopped
+    stopped
   }
-  pd = parent.done
-  cd = c.done
-  # Roots never end: nothing to watch (a watcher would wait forever).
-  if !parent.root {
-    spawn {
-      select {
-        when pd.recv => stop(c, parent.st.lock { |s| s.why })
-        when cd.recv => {}
+}
+
+# --------------------------------------------------------------------- values
+
+# Go's valueCtx.
+struct ValueCtx {
+  parent: Context
+  # Under a lock, so a value with storage of its own (a slice, a closure)
+  # doesn't make every Context unsafe to hand to a task.
+  kv: Mutex[KeyVal]
+
+  def deadline -> time.Time? { parent.deadline }
+  def done -> Chan[Bool] { parent.done }
+  def err -> Error? { parent.err }
+  def cancelable? -> Bool { parent.cancelable? }
+
+  def value(k: Key) -> Any? { lookup(self, k) }
+
+  def to_s -> Str {
+    s = kv.lock { |x| "#{x.key.context_key_str}, #{x.val.context_any_str}" }
+    "#{parent}.WithValue(#{s})"
+  }
+}
+
+struct KeyVal {
+  key: Key
+  val: Any
+}
+
+# A child of `parent` in which `key` has the value `val` (looked up with
+# `value(ctx, key)`). Use a key type of your own (an unexported struct or
+# enum) so other packages' keys can't collide with it.
+pub def with_value[K, V](parent: Context, key: K, val: V) -> Context {
+  ValueCtx.new(parent: parent, kv: Mutex.new(KeyVal.new(key: key_of(key), val: any_of(val))))
+}
+
+# The value of `key` in `c` if it is a V: Go's `c.Value(key).(V)`. The type
+# comes from the declaration: `lang: Str? = context.value(ctx, k)`.
+pub def value[K, V](c: Context, key: K) -> V? {
+  v: V? = from_any(c.value(key_of(key)))
+  v
+}
+
+# Go's value(): walk up through the package's own contexts, asking any
+# other context for the value itself.
+def lookup(c0: Context, key: Key) -> Any? {
+  c = c0
+  loop {
+    case c {
+      ValueCtx(v) => {
+        hit = v.kv.lock { |x| key == x.key ? x.val : none }
+        return hit if hit != none
+        c = v.parent
+      }
+      CancelCtx(x) => {
+        return any_of(x) if key == cancel_key
+        c = x.parent
+      }
+      WithoutCancelCtx(w) => {
+        return none if key == cancel_key
+        c = w.parent
+      }
+      EmptyCtx => {
+        return none
+      }
+      _ => {
+        return c.value(key)
       }
     }
   }
-  c
+  none
+}
+
+# ------------------------------------------------------------- without_cancel
+
+struct WithoutCancelCtx {
+  parent: Context
+
+  def deadline -> time.Time? { none }
+  def done -> Chan[Bool] { NEVER.load }
+  def err -> Error? { none }
+  def cancelable? -> Bool { false }
+  def value(key: Key) -> Any? { lookup(self, key) }
+  def to_s -> Str { "#{parent}.WithoutCancel" }
+}
+
+# A child that keeps `parent`'s values but is never cancelled, has no
+# deadline and no error, even when `parent` is cancelled.
+pub def without_cancel(parent: Context) -> Context {
+  WithoutCancelCtx.new(parent: parent)
 }

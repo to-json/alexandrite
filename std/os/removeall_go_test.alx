@@ -1,0 +1,159 @@
+#![test(external)]
+# Go's os/removeall_test.go, translated. Not translated: TestRemoveAllNoFcntl
+# (counts fcntl calls under strace, Linux only: an implementation detail).
+
+import "os"
+import "path/filepath"
+import "testing"
+
+test "RemoveAll" { |t|
+  tmp_dir = t.temp_dir
+  os.remove_all("").unwrap
+  file = tmp_dir + "/file"
+  path = tmp_dir + "/_TestRemoveAll_"
+  fpath = path + "/file"
+  dpath = path + "/dir"
+  touch(file)
+  os.remove_all(file).unwrap
+  assert os.lstat(file).err?, "Lstat #{file} succeeded after RemoveAll (first)"
+  os.mkdir_all(path, 0o777).unwrap
+  touch(fpath)
+  os.remove_all(path).unwrap
+  assert os.lstat(path).err?, "Lstat #{path} succeeded after RemoveAll (second)"
+  os.mkdir_all(dpath, 0o777).unwrap
+  touch(fpath)
+  touch(dpath + "/file")
+  os.remove_all(path).unwrap
+  assert os.lstat(path).err?, "Lstat #{path} succeeded after RemoveAll (third)"
+  if os.getuid != 0 {
+    os.mkdir_all(dpath, 0o777).unwrap
+    for s in [fpath, dpath + "/file1", path + "/zzz"] { touch(s) }
+    os.chmod(dpath, 0).unwrap
+    _ = os.remove_all(path)
+    os.chmod(dpath, 0o777).unwrap
+    for s in [fpath, path + "/zzz"] {
+      assert os.lstat(s).err?, "Lstat #{s} succeeded after partial RemoveAll"
+    }
+  }
+  os.remove_all(path).unwrap
+  assert os.lstat(path).err?, "Lstat #{path} succeeded after RemoveAll (final)"
+}
+
+test "RemoveAllLarge" { |t|
+  path = t.temp_dir + "/_TestRemoveAllLarge_"
+  os.mkdir_all(path, 0o777).unwrap
+  for i in 0...1000 { touch("#{path}/file#{i}") }
+  os.remove_all(path).unwrap
+  assert os.lstat(path).err?, "Lstat #{path} succeeded after RemoveAll"
+}
+
+test "RemoveAllLongPath" { |t|
+  start_path = t.temp_dir
+  t.chdir(start_path)
+  name = "a" * 100
+  for _i in 0...41 {
+    os.mkdir(name, 0o755).unwrap
+    os.chdir(name).unwrap
+  }
+  os.chdir(start_path + "/..").unwrap
+  r = os.remove_all(start_path)
+  assert r.ok?, "RemoveAll could not remove long file path #{start_path}: #{r.err}"
+}
+
+test "RemoveAllDot" { |t|
+  t.chdir(t.temp_dir)
+  assert os.remove_all(".").err?, "RemoveAll succeed to remove ."
+}
+
+test "RemoveAllDotDot" { |t|
+  temp_dir = t.temp_dir
+  subdir = temp_dir + "/x"
+  subsubdir = subdir + "/y"
+  os.mkdir_all(subsubdir, 0o777).unwrap
+  os.remove_all(filepath.join([subsubdir, ".."])).unwrap
+  for dir in [subsubdir, subdir] {
+    assert os.stat(dir).err?, "#{dir}: exists after RemoveAll"
+  }
+}
+
+test "RemoveReadOnlyDir" { |t|
+  subdir = t.temp_dir + "/x"
+  os.mkdir(subdir, 0).unwrap
+  r = os.remove_all(subdir)
+  _ = os.chmod(subdir, 0o777)
+  r.unwrap
+  assert os.stat(subdir).err?, "subdirectory was not removed"
+}
+
+def requires_permissions(t: testing.T) {
+  t.skip("skipping test: running as root (which ignores file permissions)") if os.getuid == 0
+}
+
+test "RemoveAllButReadOnlyAndPathError" { |t|
+  requires_permissions(t)
+  temp_dir = t.temp_dir
+  dirs = ["a", "a/x", "a/x/1", "b", "b/y", "b/y/2", "c", "c/z", "c/z/3"]
+  readonly = ["b"]
+  in_readonly = ->(d: Str) -> Bool {
+    readonly.any? { |ro| d == ro || filepath.clean(filepath.dir(d)) == ro }
+  }
+  for dir in dirs { os.mkdir(temp_dir + "/" + dir, 0o777).unwrap }
+  for dir in readonly { os.chmod(temp_dir + "/" + dir, 0o555).unwrap }
+  r = os.remove_all(temp_dir)
+  for dir in readonly { os.chmod(temp_dir + "/" + dir, 0o777).unwrap }
+  t.fatal("RemoveAll succeeded unexpectedly") if r.ok?
+  e = r.err.unwrap
+  assert e.path_error?, "RemoveAll(#{temp_dir}): error #{e}, want a PathError"
+  assert_eq e.path, temp_dir + "/b/y"
+  for dir in dirs {
+    gone = os.stat(temp_dir + "/" + dir).err?
+    if in_readonly.call(dir) {
+      assert !gone, "file #{dir} was deleted but should still exist"
+    } else {
+      assert gone, "file #{dir} still exists but should have been deleted"
+    }
+  }
+}
+
+test "RemoveUnreadableDir" { |t|
+  t.skip("skipping test when running as root") if os.getuid == 0
+  temp_dir = t.temp_dir
+  target = temp_dir + "/d0/d1/d2"
+  os.mkdir_all(target, 0o755).unwrap
+  os.chmod(target, 0o300).unwrap
+  os.remove_all(temp_dir + "/d0").unwrap
+}
+
+test "RemoveAllWithMoreErrorThanReqSize" { |t|
+  path = t.temp_dir + "/_TestRemoveAllWithMoreErrorThanReqSize_"
+  os.mkdir_all(path, 0o777).unwrap
+  for i in 0...1025 { touch("#{path}/file#{i}") }
+  os.chmod(path, 0o555).unwrap
+  r = os.remove_all(path)
+  if os.getuid == 0 {
+    os.chmod(path, 0o755).unwrap
+    return
+  }
+  t.fatal("RemoveAll(<read-only directory>) = nil; want error") if r.ok?
+  dir = os.open(path).unwrap
+  names = dir.readdirnames!(1025).unwrap
+  dir.close!.unwrap
+  os.chmod(path, 0o755).unwrap
+  assert names.size >= 1025, "RemoveAll(<read-only directory>) unexpectedly removed #{1025 - names.size} read-only files from that directory"
+}
+
+test "RemoveAllTrailingSlash" { |t|
+  dir = makefs(t, ["dir/a/file1", "dir/a/file2", "dir/file3"])
+  path = dir + "/dir"
+  os.remove_all(path + "/").unwrap
+  assert os.is_not_exist(os.stat(path).err.unwrap), "after RemoveAll(#{path}/), directory still exists"
+}
+
+test "RemoveAllSymlinkRemovalFailure" { |t|
+  requires_permissions(t)
+  dir = makefs(t, ["parent/", "parent/link => target"])
+  os.chmod(dir + "/parent", 0o555).unwrap
+  r = os.remove_all(dir + "/parent/link")
+  os.chmod(dir + "/parent", 0o755).unwrap
+  assert r.err? && os.is_permission(r.err.unwrap), "RemoveAll = #{r.err}; want ErrPermission"
+}

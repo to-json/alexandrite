@@ -65,7 +65,7 @@ let fail = 0;
 // What needs the C library must be refused at compile time.
 const browserless = [
   'ffi.alx', 'echo.alx', 'httpdemo.alx', 'scripting.alx', 'parseexec.alx',
-  'exec_pinned.alx', // processes (os/exec)
+  'exec_pinned.alx', 'os_read_pinned.alx', // processes (os/exec, os.start_process)
   'mutex_http.alx', 'net_dgram.alx', // sockets
   'sqlite_demo.alx', // SQLite through C FFI
 ];

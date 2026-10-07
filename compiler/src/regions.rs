@@ -434,9 +434,15 @@ impl<'a> Graph<'a> {
                         Ty::Fn(..) | Ty::Struct(..) => true,
                         _ => false,
                     };
+                // A map lookup's value is one of the map's values (or the
+                // default given), never the key it was looked up by: the
+                // view aliases the receiver only (port-issues #177; else a
+                // helper `def get(m, k) { m[k] }` ties the map to the key's
+                // storage, and the caller's map goes to the program region).
+                let key_arg = matches!(m, M::MapGet | M::MapGetOr | M::MapDel | M::MapHas);
                 if !matches!(m, M::Spawn | M::Lock) && !flat_copy {
                     v.extend(rv);
-                    v.extend(avs);
+                    v.extend(per_arg.iter().skip(key_arg as usize).flatten().copied());
                 }
             }
             TK::Seq(ss) => {
@@ -868,19 +874,19 @@ fn fresh_locals(f: &TFunc, g: &Graph) -> HashMap<usize, std::collections::HashSe
         // Used only inside this loop?
         let only_inside = |l: &LocalId| everywhere.get(l) == count.get(l);
         let mut ok = std::collections::HashSet::new();
-        let mut seen = std::collections::HashSet::new();
+        // Variables every iteration assigns before it reads them (port-issues
+        // #177): `x = v` anywhere in the body's statements, and in an `if`'s
+        // both branches (or one, when the other leaves the iteration), counts
+        // from there on. A variable read (or mutated in place) anywhere it
+        // may still hold the previous iteration's value is not fresh.
+        let mut da = DefAssign::default();
         for s in body {
-            // `x = v` at the top of the body, before any other mention of x.
-            if let TStmt::Expr(TExpr { kind: TK::Assign(l, v), .. }) = s {
-                let mut in_v = vec![];
-                crate::lower::collect_locals(v, &mut in_v);
-                if !seen.contains(l) && !in_v.contains(l) && only_inside(l) {
-                    ok.insert(*l);
-                }
+            da.stmt(s);
+        }
+        for l in &inside {
+            if only_inside(l) && !da.stale.contains(l) {
+                ok.insert(*l);
             }
-            let mut here = vec![];
-            crate::lower::collect_locals_stmt(s, &mut here);
-            seen.extend(here);
         }
         for l in &inside {
             if !f.locals[*l].user && only_inside(l) {
@@ -890,6 +896,120 @@ fn fresh_locals(f: &TFunc, g: &Graph) -> HashMap<usize, std::collections::HashSe
         out.insert(*key, ok);
     }
     out
+}
+
+/// Definite assignment over one iteration of a loop body: `assigned` holds
+/// the variables assigned on every path to the current point; `stale` the
+/// ones mentioned (read, or changed in place) at a point where they may not
+/// be. Conservative: an assignment nested in an expression, a block or an
+/// inner loop doesn't count after it; a `defer` runs later, so what it
+/// mentions is stale.
+#[derive(Default)]
+struct DefAssign {
+    assigned: std::collections::HashSet<LocalId>,
+    stale: std::collections::HashSet<LocalId>,
+}
+
+impl DefAssign {
+    fn read(&mut self, l: LocalId) {
+        if !self.assigned.contains(&l) {
+            self.stale.insert(l);
+        }
+    }
+    /// Walk an expression in evaluation order. What it assigns counts only
+    /// inside a statement sequence of its own (a `case` arm, a block), not
+    /// after the expression: it may be conditional.
+    fn uses(&mut self, e: &TExpr) {
+        match &e.kind {
+            TK::Local(l) => self.read(*l),
+            TK::Assign(_, v) => self.uses(v),
+            TK::IndexAssign(l, ..) | TK::PlaceAssign(l, ..) | TK::Bang(l, ..) => {
+                self.read(*l);
+                crate::prove::each_child(e, &mut |c| self.uses(c));
+            }
+            TK::Seq(ss) => {
+                let saved = self.assigned.clone();
+                for s in ss {
+                    self.stmt(s);
+                }
+                self.assigned = saved;
+            }
+            TK::Ternary(c, a, b) => {
+                self.uses(c);
+                for x in [a, b] {
+                    let saved = self.assigned.clone();
+                    self.uses(x);
+                    self.assigned = saved;
+                }
+            }
+            TK::M(_, r, args, Some(b)) => {
+                if let Some(r) = r {
+                    self.uses(r);
+                }
+                for a in args {
+                    self.uses(a);
+                }
+                // The body runs zero or more times, now or later; its
+                // parameters are set each time.
+                let saved = self.assigned.clone();
+                self.assigned.extend(b.params.iter().copied());
+                for s in &b.body {
+                    self.stmt(s);
+                }
+                self.assigned = saved;
+            }
+            _ => crate::prove::each_child(e, &mut |c| self.uses(c)),
+        }
+    }
+    /// Does this statement list always leave the iteration (or the loop)?
+    fn leaves(ss: &[TStmt]) -> bool {
+        matches!(ss.last(), Some(TStmt::Next(_) | TStmt::Break(..) | TStmt::Return(..) | TStmt::Fail(..)))
+    }
+    fn stmts(&mut self, ss: &[TStmt]) {
+        for s in ss {
+            self.stmt(s);
+        }
+    }
+    fn stmt(&mut self, s: &TStmt) {
+        match s {
+            TStmt::Expr(TExpr { kind: TK::Assign(l, v), .. }) => {
+                self.uses(v);
+                self.assigned.insert(*l);
+            }
+            TStmt::Expr(e) | TStmt::Break(Some(e), _) | TStmt::Return(Some(e), _) | TStmt::Fail(e, _) => self.uses(e),
+            TStmt::MultiAssign(ls, es) => {
+                for e in es {
+                    self.uses(e);
+                }
+                self.assigned.extend(ls.iter().copied());
+            }
+            TStmt::If(c, a, b) => {
+                self.uses(c);
+                let before = self.assigned.clone();
+                self.stmts(a);
+                let after_a = std::mem::replace(&mut self.assigned, before);
+                self.stmts(b);
+                let after_b = std::mem::take(&mut self.assigned);
+                self.assigned = match (Self::leaves(a), Self::leaves(b)) {
+                    (true, _) => after_b,
+                    (false, true) => after_a,
+                    _ => after_a.intersection(&after_b).copied().collect(),
+                };
+            }
+            TStmt::While(c, b) => {
+                self.uses(c);
+                let before = self.assigned.clone();
+                self.stmts(b);
+                self.assigned = before;
+            }
+            TStmt::Defer(e) => {
+                let mut ls = vec![];
+                crate::lower::collect_locals(e, &mut ls);
+                self.stale.extend(ls);
+            }
+            TStmt::Next(_) | TStmt::Break(None, _) | TStmt::Return(None, _) => {}
+        }
+    }
 }
 
 /// R3: which Map/Pool locals own their contents' region. A container

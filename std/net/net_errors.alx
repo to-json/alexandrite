@@ -1,0 +1,500 @@
+# Errors (Go's OpError, AddrError, ParseError, DNSError, DNSConfigError,
+# UnknownNetworkError, InvalidAddrError and the package's sentinel errors).
+
+import "context"
+
+# getaddrinfo's "host not found", as the runtime reports it (not an errno).
+NO_HOST = 100000
+
+# What an operation on the network failed at (Go's OpError's fields): the
+# operation ("dial", "listen", "accept", "read", "write", "close", "set",
+# "file", ...), the network ("tcp", "udp", ...; may be ""), the local
+# (source) and remote addresses as text ("" for none), and the cause: a
+# failed system call (`syscall` and its errno `code`) or, when `syscall`
+# is "", the text of another error (`err`: an AddrError's, a DNSError's,
+# "unknown network sctp", "missing address", ...).
+pub struct NetFailure {
+  op: Str
+  addr: Str
+  syscall: Str
+  code: Int
+  network: Str
+  source: Str
+  err: Str
+  # The DNSError inside, for a failed lookup.
+  dns: DNSFailure?
+}
+
+# Go's *OpError, by what programs branch on. Each variant holds the
+# NetFailure. `Timeout` is Go's os.ErrDeadlineExceeded / errTimeout inside an
+# OpError, `Closed` Go's ErrClosed, `BadAddr` an AddrError, `Lookup` a
+# DNSError.
+pub error NetError {
+  ConnRefused(at: NetFailure)
+  AddrInUse(at: NetFailure)
+  Timeout(at: NetFailure)
+  Closed(at: NetFailure)
+  # A malformed address: the inner error is an AddrError.
+  BadAddr(at: NetFailure)
+  # A failed name lookup: the inner error is a DNSError (`at.dns`).
+  Lookup(at: NetFailure)
+  Other(at: NetFailure)
+
+  def message -> Str {
+    f = failure
+    describe(f, inner_message)
+  }
+
+  # The failed call's details.
+  pub def failure -> NetFailure {
+    case self {
+      ConnRefused(at) => at
+      AddrInUse(at) => at
+      Timeout(at) => at
+      Closed(at) => at
+      BadAddr(at) => at
+      Lookup(at) => at
+      Other(at) => at
+    }
+  }
+
+  # The text of the error inside (Go's e.Err.Error()).
+  pub def inner_message -> Str {
+    f = failure
+    case self {
+      Timeout => "i/o timeout"
+      Closed => "use of closed network connection"
+      _ => cause_text(f)
+    }
+  }
+
+  # The errno (0 when the cause isn't a system call).
+  pub def errno -> Int {
+    f = failure
+    f.code
+  }
+
+  pub def op -> Str {
+    f = failure
+    f.op
+  }
+
+  pub def net -> Str {
+    f = failure
+    f.network
+  }
+
+  # The remote address, as text ("" for none).
+  pub def addr -> Str {
+    f = failure
+    f.addr
+  }
+
+  pub def source -> Str {
+    f = failure
+    f.source
+  }
+
+  # The DNSError inside, for a failed lookup.
+  pub def dns_error -> DNSError? {
+    f = failure
+    d = f.dns || return none
+    DNSError.Lookup(d)
+  }
+
+  # Go's OpError.Timeout: a deadline passed (or a lookup timed out, or the
+  # system call failed with ETIMEDOUT... as Go's syscall.Errno.Timeout).
+  pub def timeout? -> Bool {
+    f = failure
+    case self {
+      Timeout => true
+      Lookup => (f.dns || DNSFailure.new).is_timeout
+      _ => f.code != 0 && errno_timeout?(f.code)
+    }
+  }
+
+  # Go's OpError.Temporary.
+  pub def temporary? -> Bool {
+    f = failure
+    case self {
+      Timeout => true
+      Lookup => {
+        d = f.dns || DNSFailure.new
+        d.is_timeout || d.is_temporary
+      }
+      _ => {
+        return true if f.op == "accept" && conn_errno?(f.code)
+        f.code != 0 && errno_temporary?(f.code)
+      }
+    }
+  }
+
+  # Go's errors.Is(err, os.ErrDeadlineExceeded).
+  pub def deadline_exceeded? -> Bool {
+    case self {
+      Timeout => true
+      _ => false
+    }
+  }
+}
+
+def cause_text(f: NetFailure) -> Str {
+  if f.syscall == "" {
+    return f.code != 0 ? errno_message(f.code) : f.err
+  }
+  return f.syscall if f.code == 0
+  return "#{f.syscall}: no such host" if f.code == NO_HOST
+  "#{f.syscall}: #{errno_message(f.code)}"
+}
+
+# Go's OpError.Error: "op net source->addr: inner".
+def describe(f: NetFailure, inner: Str) -> Str {
+  return inner if f.op == ""
+  s = f.op
+  s = s + " " + f.network if f.network.size > 0
+  s = s + " " + f.source if f.source.size > 0
+  if f.addr.size > 0 {
+    s = s + (f.source.size > 0 ? "->" : " ") + f.addr
+  }
+  s + ": " + inner
+}
+
+# C's message for an errno, in Go's lower case: "connection refused".
+pub def errno_message(code: Int) -> Str {
+  return "no such host" if code == NO_HOST
+  s = C.strerror(code)
+  return s if s.size == 0 || s[0] < 65 || s[0] > 90
+  return s if s.size > 1 && s[1] >= 65 && s[1] <= 90
+  b = s.bytes.to_a
+  b[0] = b[0] + 32
+  Str.from_bytes(b)
+}
+
+# Go's syscall.Errno.Timeout.
+def errno_timeout?(code: Int) -> Bool { code == c("EAGAIN") || code == c("ETIMEDOUT") }
+
+# Go's syscall.Errno.Temporary.
+def errno_temporary?(code: Int) -> Bool {
+  code == c("EINTR") || code == c("EMFILE") || code == c("ENFILE") || errno_timeout?(code)
+}
+
+# Go's isConnError: ECONNRESET or ECONNABORTED.
+def conn_errno?(code: Int) -> Bool { code != 0 && (code == c("ECONNRESET") || code == c("ECONNABORTED")) }
+
+def c(name: Str) -> Int { alx_sys_const(name) }
+
+# The NetError for errno `code` from `syscall` during `op` on `addr`.
+pub def net_error(op: Str, addr: Str, syscall: Str, code: Int) -> NetError {
+  op_error(op, "", "", addr, syscall, code)
+}
+
+# The NetError for a failed system call.
+def op_error(op: Str, network: Str, source: Str, addr: Str, syscall: Str, code: Int) -> NetError {
+  at = NetFailure.new(op: op, addr: addr, syscall: syscall, code: code, network: network, source: source)
+  return NetError.Lookup(at) if code == NO_HOST
+  return NetError.ConnRefused(at) if code == c("ECONNREFUSED")
+  return NetError.AddrInUse(at) if code == c("EADDRINUSE")
+  return NetError.Closed(at) if code == c("EBADF")
+  NetError.Other(at)
+}
+
+# The NetError wrapping another error (its text `err`), by kind: "addr"
+# (an AddrError), "timeout", "closed" or "" (other).
+def wrap_error(op: Str, network: Str, source: Str, addr: Str, kind: Str, err: Str) -> NetError {
+  at = NetFailure.new(op: op, addr: addr, network: network, source: source, err: err)
+  return NetError.BadAddr(at) if kind == "addr"
+  return NetError.Timeout(at) if kind == "timeout"
+  return NetError.Closed(at) if kind == "closed"
+  NetError.Other(at)
+}
+
+# Wraps an error from resolving or checking an address (an AddrError, a
+# DNSError, an UnknownNetworkError, ...) in the NetError of `op`.
+def wrap_any(op: Str, network: Str, source: Str, addr: Str, e: Error) -> NetError {
+  case e {
+    NetError.ConnRefused(at) => return relabel(NetError.ConnRefused(at), op, network, source, addr)
+    NetError.AddrInUse(at) => return relabel(NetError.AddrInUse(at), op, network, source, addr)
+    NetError.Timeout(at) => return relabel(NetError.Timeout(at), op, network, source, addr)
+    NetError.Closed(at) => return relabel(NetError.Closed(at), op, network, source, addr)
+    NetError.BadAddr(at) => return relabel(NetError.BadAddr(at), op, network, source, addr)
+    NetError.Lookup(at) => return relabel(NetError.Lookup(at), op, network, source, addr)
+    NetError.Other(at) => return relabel(NetError.Other(at), op, network, source, addr)
+    AddrError.Bad(_, _) => return wrap_error(op, network, source, addr, "addr", e.message)
+    DNSError.Lookup(d) => {
+      at = NetFailure.new(op: op, addr: addr, network: network, source: source, err: e.message, dns: d)
+      return NetError.Lookup(at)
+    }
+    _ => return wrap_error(op, network, source, addr, "", e.message)
+  }
+}
+
+# An existing NetError is passed on as it is (Go doesn't wrap an OpError in
+# another).
+# A bare cause (op "") gets the operation's details.
+def relabel(e: NetError, op: Str, network: Str, source: Str, addr: Str) -> NetError {
+  f = e.failure
+  return e if f.op != ""
+  at = NetFailure.new(op: op, addr: addr, syscall: f.syscall, code: f.code, network: network, source: source, err: f.err, dns: f.dns)
+  case e {
+    ConnRefused => NetError.ConnRefused(at)
+    AddrInUse => NetError.AddrInUse(at)
+    Timeout => NetError.Timeout(at)
+    Closed => NetError.Closed(at)
+    BadAddr => NetError.BadAddr(at)
+    Lookup => NetError.Lookup(at)
+    Other => NetError.Other(at)
+  }
+}
+
+def closed_error(op: Str, network: Str, source: Str, addr: Str) -> NetError { wrap_error(op, network, source, addr, "closed", "") }
+
+def timeout_error(op: Str, network: Str, source: Str, addr: Str) -> NetError { wrap_error(op, network, source, addr, "timeout", "") }
+
+# Go's errors.Is(err, net.ErrClosed).
+pub def is_closed(e: Error) -> Bool {
+  case e {
+    NetError.Closed => true
+    _ => false
+  }
+}
+
+# Go's errors.Is(err, os.ErrDeadlineExceeded), or a timeout of any kind.
+pub def is_timeout(e: Error) -> Bool {
+  case e {
+    NetError.Timeout => true
+    DNSError.Lookup(d) => d.is_timeout
+    _ => false
+  }
+}
+
+# Go's net.Error interface: an error that knows whether it is a timeout and
+# whether it is temporary. Every error type of this package is one.
+pub interface NetErr {
+  def timeout? -> Bool
+  def temporary? -> Bool
+}
+
+# Go's ErrClosed: the error of an operation on a closed connection
+# ("use of closed network connection"); is_closed tells such errors.
+pub def err_closed -> NetError { NetError.Closed(NetFailure.new) }
+
+# Go's err.(net.Error).Temporary() for any error (false for other errors).
+pub def is_temporary(e: Error) -> Bool {
+  case e {
+    NetError.ConnRefused(at) => return NetError.ConnRefused(at).temporary?
+    NetError.AddrInUse(at) => return NetError.AddrInUse(at).temporary?
+    NetError.Timeout => return true
+    NetError.Closed(at) => return NetError.Closed(at).temporary?
+    NetError.BadAddr => return false
+    NetError.Lookup(at) => return NetError.Lookup(at).temporary?
+    NetError.Other(at) => return NetError.Other(at).temporary?
+    DNSError.Lookup(d) => return d.is_timeout || d.is_temporary
+    _ => return false
+  }
+}
+
+pub def is_conn_refused(e: Error) -> Bool {
+  case e {
+    NetError.ConnRefused => true
+    _ => false
+  }
+}
+
+# Go's AddrError: an address (`addr`, may be "") that is wrong in some way
+# (`err`).
+pub error AddrError {
+  Bad(err: Str, addr: Str)
+
+  def message -> Str {
+    case self {
+      Bad(err, addr) => addr == "" ? err : "address #{addr}: #{err}"
+    }
+  }
+
+  pub def err -> Str {
+    case self {
+      Bad(err, _) => err
+    }
+  }
+
+  pub def addr -> Str {
+    case self {
+      Bad(_, addr) => addr
+    }
+  }
+
+  pub def timeout? -> Bool { false }
+  pub def temporary? -> Bool { false }
+}
+
+pub def addr_error(err: Str, addr: Str) -> AddrError { AddrError.Bad(err, addr) }
+
+# Go's ParseError: a string that isn't the kind of address it should be.
+pub error ParseError {
+  Bad(kind: Str, text: Str)
+
+  def message -> Str {
+    case self {
+      Bad(kind, text) => "invalid #{kind}: #{text}"
+    }
+  }
+
+  # Go's ParseError.Type: "IP address", "CIDR address", ...
+  pub def kind -> Str {
+    case self {
+      Bad(kind, _) => kind
+    }
+  }
+
+  pub def text -> Str {
+    case self {
+      Bad(_, text) => text
+    }
+  }
+
+  pub def timeout? -> Bool { false }
+  pub def temporary? -> Bool { false }
+}
+
+pub def parse_error(kind: Str, text: Str) -> ParseError { ParseError.Bad(kind, text) }
+
+# Go's UnknownNetworkError.
+pub error UnknownNetworkError {
+  Network(name: Str)
+
+  def message -> Str {
+    case self {
+      Network(n) => "unknown network #{n}"
+    }
+  }
+
+  pub def timeout? -> Bool { false }
+  pub def temporary? -> Bool { false }
+}
+
+# Go's InvalidAddrError.
+pub error InvalidAddrError {
+  Msg(text: Str)
+
+  def message -> Str {
+    case self {
+      Msg(t) => t
+    }
+  }
+
+  pub def timeout? -> Bool { false }
+  pub def temporary? -> Bool { false }
+}
+
+# Go's DNSConfigError: reading resolv.conf failed (`err` is the cause's text).
+pub error DNSConfigError {
+  Bad(err: Str)
+
+  def message -> Str {
+    case self {
+      Bad(err) => "error reading DNS config: #{err}"
+    }
+  }
+
+  pub def timeout? -> Bool { false }
+  pub def temporary? -> Bool { false }
+}
+
+# A DNSError's fields (Go's DNSError struct; UnwrapErr becomes `canceled` /
+# `deadline` flags: whether the lookup ended by a canceled or expired
+# context).
+pub struct DNSFailure {
+  # The description: "no such host", "server misbehaving", ...
+  err: Str
+  # The name looked for.
+  name: Str
+  # The server used ("" if none).
+  server: Str
+  is_timeout: Bool
+  is_temporary: Bool
+  # The host or service wasn't found (Go's IsNotFound).
+  is_not_found: Bool
+  # The context error inside (Go's UnwrapErr): 0 none, CTX_CANCELED,
+  # CTX_DEADLINE.
+  ctx_err: Int
+}
+
+CTX_CANCELED = 1
+CTX_DEADLINE = 2
+
+# Go's DNSError.
+pub error DNSError {
+  Lookup(at: DNSFailure)
+
+  def message -> Str {
+    f = failure
+    s = "lookup " + f.name
+    s = s + " on " + f.server if f.server.size > 0
+    s + ": " + f.err
+  }
+
+  pub def failure -> DNSFailure {
+    case self {
+      Lookup(at) => at
+    }
+  }
+
+  pub def err -> Str {
+    f = failure
+    f.err
+  }
+
+  pub def name -> Str {
+    f = failure
+    f.name
+  }
+
+  pub def server -> Str {
+    f = failure
+    f.server
+  }
+
+  pub def timeout? -> Bool {
+    f = failure
+    f.is_timeout
+  }
+
+  pub def temporary? -> Bool {
+    f = failure
+    f.is_timeout || f.is_temporary
+  }
+
+  pub def not_found? -> Bool {
+    f = failure
+    f.is_not_found
+  }
+
+  # Go's Unwrap: the context error that ended the lookup, if one did
+  # (errors.is?(err, context.ContextError.Canceled) works through it).
+  pub def unwrap -> Error? {
+    f = failure
+    return context.ContextError.Canceled if f.ctx_err == CTX_CANCELED
+    return context.ContextError.DeadlineExceeded if f.ctx_err == CTX_DEADLINE
+    none
+  }
+}
+
+# Go's newDNSError for the error kinds the resolver makes: "notfound"
+# (errNoSuchHost, errUnknownPort), "temporary", "timeout" or "" (other).
+def dns_error(err: Str, name: Str, server: Str, kind: Str) -> DNSError {
+  DNSError.Lookup(DNSFailure.new(err: err, name: name, server: server, is_timeout: kind == "timeout", is_temporary: kind == "temporary" || kind == "timeout", is_not_found: kind == "notfound"))
+}
+
+# Go's errNoSuchHost / errUnknownPort texts.
+ERR_NO_SUCH_HOST = "no such host"
+ERR_UNKNOWN_PORT = "unknown port"
+ERR_MISSING_ADDRESS = "missing address"
+ERR_NO_SUITABLE_ADDRESS = "no suitable address found"
+ERR_CANCELED = "operation was canceled"
+
+# Go's ErrWriteToConnected.
+pub error WriteToConnectedError {
+  Connected
+
+  def message -> Str { "use of WriteTo with pre-connected connection" }
+}

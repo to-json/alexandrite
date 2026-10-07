@@ -995,17 +995,22 @@ impl<'a> Lw<'a> {
             return;
         }
         let saved = self.defers.clone();
+        let saved_iters = self.iter_open.clone();
         for depth in (from..saved.len()).rev() {
             // Errors in deferred code clean up only the outer blocks; a scope
             // inside it sits below an empty level (so its own cleanup never
             // looks like leaving the function, which frees the frame).
             self.defers.truncate(depth);
             self.defers.push(vec![]);
+            // The iteration regions of the levels being left are freed once,
+            // below: the deferred code's own scopes must not free them too.
+            self.iter_open.retain(|(d, _, _)| *d < depth);
             for e in saved[depth].iter().rev() {
                 self.stmt(&TStmt::Expr(e.clone()));
             }
         }
         self.defers = saved;
+        self.iter_open = saved_iters;
         // Leaving loops: their iteration regions go (innermost first).
         for (d, r, sv) in self.iter_open.clone().into_iter().rev() {
             if d >= from {
@@ -3469,7 +3474,7 @@ impl<'a> Lw<'a> {
                 let v = self.expr(&args[0]);
                 LE::Rt(Rt::StrFromBytes, vec![v])
             }
-            Dup if matches!(recv.unwrap().ty, Ty::Fn(..) | Ty::Struct(..)) => {
+            Dup if matches!(recv.unwrap().ty, Ty::Fn(..) | Ty::Struct(..) | Ty::Iface(_)) => {
                 let r = recv.unwrap();
                 let v = self.expr(r);
                 let t = self.lty(&r.ty);
@@ -3974,9 +3979,17 @@ impl<'a> Lw<'a> {
                 let b = blk.unwrap();
                 let res = self.inline_block(b, &[LE::Field(Box::new(cell()), 1)], &[], None);
                 let rt = self.lty(&e.ty);
-                let res = self.bind(res, rt.clone());
-                let res = self.deep_copy(res, &rt);
-                let res = self.bind(res, rt);
+                let res = if rt == LTy::Unit {
+                    // a block ending in a Unit call: evaluate it, there's no value
+                    if !matches!(res, LE::Unit | LE::Var(_) | LE::I(_) | LE::B(_)) {
+                        self.emit(LS::Eval(res));
+                    }
+                    LE::Unit
+                } else {
+                    let res = self.bind(res, rt.clone());
+                    let res = self.deep_copy(res, &rt);
+                    self.bind(res, rt)
+                };
                 let pvar = self.var_of(b.params[0]);
                 self.emit(LS::SetPlace { var: p, steps: vec![crate::lir::Step::Index(LE::I(0), None), crate::lir::Step::Field(1)], val: LE::Var(pvar) });
                 self.emit(LS::Unlock(LE::Field(Box::new(cell()), 0)));
@@ -4429,10 +4442,17 @@ impl<'a> Lw<'a> {
                         let out = self.tmp(self.lty(&e.ty));
                         self.emit(LS::Set(out, val));
                         let b = blk.unwrap();
-                        let body = self.sub(|lw| {
+                        let mut body = self.sub(|lw| {
                             let v = lw.inline_block(b, &[err], &[], None);
                             lw.emit(LS::Set(out, v));
                         });
+                        // A block that ends in `fail` / `return` / a panic has
+                        // no value: nothing to store after the jump (the C and
+                        // Rust backends reject a Unit stored into the result).
+                        let n = body.len();
+                        if n >= 2 && matches!(body[n - 2], LS::Return(_) | LS::Die(_) | LS::Panic(..) | LS::Break(_) | LS::Continue(_)) {
+                            body.pop();
+                        }
                         self.emit(LS::If(LE::Not(Box::new(ok)), body, vec![]));
                         LE::Var(out)
                     }

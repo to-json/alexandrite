@@ -26,9 +26,12 @@ pub const EXTERNS: &[(&str, &str, &str)] = &[
     ("getentropy", "alxr_getentropy", "jjjj>j"),
     ("read", "alxr_read", "jjjjj>j"),
     ("write", "alxr_write", "jjjjj>j"),
+    ("alx_sys_read", "alxr_sys_read", "jjjjj>j"),
+    ("alx_sys_write", "alxr_sys_write", "jjjjj>j"),
     ("pread", "alxr_nosys_fd_buf_off", "jjjjjj>j"),
     ("pwrite", "alxr_nosys_fd_buf_off", "jjjjjj>j"),
     ("close", "alxr_close", "j>j"),
+    ("alx_fd_close", "alxr_fd_close", "j>j"),
     ("lseek", "alxr_lseek", "jjj>j"),
     ("fsync", "alxr_nosys_fd", "j>j"),
     ("ftruncate", "alxr_nosys_fd_int", "jj>j"),
@@ -62,6 +65,7 @@ pub const EXTERNS: &[(&str, &str, &str)] = &[
     ("alx_sys_dir_open", "alxr_sys_dir_open", "jj>j"),
     ("alx_sys_dir_next", "alxr_sys_dir_next", "jjjj>j"),
     ("alx_sys_dir_close", "alxr_sys_dir_close", "j>"),
+    ("alx_sys_dir_fdopen", "alxr_sys_dir_fdopen", "j>j"),
     ("alx_argc", "alxr_argc", ">j"),
     ("alx_argv", "alxr_argv", "j>j"),
 ];
@@ -156,6 +160,25 @@ pub extern "C" fn alxr_write(fd: i64, p: i64, len: i64, _cap: i64, n: i64) -> i6
     n
 }
 
+/// `alx_sys_read` / `alx_sys_write`: read / write, with -errno on failure.
+#[unsafe(no_mangle)]
+pub extern "C" fn alxr_sys_read(fd: i64, p: i64, len: i64, cap: i64, n: i64) -> i64 {
+    let r = alxr_read(fd, p, len, cap, n);
+    if r < 0 { -ERRNO.with(|e| e.get()) } else { r }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alxr_sys_write(fd: i64, p: i64, len: i64, cap: i64, n: i64) -> i64 {
+    let r = alxr_write(fd, p, len, cap, n);
+    if r < 0 { -ERRNO.with(|e| e.get()) } else { r }
+}
+
+/// `alx_fd_close`: close, with -errno on failure.
+#[unsafe(no_mangle)]
+pub extern "C" fn alxr_fd_close(fd: i64) -> i64 {
+    if alxr_close(fd) < 0 { -ERRNO.with(|e| e.get()) } else { 0 }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn alxr_close(fd: i64) -> i64 {
     if (0..=2).contains(&fd) { 0 } else { fail(EBADF) }
@@ -240,6 +263,11 @@ pub extern "C" fn alxr_sys_stat(_p: i64, _n: i64, _b: i64, _len: i64, _cap: i64,
 
 #[unsafe(no_mangle)]
 pub extern "C" fn alxr_sys_dir_open(_p: i64, _n: i64) -> i64 {
+    -ENOSYS
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alxr_sys_dir_fdopen(_fd: i64) -> i64 {
     -ENOSYS
 }
 
@@ -349,6 +377,7 @@ const SYS_CONSTS: &[(&str, i64)] = &[
     ("O_RDONLY", 0), ("O_WRONLY", 1), ("O_RDWR", 2), ("O_CREAT", 0o100), ("O_EXCL", 0o200), ("O_TRUNC", 0o1000),
     ("O_APPEND", 0o2000), ("O_NONBLOCK", 0o4000), ("O_CLOEXEC", 0o2000000), ("O_DIRECTORY", 0o200000),
     ("O_SYNC", 0o4010000), ("O_NOFOLLOW", 0o400000),
+    ("UTIME_OMIT", (1 << 30) - 2), ("AT_FDCWD", -100), ("AT_SYMLINK_NOFOLLOW", 0x100), ("PIPE_BUF", 4096), ("AT_REMOVEDIR", 0x200),
     ("SEEK_SET", 0), ("SEEK_CUR", 1), ("SEEK_END", 2),
     ("F_GETFD", 1), ("F_SETFD", 2), ("F_GETFL", 3), ("F_SETFL", 4), ("FD_CLOEXEC", 1), ("F_DUPFD_CLOEXEC", 1030),
     ("EPERM", 1), ("ENOENT", ENOENT), ("ESRCH", 3), ("EINTR", 4), ("EIO", 5), ("ENXIO", 6), ("E2BIG", 7),

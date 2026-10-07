@@ -1,0 +1,119 @@
+#![test(external)]
+# Go's context/afterfunc_test.go: a custom Context that implements
+# after_func (Go's afterFuncer), which the package uses to follow it
+# instead of starting a task.
+
+import "context"
+import "time"
+
+struct AfcState {
+  funcs: Map[Int, () -> Unit]
+  next: Int
+  err: Error?
+}
+
+# Go's afterFuncContext. Its done channel is never closed: only its
+# after-funcs say it is cancelled.
+struct AfterFuncContext {
+  donec: Chan[Bool]
+  st: Mutex[AfcState]
+
+  def deadline -> time.Time? { none }
+  def done -> Chan[Bool] { donec }
+  def err -> Error? { st.lock { |s| s.err } }
+  def value(key: context.Key) -> context.Any? { none }
+
+  def after_func(f: () -> Unit) -> (() -> Bool)? {
+    g = f.dup
+    k = st.lock { |s|
+      s.next += 1
+      s.funcs[s.next] = g
+      s.next
+    }
+    m = st
+    ->() -> Bool {
+      m.lock { |s|
+        ok = s.funcs.has_key?(k)
+        s.funcs.delete(k)
+        ok
+      }
+    }
+  }
+
+  def cancel(e: Error) {
+    fs = st.lock { |s|
+      if s.err != none {
+        none
+      } else {
+        s.err = e
+        out = s.funcs.values
+        s.funcs = {}
+        out
+      }
+    }
+    if xs = fs {
+      for f in xs {
+        g = f.dup
+        _ = spawn { g() }
+      }
+    }
+  }
+
+  def count -> Int { st.lock { |s| s.funcs.size } }
+}
+
+def new_afc -> AfterFuncContext {
+  fs: Map[Int, () -> Unit] = {}
+  AfterFuncContext.new(donec: Chan[Bool].new, st: Mutex.new(AfcState.new(funcs: fs, next: 0, err: none)))
+}
+
+test "CustomContextAfterFuncCancel" {
+  ctx0 = new_afc
+  ctx1, cancel = context.with_cancel(ctx0)
+  defer { cancel() }
+  ctx0.cancel(context.ContextError.Canceled)
+  ctx1.done.recv
+}
+
+test "CustomContextAfterFuncTimeout" {
+  ctx0 = new_afc
+  ctx1, cancel = context.with_timeout(ctx0, very_long_duration)
+  defer { cancel() }
+  ctx0.cancel(context.ContextError.Canceled)
+  ctx1.done.recv
+}
+
+test "CustomContextAfterFuncAfterFunc" {
+  ctx0 = new_afc
+  donec = Chan[Bool].new
+  stop = context.after_func(ctx0, ->() { donec.close })
+  defer { _ = stop() }
+  ctx0.cancel(context.ContextError.Canceled)
+  donec.recv
+}
+
+test "CustomContextAfterFuncUnregisterCancel" {
+  ctx0 = new_afc
+  _, cancel1 = context.with_cancel(ctx0)
+  _, cancel2 = context.with_cancel(ctx0)
+  assert_eq ctx0.count, 2
+  cancel1()
+  cancel2()
+  assert_eq ctx0.count, 0
+}
+
+test "CustomContextAfterFuncUnregisterTimeout" {
+  ctx0 = new_afc
+  _, cancel = context.with_timeout(ctx0, very_long_duration)
+  assert_eq ctx0.count, 1
+  cancel()
+  assert_eq ctx0.count, 0
+}
+
+test "CustomContextAfterFuncUnregisterAfterFunc" {
+  ctx0 = new_afc
+  stop = context.after_func(ctx0, ->() {})
+  assert_eq ctx0.count, 1
+  _ = stop()
+  assert_eq ctx0.count, 0
+}

@@ -1,0 +1,328 @@
+# Go's lookup_test.go (the tests that need no external network) and
+# resolverdialfunc_test.go, translated.
+#
+# Not translated:
+# - The tests of real names (TestLookupGoogleSRV, ...GmailMX, ...GmailNS,
+#   ...GmailTXT, ...GooglePublicDNSAddr, TestLookupCNAME, ...GoogleHost,
+#   ...LongTXT, ...GoogleIP, TestLookupDotsWithRemoteSource,
+#   TestLookupDotsWithLocalSource, TestDNSFlood, TestLookupContextCancel,
+#   TestNilResolverLookup, TestLookupHostCancel,
+#   TestConcurrentPreferGoResolversDial, TestLookupNullByte,
+#   TestResolverLookupIP, TestLookupNoData, TestLookupNoSuchHost): they
+#   query the internet's DNS.
+# - TestLookupIPAddrPreservesContextValues, TestWithUnexpiredValuesPreserved:
+#   alx's context has no values.
+# - TestLookupIPAddrConcurrentCallsForNetworks, TestDNSTimeout: they test
+#   the singleflight lookup group through testHookLookupIP; alx's lookups
+#   don't share calls (each runs on its own).
+
+import "context"
+import "errors"
+import "golang.org/x/net/dns/dnsmessage"
+
+test "LookupIPv6LinkLocalAddr" {
+  return unless supports_ipv6?
+  addrs = lookup_host("localhost").unwrap
+  # Not supported here.
+  return unless addrs.include?("fe80::1%lo0")
+  r = lookup_addr("fe80::1%lo0")
+  assert r.ok?, "#{r.err}"
+}
+
+test "LookupIPv6LinkLocalAddrWithZone" {
+  return unless supports_ipv6?
+  ipaddrs = default_resolver.lookup_ip_addr(context.background, "fe80::1%lo0").unwrap
+  for addr in ipaddrs {
+    assert_eq addr.zone, "lo0"
+  }
+  addrs = default_resolver.lookup_host(context.background, "fe80::1%lo0").unwrap
+  for addr in addrs {
+    assert_eq addr, "fe80::1%lo0"
+  }
+}
+
+# Go's TestLookupWithIP (ip_test.go): lookup_host and lookup_ip take IP
+# literals (Go only logs the invalid rows' results: the system resolver
+# might resolve "abc", so those aren't checked).
+test "LookupWithIP" {
+  assert lookup_ip("").err?, "lookup_ip(\"\") succeeded, should fail"
+  assert lookup_host("").err?, "lookup_host(\"\") succeeded, should fail"
+  v6 = ip_from([0x20, 0x01, 0x48, 0x60, 0, 0, 0x20, 0x01, 0, 0, 0, 0, 0, 0, 0x00, 0x68])
+  tests: [(Str, IP)] = [
+    ("127.0.1.2", ipv4(127, 0, 1, 2)),
+    ("127.0.0.1", ipv4(127, 0, 0, 1)),
+    ("::ffff:127.1.2.3", ipv4(127, 1, 2, 3)),
+    ("::ffff:7f01:0203", ipv4(127, 1, 2, 3)),
+    ("0:0:0:0:0000:ffff:127.1.2.3", ipv4(127, 1, 2, 3)),
+    ("0:0:0:0::ffff:127.1.2.3", ipv4(127, 1, 2, 3)),
+    ("2001:4860:0:2001::68", v6),
+    ("2001:4860:0000:2001:0000:0000:0000:0068", v6)
+  ]
+  for tt in tests {
+    input, out = tt
+    addrs = lookup_host(input)
+    assert addrs.ok? && addrs.unwrap == [input], "lookup_host(#{input}) = #{addrs.err}; want [#{input}]"
+    ips = lookup_ip(input)
+    assert ips.ok? && ips.unwrap.size == 1 && ips.unwrap[0].bytes == out.bytes, "lookup_ip(#{input}) = #{ips.err}; want [#{out}]"
+  }
+}
+
+test "ReverseAddress" {
+  tests: [(Str, Str, Str)] = [
+    ("1.2.3.4", "4.3.2.1.in-addr.arpa.", ""),
+    ("245.110.36.114", "114.36.110.245.in-addr.arpa.", ""),
+    ("::ffff:12.34.56.78", "78.56.34.12.in-addr.arpa.", ""),
+    ("::1", "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa.", ""),
+    ("1::", "0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.1.0.0.0.ip6.arpa.", ""),
+    ("1234:567::89a:bcde", "e.d.c.b.a.9.8.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.7.6.5.0.4.3.2.1.ip6.arpa.", ""),
+    ("1234:567:fefe:bcbc:adad:9e4a:89a:bcde", "e.d.c.b.a.9.8.0.a.4.e.9.d.a.d.a.c.b.c.b.e.f.e.f.7.6.5.0.4.3.2.1.ip6.arpa.", ""),
+    ("1.2.3", "", "unrecognized address"),
+    ("1.2.3.4.5", "", "unrecognized address"),
+    ("1234:567:bcbca::89a:bcde", "", "unrecognized address"),
+    ("1234:567::bcbc:adad::89a:bcde", "", "unrecognized address")
+  ]
+  for i in 0...tests.size {
+    addr, reverse, err_prefix = tests[i]
+    r = reverseaddr(addr)
+    if e = r.err {
+      assert err_prefix != "", "##{i}: expected <nil>, got #{e.message} (error)"
+      assert_eq e.err, err_prefix
+      next
+    }
+    assert err_prefix == "", "##{i}: expected #{err_prefix}, got <nil> (error)"
+    assert r.unwrap == reverse, "##{i}: expected #{reverse}, got #{r.unwrap} (reverse address)"
+  }
+}
+
+# Go's parseLookupPortError: an AddrError or a DNSError.
+def parse_lookup_port_error(e: Error) -> Str? {
+  case e {
+    AddrError.Bad => return none
+    DNSError.Lookup => return none
+    _ => return "unexpected type on 1st nested level: #{e.message}"
+  }
+}
+
+test "LookupPort" {
+  # https://www.iana.org/assignments/service-names-port-numbers/: some
+  # platforms have incomplete mappings, so tests are added with care.
+  tests: [(Str, Str, Int, Bool)] = [
+    ("tcp", "0", 0, true),
+    ("udp", "0", 0, true),
+    ("udp", "domain", 53, true),
+    ("--badnet--", "zzz", 0, false),
+    ("tcp", "--badport--", 0, false),
+    ("tcp", "-1", 0, false),
+    ("tcp", "65536", 0, false),
+    ("udp", "-1", 0, false),
+    ("udp", "65536", 0, false),
+    ("tcp", "123456789", 0, false),
+    ("tcp", "bad" + Str.from_bytes([0]) + "port", 0, false),
+    # golang.org/issue/13610: LookupPort("tcp", "").
+    ("tcp", "", 0, true),
+    ("tcp4", "", 0, true),
+    ("tcp6", "", 0, true),
+    ("udp", "", 0, true),
+    ("udp4", "", 0, true),
+    ("udp6", "", 0, true),
+    ("tcp", "http", 80, true)
+  ]
+  for tt in tests {
+    network, name, port, ok = tt
+    r = lookup_port(network, name)
+    got = r.ok? ? r.unwrap : 0
+    assert got == port && r.ok? == ok, "lookup_port(#{network}, #{name}) = #{got}, #{r.err}; want #{port}, error=#{!ok}"
+    if e = r.err {
+      if p = parse_lookup_port_error(e) {
+        assert false, p
+      }
+    }
+  }
+}
+
+# Like LookupPort, with answers built into the package.
+test "LookupPort_Minimal" {
+  tests: [(Str, Str, Int)] = [
+    ("tcp", "http", 80),
+    # Case doesn't matter.
+    ("tcp", "HTTP", 80),
+    ("tcp", "https", 443),
+    ("tcp", "ssh", 22),
+    ("tcp", "gopher", 70),
+    ("tcp4", "http", 80),
+    ("tcp6", "http", 80)
+  ]
+  for tt in tests {
+    network, name, port = tt
+    r = lookup_port(network, name)
+    assert r.ok? && r.unwrap == port, "lookup_port(#{network}, #{name}) = #{r.err}; want #{port}, error=nil"
+  }
+}
+
+test "LookupProtocol_Minimal" {
+  tests: [(Str, Int)] = [
+    ("tcp", 6),
+    # Case doesn't matter.
+    ("TcP", 6),
+    ("icmp", 1),
+    ("igmp", 2),
+    ("udp", 17),
+    ("ipv6-icmp", 58)
+  ]
+  for tt in tests {
+    name, want = tt
+    r = lookup_protocol(name)
+    assert r.ok? && r.unwrap == want, "lookup_protocol(#{name}) = #{r.err}; want #{want}, error=nil"
+  }
+}
+
+# Names that aren't LDH (letters, digits, hyphens) are not found, not
+# invalid.
+test "LookupNonLDH" {
+  NETDNS_MODE.store("go")
+  defer {
+    NETDNS_MODE.store("")
+  }
+  r = lookup_host("!!!.###.bogus..domain.")
+  assert r.err?, "lookup succeeded"
+  e = r.err.unwrap
+  assert e.message.end_with?(ERR_NO_SUCH_HOST), "lookup error = #{e.message}, want #{ERR_NO_SUCH_HOST}"
+  case e {
+    DNSError.Lookup(d) => assert d.is_not_found, "lookup error is_not_found = false, want true"
+    _ => assert false, "not a DNSError: #{e.message}"
+  }
+}
+
+test "IPVersion" {
+  tests: [(Str, Byte)] = [
+    ("tcp", 0),
+    ("tcp4", 52),
+    ("tcp6", 54),
+    ("udp", 0),
+    ("udp4", 52),
+    ("udp6", 54),
+    ("ip", 0),
+    ("ip4", 52),
+    ("ip6", 54),
+    ("ip7", 0),
+    ("", 0)
+  ]
+  for tt in tests {
+    network, version = tt
+    assert ip_version(network) == version, "family for: #{network}. Expected: #{version}, Got: #{ip_version(network)}"
+  }
+}
+
+# golang.org/issue/53995: lookup_ip fails for an empty host name.
+test "ResolverLookupIPWithEmptyHost" {
+  r = default_resolver.lookup_ip(context.background, "ip", "")
+  assert r.err?, "lookup_ip for empty host success, want no host error"
+  assert r.err.unwrap.message.end_with?(ERR_NO_SUCH_HOST), "lookup error = #{r.err.unwrap.message}, want #{ERR_NO_SUCH_HOST}"
+}
+
+# Go's allResolvers: f with the default, the go and the cgo resolver.
+def all_resolvers(f: () -> Unit) {
+  defer {
+    NETDNS_MODE.store("")
+  }
+  for mode in ["", "go", "cgo"] {
+    NETDNS_MODE.store(mode)
+    f.call
+  }
+}
+
+def check_port_not_found(network: Str, service: Str) {
+  r = lookup_port(network, service)
+  ok = false
+  if e = r.err {
+    case e {
+      DNSError.Lookup(d) => ok = d.is_not_found
+      _ => nil
+    }
+  }
+  assert ok, "unexpected error: #{r.err}"
+}
+
+test "LookupPortNotFound" {
+  all_resolvers(->() { check_port_not_found("udp", "_-unknown-service-") })
+}
+
+# The submissions service is only defined for tcp (IANA).
+test "LookupPortDifferentNetwork" {
+  all_resolvers(->() { check_port_not_found("udp", "submissions") })
+}
+
+test "LookupPortEmptyNetworkString" {
+  all_resolvers(->() {
+    r = lookup_port("", "submissions")
+    assert r.ok?, "unexpected error: #{r.err}"
+  })
+}
+
+test "LookupPortIPNetworkString" {
+  all_resolvers(->() {
+    r = lookup_port("ip", "submissions")
+    assert r.ok?, "unexpected error: #{r.err}"
+  })
+}
+
+def dial_fails(e: Error) -> ~Conn { fail e }
+
+test "DNSErrorUnwrap" {
+  r_deadline = Resolver.new(prefer_go: true, dial: ->(ctx: context.Context, network: Str, address: Str) -> ~Conn { ~dial_fails(context.ContextError.DeadlineExceeded) })
+  r_canceled = Resolver.new(prefer_go: true, dial: ->(ctx: context.Context, network: Str, address: Str) -> ~Conn { ~dial_fails(context.ContextError.Canceled) })
+  e1 = r_deadline.lookup_host(context.background, "test.go.dev").err
+  assert errors.is?(e1, context.ContextError.DeadlineExceeded), "errors.is?(err, DeadlineExceeded) = false; want true (#{e1})"
+  e2 = r_canceled.lookup_host(context.background, "test.go.dev").err
+  assert errors.is?(e2, context.ContextError.Canceled), "errors.is?(err, Canceled) = false; want true (#{e2})"
+  ctx, cancel = context.with_cancel(context.background)
+  cancel.call
+  e3 = Resolver.new(prefer_go: true).lookup_host(ctx, "text.go.dev").err
+  assert errors.is?(e3, context.ContextError.Canceled), "errors.is?(err, Canceled) = false; want true (#{e3})"
+}
+
+# Go's TestResolverDialFunc: a resolver whose dial function answers A, AAAA
+# and SRV queries itself (Go's resolverDialHandler; here the fake server
+# of dnsclient_unix_test.alx).
+test "ResolverDialFunc" {
+  reqs = Chan[FakeReq].new
+  rh = ->(n: Str, s: Str, q: dnsmessage.Message, t: Int) -> ~dnsmessage.Message {
+    quest = q.questions[0]
+    answers: [dnsmessage.Resource] = []
+    h = dnsmessage.ResourceHeader.new(name: quest.name, type: quest.type, class: quest.class, ttl: 10)
+    if quest.type == dnsmessage.TYPE_A {
+      answers << dnsmessage.Resource.new(header: h, body: dnsmessage.AResource.new(a: [1, 2, 3, 4]).body)
+      answers << dnsmessage.Resource.new(header: h, body: dnsmessage.AResource.new(a: [5, 6, 7, 8]).body)
+    } elsif quest.type == dnsmessage.TYPE_AAAA {
+      a1: [Byte; 16] = [0; 16]
+      a1[1] = 1
+      a1[15] = 15
+      a2: [Byte; 16] = [0; 16]
+      a2[2] = 2
+      a2[14] = 14
+      answers << dnsmessage.Resource.new(header: h, body: dnsmessage.AAAAResource.new(aaaa: a1).body)
+      answers << dnsmessage.Resource.new(header: h, body: dnsmessage.AAAAResource.new(aaaa: a2).body)
+    } elsif quest.type == dnsmessage.TYPE_SRV {
+      answers << dnsmessage.Resource.new(header: h, body: dnsmessage.SRVResource.new(priority: 1, weight: 2, port: 80, target: dnsmessage.must_new_name("foo.bar.")).body)
+      answers << dnsmessage.Resource.new(header: h, body: dnsmessage.SRVResource.new(priority: 2, weight: 3, port: 81, target: dnsmessage.must_new_name("bar.baz.")).body)
+    }
+    hd = dnsmessage.Header.new(id: q.header.id, response: true, authoritative: true, recursion_available: true)
+    msg(hd, q.questions, answers)
+  }
+  spawn {
+    fake_serve(rh, reqs)
+  }
+  r = Resolver.new(prefer_go: true, dial: fake_dial(reqs, false))
+  defer {
+    reqs.close
+  }
+  ctx = context.background
+  fake_domain = "something-that-is-a-not-a-real-domain.fake-tld."
+  ips = r.lookup_ip(ctx, "ip", fake_domain).unwrap
+  got = ips.map { |ip| ip.to_s }.to_a.sort
+  assert_eq got, ["0:200::e00", "1.2.3.4", "1::f", "5.6.7.8"]
+  _, srvs = r.lookup_srv(ctx, "some-service", "tcp", fake_domain).unwrap
+  assert_eq srvs.size, 2
+  assert srvs[0].target == "foo.bar." && srvs[0].port == 80 && srvs[0].priority == 1 && srvs[0].weight == 2, "wrong result: #{srvs[0]}"
+  assert srvs[1].target == "bar.baz." && srvs[1].port == 81 && srvs[1].priority == 2 && srvs[1].weight == 3, "wrong result: #{srvs[1]}"
+}

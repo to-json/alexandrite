@@ -1,0 +1,593 @@
+#![test(external)]
+# Go's format_test.go (package time_test). The local zone is US Pacific, as in
+# Go's tests (force_us_pacific_for_testing, from export_test.alx); importing
+# time/tzdata makes that and the zones below load without a system database.
+#
+# Not translated:
+#   - FuzzFormatRFC3339, FuzzParseRFC3339: they compare Go's RFC 3339 fast paths
+#     (appendFormatRFC3339, parseRFC3339) with the general Format/Parse; alx has
+#     only the general ones. Their seed corpora run through format/parse in
+#     "rfc3339 seeds" below.
+#   - TestStd0xParseError's `err.(*ParseError)` type assertion: parse's error set
+#     is ParseError by its signature; the fields are its methods.
+import "time"
+import _ "time/tzdata"
+import "strings"
+
+def pacific { time.force_us_pacific_for_testing() }
+
+# A deterministic stand-in for testing/quick's random int64s (an LCG).
+def mix(x: Int) -> Int { x *% 6364136223846793005 +% 1442695040888963407 }
+
+def unmark(s: Str) -> Str { strings.replace_all(strings.replace_all(s, "(", ""), ")", "") }
+
+def mark_chunks(format: Str) -> Str {
+  out = ""
+  s = format
+  while s != "" {
+    prefix, std, suffix = time.next_std_chunk(s)
+    out += prefix
+    out += "(" + time.std_chunk_name(std) + ")" if std > 0
+    s = suffix
+  }
+  out
+}
+
+test "TestNextStdChunk" {
+  marked = [
+    "(2006)-(01)-(02)T(15):(04):(05)(Z07:00)",
+    "(2006)-(01)-(02) (002) (15):(04):(05)",
+    "(2006)-(01) (002) (15):(04):(05)",
+    "(2006)-(002) (15):(04):(05)",
+    "(2006)(002)(01) (15):(04):(05)",
+    "(2006)(002)(04) (15):(04):(05)",
+  ]
+  for m in marked {
+    assert_eq mark_chunks(unmark(m)), m
+  }
+}
+
+test "TestRFC3339Conversion" {
+  assert_eq time.date(2008, 9, 17, 20, 4, 26, 0, time.utc()).format(time.RFC3339), "2008-09-17T20:04:26Z"
+  assert_eq time.date(1994, 9, 17, 20, 4, 26, 0, time.fixed_zone("EST", -18000)).format(time.RFC3339), "1994-09-17T20:04:26-05:00"
+  assert_eq time.date(2000, 12, 26, 1, 15, 6, 0, time.fixed_zone("OTO", 15600)).format(time.RFC3339), "2000-12-26T01:15:06+04:20"
+}
+
+test "TestAppendInt" {
+  tests = [
+    (0, 0, "0"), (0, 1, "0"), (0, 2, "00"), (0, 3, "000"),
+    (1, 0, "1"), (1, 1, "1"), (1, 2, "01"), (1, 3, "001"),
+    (-1, 0, "-1"), (-1, 1, "-1"), (-1, 2, "-01"), (-1, 3, "-001"),
+    (99, 2, "99"), (100, 2, "100"),
+    (1, 4, "0001"), (12, 4, "0012"), (123, 4, "0123"), (1234, 4, "1234"), (12345, 4, "12345"),
+    (1, 5, "00001"), (12, 5, "00012"), (123, 5, "00123"), (1234, 5, "01234"), (12345, 5, "12345"), (123456, 5, "123456"),
+    (0, 9, "000000000"), (123, 9, "000000123"), (123456, 9, "000123456"), (123456789, 9, "123456789"),
+  ]
+  got: [Byte] = []
+  for tt in tests {
+    got = time.append_int(got[0...0], tt[0], tt[1])
+    assert_eq Str.from_bytes(got), tt[2]
+  }
+}
+
+def format_tests -> [(Str, Str, Str)] {
+  [
+    ("ANSIC", time.ANSIC, "Wed Feb  4 21:00:57 2009"),
+    ("UnixDate", time.UNIX_DATE, "Wed Feb  4 21:00:57 PST 2009"),
+    ("RubyDate", time.RUBY_DATE, "Wed Feb 04 21:00:57 -0800 2009"),
+    ("RFC822", time.RFC822, "04 Feb 09 21:00 PST"),
+    ("RFC850", time.RFC850, "Wednesday, 04-Feb-09 21:00:57 PST"),
+    ("RFC1123", time.RFC1123, "Wed, 04 Feb 2009 21:00:57 PST"),
+    ("RFC1123Z", time.RFC1123Z, "Wed, 04 Feb 2009 21:00:57 -0800"),
+    ("RFC3339", time.RFC3339, "2009-02-04T21:00:57-08:00"),
+    ("RFC3339Nano", time.RFC3339_NANO, "2009-02-04T21:00:57.0123456-08:00"),
+    ("Kitchen", time.KITCHEN, "9:00PM"),
+    ("am/pm", "3pm", "9pm"),
+    ("AM/PM", "3PM", "9PM"),
+    ("two-digit year", "06 01 02", "09 02 04"),
+    ("Janet", "Hi Janet, the Month is January", "Hi Janet, the Month is February"),
+    ("Stamp", time.STAMP, "Feb  4 21:00:57"),
+    ("StampMilli", time.STAMP_MILLI, "Feb  4 21:00:57.012"),
+    ("StampMicro", time.STAMP_MICRO, "Feb  4 21:00:57.012345"),
+    ("StampNano", time.STAMP_NANO, "Feb  4 21:00:57.012345600"),
+    ("DateTime", time.DATE_TIME, "2009-02-04 21:00:57"),
+    ("DateOnly", time.DATE_ONLY, "2009-02-04"),
+    ("TimeOnly", time.TIME_ONLY, "21:00:57"),
+    ("YearDay", "Jan  2 002 __2 2", "Feb  4 035  35 4"),
+    ("Year", "2006 6 06 _6 __6 ___6", "2009 6 09 _6 __6 ___6"),
+    ("Month", "Jan January 1 01 _1", "Feb February 2 02 _2"),
+    ("DayOfMonth", "2 02 _2 __2", "4 04  4  35"),
+    ("DayOfWeek", "Mon Monday", "Wed Wednesday"),
+    ("Hour", "15 3 03 _3", "21 9 09 _9"),
+    ("Minute", "4 04 _4", "0 00 _0"),
+    ("Second", "5 05 _5", "57 57 _57"),
+  ]
+}
+
+test "TestFormat" {
+  pacific()
+  t = time.unix(0, 1233810057012345600)
+  for tt in format_tests() {
+    assert_eq t.format(tt[1]), tt[2]
+  }
+}
+
+test "TestGoString" {
+  pacific()
+  assert_eq time.date(2009, 2, 5, 5, 0, 57, 12345600, time.utc()).go_string, "time.date(2009, time.FEBRUARY, 5, 5, 0, 57, 12345600, time.utc())"
+  assert_eq time.date(2009, 2, 5, 5, 0, 57, 12345600, time.local()).go_string, "time.date(2009, time.FEBRUARY, 5, 5, 0, 57, 12345600, time.local())"
+  assert_eq time.date(2009, 2, 5, 5, 0, 57, 12345600, time.fixed_zone("Europe/Berlin", 3 * 60 * 60)).go_string, "time.date(2009, time.FEBRUARY, 5, 5, 0, 57, 12345600, time.Location(\"Europe/Berlin\"))"
+  assert_eq time.date(2009, 2, 5, 5, 0, 57, 12345600, time.fixed_zone("Non-ASCII character ⏰", 3 * 60 * 60)).go_string, "time.date(2009, time.FEBRUARY, 5, 5, 0, 57, 12345600, time.Location(\"Non-ASCII character \\xe2\\x8f\\xb0\"))"
+}
+
+test "TestFormatSingleDigits" {
+  assert_eq time.date(2001, 2, 3, 4, 5, 6, 700000000, time.utc()).format("3:4:5"), "4:5:6"
+}
+
+def pad4(n: Int) -> Str { sprintf("%04d", n) }
+
+test "TestFormatShortYear" {
+  years = [
+    -100001, -100000, -99999, -10001, -10000, -9999, -1001, -1000, -999, -101, -100, -99,
+    -11, -10, -9, -1, 0, 1, 9, 10, 11, 99, 100, 101, 999, 1000, 1001, 9999, 10000, 10001,
+    99999, 100000, 100001,
+  ]
+  for y in years {
+    result = time.date(y, 1, 1, 0, 0, 0, 0, time.utc()).format("2006.01.02")
+    want = y < 0 ? "-" + pad4(0 - y) + ".01.01" : pad4(y) + ".01.01"
+    assert_eq result, want
+  }
+}
+
+# (name, layout, value, has_tz, has_wd, year_sign, frac_digits)
+def parse_tests -> [(Str, Str, Str, Bool, Bool, Int, Int)] {
+  [
+    ("ANSIC", time.ANSIC, "Thu Feb  4 21:00:57 2010", false, true, 1, 0),
+    ("UnixDate", time.UNIX_DATE, "Thu Feb  4 21:00:57 PST 2010", true, true, 1, 0),
+    ("RubyDate", time.RUBY_DATE, "Thu Feb 04 21:00:57 -0800 2010", true, true, 1, 0),
+    ("RFC850", time.RFC850, "Thursday, 04-Feb-10 21:00:57 PST", true, true, 1, 0),
+    ("RFC1123", time.RFC1123, "Thu, 04 Feb 2010 21:00:57 PST", true, true, 1, 0),
+    ("RFC1123", time.RFC1123, "Thu, 04 Feb 2010 22:00:57 PDT", true, true, 1, 0),
+    ("RFC1123Z", time.RFC1123Z, "Thu, 04 Feb 2010 21:00:57 -0800", true, true, 1, 0),
+    ("RFC3339", time.RFC3339, "2010-02-04T21:00:57-08:00", true, false, 1, 0),
+    ("custom: \"2006-01-02 15:04:05-07\"", "2006-01-02 15:04:05-07", "2010-02-04 21:00:57-08", true, false, 1, 0),
+    ("ANSIC", time.ANSIC, "Thu Feb  4 21:00:57.0 2010", false, true, 1, 1),
+    ("UnixDate", time.UNIX_DATE, "Thu Feb  4 21:00:57.01 PST 2010", true, true, 1, 2),
+    ("RubyDate", time.RUBY_DATE, "Thu Feb 04 21:00:57.012 -0800 2010", true, true, 1, 3),
+    ("RFC850", time.RFC850, "Thursday, 04-Feb-10 21:00:57.0123 PST", true, true, 1, 4),
+    ("RFC1123", time.RFC1123, "Thu, 04 Feb 2010 21:00:57.01234 PST", true, true, 1, 5),
+    ("RFC1123Z", time.RFC1123Z, "Thu, 04 Feb 2010 21:00:57.01234 -0800", true, true, 1, 5),
+    ("RFC3339", time.RFC3339, "2010-02-04T21:00:57.012345678-08:00", true, false, 1, 9),
+    ("custom: \"2006-01-02 15:04:05\"", "2006-01-02 15:04:05", "2010-02-04 21:00:57.0", false, false, 1, 0),
+    ("ANSIC", time.ANSIC, "Thu Feb 4 21:00:57 2010", false, true, 1, 0),
+    ("ANSIC", time.ANSIC, "Thu      Feb     4     21:00:57     2010", false, true, 1, 0),
+    ("ANSIC", time.ANSIC, "THU FEB 4 21:00:57 2010", false, true, 1, 0),
+    ("ANSIC", time.ANSIC, "thu feb 4 21:00:57 2010", false, true, 1, 0),
+    ("millisecond:: dot separator", "Mon Jan _2 15:04:05.000 2006", "Thu Feb  4 21:00:57.012 2010", false, true, 1, 3),
+    ("microsecond:: dot separator", "Mon Jan _2 15:04:05.000000 2006", "Thu Feb  4 21:00:57.012345 2010", false, true, 1, 6),
+    ("nanosecond:: dot separator", "Mon Jan _2 15:04:05.000000000 2006", "Thu Feb  4 21:00:57.012345678 2010", false, true, 1, 9),
+    ("millisecond:: comma separator", "Mon Jan _2 15:04:05,000 2006", "Thu Feb  4 21:00:57.012 2010", false, true, 1, 3),
+    ("microsecond:: comma separator", "Mon Jan _2 15:04:05,000000 2006", "Thu Feb  4 21:00:57.012345 2010", false, true, 1, 6),
+    ("nanosecond:: comma separator", "Mon Jan _2 15:04:05,000000000 2006", "Thu Feb  4 21:00:57.012345678 2010", false, true, 1, 9),
+    ("zero1", "2006.01.02.15.04.05.0", "2010.02.04.21.00.57.0", false, false, 1, 1),
+    ("zero2", "2006.01.02.15.04.05.00", "2010.02.04.21.00.57.01", false, false, 1, 2),
+    ("Janet", "Hi Janet, the Month is January: Jan _2 15:04:05 2006", "Hi Janet, the Month is February: Feb  4 21:00:57 2010", false, true, 1, 0),
+    ("GMT-8", time.UNIX_DATE, "Fri Feb  5 05:00:57 GMT-8 2010", true, true, 1, 0),
+    ("", "2006-01-02 15:04:05.9999 -0700 MST", "2010-02-04 21:00:57 -0800 PST", true, false, 1, 0),
+    ("", "2006-01-02 15:04:05.999999999 -0700 MST", "2010-02-04 21:00:57 -0800 PST", true, false, 1, 0),
+    ("", "2006-01-02 15:04:05.9999 -0700 MST", "2010-02-04 21:00:57.0123 -0800 PST", true, false, 1, 4),
+    ("", "2006-01-02 15:04:05.999999999 -0700 MST", "2010-02-04 21:00:57.0123 -0800 PST", true, false, 1, 4),
+    ("", "2006-01-02 15:04:05.9999 -0700 MST", "2010-02-04 21:00:57.012345678 -0800 PST", true, false, 1, 9),
+    ("", "2006-01-02 15:04:05.999999999 -0700 MST", "2010-02-04 21:00:57.012345678 -0800 PST", true, false, 1, 9),
+    ("", "2006-01-02 15:04:05,9999 -0700 MST", "2010-02-04 21:00:57 -0800 PST", true, false, 1, 0),
+    ("", "2006-01-02 15:04:05,999999999 -0700 MST", "2010-02-04 21:00:57 -0800 PST", true, false, 1, 0),
+    ("", "2006-01-02 15:04:05,9999 -0700 MST", "2010-02-04 21:00:57.0123 -0800 PST", true, false, 1, 4),
+    ("", "2006-01-02 15:04:05,999999999 -0700 MST", "2010-02-04 21:00:57.0123 -0800 PST", true, false, 1, 4),
+    ("", "2006-01-02 15:04:05,9999 -0700 MST", "2010-02-04 21:00:57.012345678 -0800 PST", true, false, 1, 9),
+    ("", "2006-01-02 15:04:05,999999999 -0700 MST", "2010-02-04 21:00:57.012345678 -0800 PST", true, false, 1, 9),
+    ("", time.STAMP_NANO, "Feb  4 21:00:57.012345678", false, false, -1, 9),
+    ("", "Jan _2 15:04:05.999", "Feb  4 21:00:57.012300000", false, false, -1, 4),
+    ("", "Jan _2 15:04:05.999", "Feb  4 21:00:57.012345678", false, false, -1, 9),
+    ("", "Jan _2 15:04:05.999999999", "Feb  4 21:00:57.0123", false, false, -1, 4),
+    ("", "Jan _2 15:04:05.999999999", "Feb  4 21:00:57.012345678", false, false, -1, 9),
+    ("", "2006-01-02 002 15:04:05", "2010-02-04 035 21:00:57", false, false, 1, 0),
+    ("", "2006-01 002 15:04:05", "2010-02 035 21:00:57", false, false, 1, 0),
+    ("", "2006-002 15:04:05", "2010-035 21:00:57", false, false, 1, 0),
+    ("", "200600201 15:04:05", "201003502 21:00:57", false, false, 1, 0),
+    ("", "200600204 15:04:05", "201003504 21:00:57", false, false, 1, 0),
+    ("", "2006-01-02T15:04:05Z07", "2010-02-04T21:00:57Z", false, false, 1, 0),
+    ("", "2006-01-02T15:04:05Z07", "2010-02-04T21:00:57+08", false, false, 1, 0),
+    ("", "2006-01-02T15:04:05Z07", "2010-02-04T21:00:57-08", true, false, 1, 0),
+    ("", "2006-01-02T15:04:05Z0700", "2010-02-04T21:00:57Z", false, false, 1, 0),
+    ("", "2006-01-02T15:04:05Z0700", "2010-02-04T21:00:57+0800", false, false, 1, 0),
+    ("", "2006-01-02T15:04:05Z0700", "2010-02-04T21:00:57-0800", true, false, 1, 0),
+    ("", "2006-01-02T15:04:05Z07:00", "2010-02-04T21:00:57Z", false, false, 1, 0),
+    ("", "2006-01-02T15:04:05Z07:00", "2010-02-04T21:00:57+08:00", false, false, 1, 0),
+    ("", "2006-01-02T15:04:05Z07:00", "2010-02-04T21:00:57-08:00", true, false, 1, 0),
+    ("", "2006-01-02T15:04:05Z070000", "2010-02-04T21:00:57Z", false, false, 1, 0),
+    ("", "2006-01-02T15:04:05Z070000", "2010-02-04T21:00:57+080000", false, false, 1, 0),
+    ("", "2006-01-02T15:04:05Z070000", "2010-02-04T21:00:57-080000", true, false, 1, 0),
+    ("", "2006-01-02T15:04:05Z07:00:00", "2010-02-04T21:00:57Z", false, false, 1, 0),
+    ("", "2006-01-02T15:04:05Z07:00:00", "2010-02-04T21:00:57+08:00:00", false, false, 1, 0),
+    ("", "2006-01-02T15:04:05Z07:00:00", "2010-02-04T21:00:57-08:00:00", true, false, 1, 0),
+  ]
+}
+
+# The time should be Thu Feb  4 21:00:57 PST 2010 (Go's checkTime).
+#[track_caller]
+def check_time(t: time.Time, tt: (Str, Str, Str, Bool, Bool, Int, Int)) {
+  name = "#{tt[0]} #{tt[2]}"
+  assert tt[5] < 0 || tt[5] * t.year == 2010, "#{name}: bad year #{t.year}"
+  assert_eq t.month, time.FEBRUARY
+  assert_eq t.day, 4
+  assert_eq t.hour, 21
+  assert_eq t.minute, 0
+  assert_eq t.second, 57
+  digits = "012345678"[0...tt[6]] + "000000000"[0...9 - tt[6]]
+  want = 0
+  for c in digits.bytes { want = want * 10 + c.to_i - 48 }
+  assert_eq t.nanosecond, want
+  _, offset = t.zone_info
+  assert !tt[3] || offset == -28800, "#{name}: bad tz offset #{offset}"
+  assert !tt[4] || t.weekday == time.THURSDAY, "#{name}: bad weekday"
+}
+
+test "TestParse" {
+  pacific()
+  for tt in parse_tests() {
+    r = time.parse(tt[1], tt[2])
+    if e = r.err {
+      assert false, "#{tt[0]} error: #{e.message}"
+    } else {
+      check_time(r.unwrap, tt)
+    }
+  }
+}
+
+test "TestParseDayOutOfRange" {
+  tests = [
+    ("Thu Jan 99 21:00:57 2010", false), ("Thu Jan 31 21:00:57 2010", true),
+    ("Thu Jan 32 21:00:57 2010", false), ("Thu Feb 28 21:00:57 2012", true),
+    ("Thu Feb 29 21:00:57 2012", true), ("Thu Feb 29 21:00:57 2010", false),
+    ("Thu Mar 31 21:00:57 2010", true), ("Thu Mar 32 21:00:57 2010", false),
+    ("Thu Apr 30 21:00:57 2010", true), ("Thu Apr 31 21:00:57 2010", false),
+    ("Thu May 31 21:00:57 2010", true), ("Thu May 32 21:00:57 2010", false),
+    ("Thu Jun 30 21:00:57 2010", true), ("Thu Jun 31 21:00:57 2010", false),
+    ("Thu Jul 31 21:00:57 2010", true), ("Thu Jul 32 21:00:57 2010", false),
+    ("Thu Aug 31 21:00:57 2010", true), ("Thu Aug 32 21:00:57 2010", false),
+    ("Thu Sep 30 21:00:57 2010", true), ("Thu Sep 31 21:00:57 2010", false),
+    ("Thu Oct 31 21:00:57 2010", true), ("Thu Oct 32 21:00:57 2010", false),
+    ("Thu Nov 30 21:00:57 2010", true), ("Thu Nov 31 21:00:57 2010", false),
+    ("Thu Dec 31 21:00:57 2010", true), ("Thu Dec 32 21:00:57 2010", false),
+    ("Thu Dec 00 21:00:57 2010", false),
+  ]
+  for tt in tests {
+    r = time.parse(time.ANSIC, tt[0])
+    if e = r.err {
+      assert !tt[1], "#{tt[0]}: unexpected error: #{e.message}"
+      assert strings.contains(e.message, "day out of range"), "#{tt[0]}: #{e.message}"
+    } else {
+      assert tt[1], "#{tt[0]}: expected 'day' error, got none"
+    }
+  }
+}
+
+test "TestParseInLocation" {
+  baghdad = ~time.load_location("Asia/Baghdad")
+  t1 = ~time.parse_in_location("Jan 02 2006 MST", "Feb 01 2013 AST", baghdad)
+  _, offset = t1.zone_info
+  # A zero offset: tzdata 2017a and later call Baghdad's zone +03, not AST.
+  if offset != 0 {
+    assert t1 == time.date(2013, 2, 1, 0, 0, 0, 0, baghdad)
+    assert_eq offset, 3 * 60 * 60
+  }
+  blanc_sablon = ~time.load_location("America/Blanc-Sablon")
+  t1 = ~time.parse_in_location("Jan 02 2006 MST", "Feb 01 2013 AST", blanc_sablon)
+  assert t1 == time.date(2013, 2, 1, 0, 0, 0, 0, blanc_sablon)
+  _, offset = t1.zone_info
+  assert_eq offset, -4 * 60 * 60
+}
+
+test "TestLoadLocationZipFile" {
+  undo = time.disable_platform_sources()
+  defer { undo.call() }
+  r = time.load_location("Australia/Sydney")
+  assert r.ok?, "Australia/Sydney from the embedded database"
+}
+
+test "TestRubyParse" {
+  pacific()
+  tests = [
+    ("RubyDate", time.RUBY_DATE, "Thu Feb 04 21:00:57 -0800 2010", true, true, 1, 0),
+    ("RubyDate", time.RUBY_DATE, "Thu Feb 04 21:00:57 -0000 2010", false, true, 1, 0),
+    ("RubyDate", time.RUBY_DATE, "Thu Feb 04 21:00:57 +0000 2010", false, true, 1, 0),
+    ("RubyDate", time.RUBY_DATE, "Thu Feb 04 21:00:57 +1130 2010", false, true, 1, 0),
+  ]
+  for tt in tests {
+    check_time(~time.parse(tt[1], tt[2]), tt)
+  }
+}
+
+test "TestFormatAndParse" {
+  pacific()
+  fmt = "Mon MST " + time.RFC3339
+  x = 1
+  for i in 0...20000 {
+    x = mix(x + i)
+    # the first half int32s, then int64s, as Go's two quick.Checks
+    sec = i < 10000 ? (x >> 32) : x
+    t1 = time.unix(sec / 2, 0)
+    next if t1.year < 1000 || t1.year > 9999 || t1.unix != sec
+    t2 = ~time.parse(fmt, t1.format(fmt))
+    assert_eq t2.unix, t1.unix
+    assert_eq t2.nanosecond, t1.nanosecond
+  }
+}
+
+test "TestParseTimeZone" {
+  tests = [
+    ("gmt hi there", 0, false), ("GMT hi there", 3, true), ("GMT+12 hi there", 6, true),
+    ("GMT+00 hi there", 6, true), ("GMT+", 3, true), ("GMT+3", 5, true), ("GMT+a", 3, true),
+    ("GMT+3a", 5, true), ("GMT-5 hi there", 5, true), ("GMT-51 hi there", 3, true),
+    ("ChST hi there", 4, true), ("MeST hi there", 4, true), ("MSDx", 3, true), ("MSDY", 0, false),
+    ("ESAST hi", 5, true), ("ESASTT hi", 0, false), ("ESATY hi", 0, false), ("WITA hi", 4, true),
+    ("+03 hi", 3, true), ("-04 hi", 3, true), ("+00", 3, true), ("-11", 3, true), ("-12", 3, true),
+    ("-23", 3, true), ("-24", 0, false), ("+13", 3, true), ("+14", 3, true), ("+23", 3, true),
+    ("+24", 0, false),
+  ]
+  for tt in tests {
+    length, ok = time.parse_time_zone(tt[0])
+    assert_eq ok, tt[2]
+    assert_eq length, tt[1] if ok
+  }
+}
+
+def parse_error_tests -> [(Str, Str, Str)] {
+  [
+    (time.ANSIC, "Feb  4 21:00:60 2010", "cannot parse \"Feb  4 21:00:60 2010\" as \"Mon\""),
+    (time.ANSIC, "Thu Feb  4 21:00:57 @2010", "cannot parse \"@2010\" as \"2006\""),
+    (time.ANSIC, "Thu Feb  4 21:00:60 2010", "second out of range"),
+    (time.ANSIC, "Thu Feb  4 21:61:57 2010", "minute out of range"),
+    (time.ANSIC, "Thu Feb  4 24:00:60 2010", "hour out of range"),
+    ("Mon Jan _2 15:04:05.000 2006", "Thu Feb  4 23:00:59x01 2010", "cannot parse \"x01 2010\" as \".000\""),
+    ("Mon Jan _2 15:04:05.000 2006", "Thu Feb  4 23:00:59.xxx 2010", "cannot parse \".xxx 2010\" as \".000\""),
+    ("Mon Jan _2 15:04:05.000 2006", "Thu Feb  4 23:00:59.-123 2010", "fractional second out of range"),
+    (time.STAMP_NANO, "Dec  7 11:22:01.000000", "cannot parse \".000000\" as \".000000000\""),
+    (time.STAMP_NANO, "Dec  7 11:22:01.0000000000", "extra text: \"0\""),
+    (time.RFC3339, "2006-01-02T15:04:05Z07:00", "parsing time \"2006-01-02T15:04:05Z07:00\": extra text: \"07:00\""),
+    (time.RFC3339, "2006-01-02T15:04_abc", "parsing time \"2006-01-02T15:04_abc\" as \"2006-01-02T15:04:05Z07:00\": cannot parse \"_abc\" as \":\""),
+    (time.RFC3339, "2006-01-02T15:04:05_abc", "parsing time \"2006-01-02T15:04:05_abc\" as \"2006-01-02T15:04:05Z07:00\": cannot parse \"_abc\" as \"Z07:00\""),
+    (time.RFC3339, "2006-01-02T15:04:05Z_abc", "parsing time \"2006-01-02T15:04:05Z_abc\": extra text: \"_abc\""),
+    (time.RFC3339, "2010-02-04T21:00:67.012345678-08:00", "second out of range"),
+    (time.RFC3339, "0000-01-01T00:00:.0+00:00", "parsing time \"0000-01-01T00:00:.0+00:00\" as \"2006-01-02T15:04:05Z07:00\": cannot parse \".0+00:00\" as \"05\""),
+    ("_2 Jan 06 15:04 MST", "4 --- 00 00:00 GMT", "cannot parse \"--- 00 00:00 GMT\" as \"Jan\""),
+    ("_2 January 06 15:04 MST", "4 --- 00 00:00 GMT", "cannot parse \"--- 00 00:00 GMT\" as \"January\""),
+    ("Jan _2 002 2006", "Feb  4 034 2006", "day-of-year does not match day"),
+    ("Jan _2 002 2006", "Feb  4 004 2006", "day-of-year does not match month"),
+    ("\"2006-01-02T15:04:05Z07:00\"", "0", "parsing time \"0\" as \"\\\"2006-01-02T15:04:05Z07:00\\\"\": cannot parse \"0\" as \"\\\"\""),
+    (time.RFC3339, "\"", "parsing time \"\\\"\" as \"2006-01-02T15:04:05Z07:00\": cannot parse \"\\\"\" as \"2006\""),
+    (time.RFC3339, "0000-01-01T00:00:00+00:+0", "parsing time \"0000-01-01T00:00:00+00:+0\" as \"2006-01-02T15:04:05Z07:00\": cannot parse \"+00:+0\" as \"Z07:00\""),
+    (time.RFC3339, "0000-01-01T00:00:00+-0:00", "parsing time \"0000-01-01T00:00:00+-0:00\" as \"2006-01-02T15:04:05Z07:00\": cannot parse \"+-0:00\" as \"Z07:00\""),
+    ("2006-01-02", "22-10-25", "parsing time \"22-10-25\" as \"2006-01-02\": cannot parse \"22-10-25\" as \"2006\""),
+    ("06-01-02", "a2-10-25", "parsing time \"a2-10-25\" as \"06-01-02\": cannot parse \"a2-10-25\" as \"06\""),
+    ("03:04PM", "12:03pM", "parsing time \"12:03pM\" as \"03:04PM\": cannot parse \"pM\" as \"PM\""),
+    ("03:04pm", "12:03pM", "parsing time \"12:03pM\" as \"03:04pm\": cannot parse \"pM\" as \"pm\""),
+    ("-07", "-25", "time zone offset hour out of range"),
+    ("-07:00", "+25:00", "time zone offset hour out of range"),
+    ("-07:00", "-23:61", "time zone offset minute out of range"),
+    ("-07:00:00", "+23:59:61", "time zone offset second out of range"),
+    ("Z07", "-25", "time zone offset hour out of range"),
+    ("Z07:00", "+25:00", "time zone offset hour out of range"),
+    ("Z07:00", "-23:61", "time zone offset minute out of range"),
+    ("Z07:00:00", "+23:59:61", "time zone offset second out of range"),
+  ]
+}
+
+test "TestParseErrors" {
+  for tt in parse_error_tests() {
+    r = time.parse(tt[0], tt[1])
+    if e = r.err {
+      assert strings.contains(e.message, tt[2]), "#{tt[0]} #{tt[1]}: got #{e.message}, want #{tt[2]}"
+    } else {
+      assert false, "expected error for #{tt[0]} #{tt[1]}"
+    }
+  }
+}
+
+test "TestNoonIs12PM" {
+  noon = time.date(0, 1, 1, 12, 0, 0, 0, time.utc())
+  assert_eq noon.format("3:04PM"), "12:00PM"
+  assert_eq noon.format("03:04PM"), "12:00PM"
+}
+
+test "TestMidnightIs12AM" {
+  midnight = time.date(0, 1, 1, 0, 0, 0, 0, time.utc())
+  assert_eq midnight.format("3:04PM"), "12:00AM"
+  assert_eq midnight.format("03:04PM"), "12:00AM"
+}
+
+test "Test12PMIsNoon" {
+  assert_eq time.~parse("3:04PM", "12:00PM").hour, 12
+  assert_eq time.~parse("03:04PM", "12:00PM").hour, 12
+}
+
+test "Test12AMIsMidnight" {
+  assert_eq time.~parse("3:04PM", "12:00AM").hour, 0
+  assert_eq time.~parse("03:04PM", "12:00AM").hour, 0
+}
+
+test "TestMissingZone" {
+  pacific()
+  t = ~time.parse(time.RUBY_DATE, "Thu Feb 02 16:10:03 -0500 2006")
+  assert_eq t.format(time.UNIX_DATE), "Thu Feb  2 16:10:03 -0500 2006"
+}
+
+test "TestMinutesInTimeZone" {
+  t = ~time.parse(time.RUBY_DATE, "Mon Jan 02 15:04:05 +0123 2006")
+  _, offset = t.zone_info
+  assert_eq offset, (1 * 60 + 23) * 60
+}
+
+def seconds_tz_tests -> [(Str, Str, Int)] {
+  [
+    ("2006-01-02T15:04:05-070000", "1871-01-01T05:33:02-003408", 0 - (34 * 60 + 8)),
+    ("2006-01-02T15:04:05-07:00:00", "1871-01-01T05:33:02-00:34:08", 0 - (34 * 60 + 8)),
+    ("2006-01-02T15:04:05-070000", "1871-01-01T05:33:02+003408", 34 * 60 + 8),
+    ("2006-01-02T15:04:05-07:00:00", "1871-01-01T05:33:02+00:34:08", 34 * 60 + 8),
+    ("2006-01-02T15:04:05Z070000", "1871-01-01T05:33:02-003408", 0 - (34 * 60 + 8)),
+    ("2006-01-02T15:04:05Z07:00:00", "1871-01-01T05:33:02+00:34:08", 34 * 60 + 8),
+    ("2006-01-02T15:04:05-07", "1871-01-01T05:33:02+01", 1 * 60 * 60),
+    ("2006-01-02T15:04:05-07", "1871-01-01T05:33:02-02", -2 * 60 * 60),
+    ("2006-01-02T15:04:05Z07", "1871-01-01T05:33:02-02", -2 * 60 * 60),
+  ]
+}
+
+test "TestParseSecondsInTimeZone" {
+  for tt in seconds_tz_tests() {
+    t = ~time.parse(tt[0], tt[1])
+    _, offset = t.zone_info
+    assert_eq offset, tt[2]
+  }
+}
+
+test "TestFormatSecondsInTimeZone" {
+  for tt in seconds_tz_tests() {
+    d = time.date(1871, 1, 1, 5, 33, 2, 0, time.fixed_zone("LMT", tt[2]))
+    assert_eq d.format(tt[0]), tt[1]
+  }
+}
+
+test "TestUnderscoreTwoThousand" {
+  t = ~time.parse("15:04_20060102", "14:38_20150618")
+  y, m, d = t.date
+  assert_eq [y, m, d], [2015, 6, 18]
+  assert_eq t.hour, 14
+  assert_eq t.minute, 38
+}
+
+test "TestStd0xParseError" {
+  tests = [("01 MST", "0 MST", "0"), ("01 MST", "1 MST", "1"), (time.RFC850, "Thursday, 04-Feb-1 21:00:57 PST", "1")]
+  for tt in tests {
+    r = time.parse(tt[0], tt[1])
+    if e = r.err {
+      assert strings.contains(e.message, "cannot parse"), e.message
+      assert e.value_elem.start_with?(tt[2]), "#{tt[1]}: value_elem #{e.value_elem}"
+    } else {
+      assert false, "parse(#{tt[0]}, #{tt[1]}) did not fail"
+    }
+  }
+}
+
+test "TestParseMonthOutOfRange" {
+  for tt in [("00-01", false), ("13-01", false), ("01-01", true)] {
+    r = time.parse("01-02", tt[0])
+    if e = r.err {
+      assert !tt[1], "#{tt[0]}: unexpected error #{e.message}"
+      assert strings.contains(e.message, "month out of range"), e.message
+    } else {
+      assert tt[1], "#{tt[0]}: expected 'month' error, got none"
+    }
+  }
+}
+
+test "TestParseYday" {
+  for i in 1..365 {
+    d = sprintf("2020-%03d", i)
+    tm = ~time.parse("2006-002", d)
+    assert_eq tm.year, 2020
+    assert_eq tm.year_day, i
+  }
+}
+
+test "TestQuote" {
+  tests = [
+    ("\"", "\"\\\"\""),
+    ("abc\"xyz\"", "\"abc\\\"xyz\\\"\""),
+    ("", "\"\""),
+    ("abc", "\"abc\""),
+    ("☺", "\"\\xe2\\x98\\xba\""),
+    ("☺ hello ☺ hello", "\"\\xe2\\x98\\xba hello \\xe2\\x98\\xba hello\""),
+    ("\u0004", "\"\\x04\""),
+  ]
+  for tt in tests {
+    assert_eq time.quote_for_testing(tt[0]), tt[1]
+  }
+}
+
+test "TestFormatFractionalSecondSeparators" {
+  pacific()
+  t = time.unix(0, 1233810057012345600)
+  tests = [("15:04:05.000", "21:00:57.012"), ("15:04:05.999", "21:00:57.012"), ("15:04:05,000", "21:00:57,012"), ("15:04:05,999", "21:00:57,012")]
+  for tt in tests {
+    assert_eq t.format(tt[0]), tt[1]
+  }
+}
+
+def long_fractional_digits_tests -> [(Str, Int)] {
+  [
+    ("2021-09-29T16:04:33.000000000Z", 0),
+    ("2021-09-29T16:04:33.000000001Z", 1),
+    ("2021-09-29T16:04:33.100000000Z", 100000000),
+    ("2021-09-29T16:04:33.100000001Z", 100000001),
+    ("2021-09-29T16:04:33.999999999Z", 999999999),
+    ("2021-09-29T16:04:33.012345678Z", 12345678),
+    ("2021-09-29T16:04:33.0000000000Z", 0),
+    ("2021-09-29T16:04:33.0000000001Z", 0),
+    ("2021-09-29T16:04:33.1000000000Z", 100000000),
+    ("2021-09-29T16:04:33.1000000009Z", 100000000),
+    ("2021-09-29T16:04:33.9999999999Z", 999999999),
+    ("2021-09-29T16:04:33.0123456789Z", 12345678),
+    ("2021-09-29T16:04:33.10000000000Z", 100000000),
+    ("2021-09-29T16:04:33.00123456789Z", 1234567),
+    ("2021-09-29T16:04:33.000123456789Z", 123456),
+    ("2021-09-29T16:04:33.9999999999999999Z", 999999999),
+  ]
+}
+
+test "TestParseFractionalSecondsLongerThanNineDigits" {
+  for tt in long_fractional_digits_tests() {
+    for layout in [time.RFC3339, time.RFC3339_NANO] {
+      tm = ~time.parse(layout, tt[0])
+      assert_eq tm.nanosecond, tt[1]
+    }
+  }
+}
+
+# FuzzFormatRFC3339's seeds: RFC3339 and RFC3339_NANO layouts agree with each other
+# up to the fraction, and FuzzParseRFC3339's: both layouts parse the same values
+# to the same times.
+test "rfc3339 seeds (FuzzFormatRFC3339, FuzzParseRFC3339)" {
+  pacific()
+  min = -9223372036854775808
+  max = 9223372036854775807
+  for ts in [(min, min), (-62167219200, 0), (1661201140, 676836973), (253402300799, 999999999), (max, max)] {
+    locs = [time.utc(), time.local()]
+    for off in [0, 60, 60 * 60, 99 * 60 * 60 + 99 * 60, 123456789] {
+      locs << time.fixed_zone("", 0 - off)
+      locs << time.fixed_zone("", off)
+    }
+    for l in locs {
+      t = time.unix(ts[0], ts[1]).in_zone(l)
+      a = t.format(time.RFC3339)
+      b = t.format(time.RFC3339_NANO)
+      assert a.size <= b.size
+    }
+  }
+  values: [Str] = []
+  for tt in format_tests() { values << tt[2] }
+  for tt in parse_tests() { values << tt[2] }
+  for tt in parse_error_tests() { values << tt[1] }
+  for tt in long_fractional_digits_tests() { values << tt[0] }
+  for s in values {
+    for tz in [time.utc(), time.local()] {
+      r1 = time.parse_in_location(time.RFC3339, s, tz)
+      r2 = time.parse_in_location(time.RFC3339_NANO, s, tz)
+      assert_eq r1.ok?, r2.ok?
+      if t1 = r1.ok {
+        t2 = r2.unwrap
+        assert t1 == t2, s
+        assert_eq t1.zone_info, t2.zone_info
+      }
+    }
+  }
+}

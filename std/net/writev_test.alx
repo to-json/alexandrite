@@ -1,0 +1,81 @@
+# Go's writev_test.go, translated. Go's TestBuffers_WriteTo also counts the
+# writev calls through a poll test hook; alx gathers each batch of 1024
+# buffers into one write (no writev, no hook), so the data, the count and
+# the emptied Buffers are checked.
+
+import "io"
+
+def bufs_s(b: Buffers) -> [Str] { b.bufs.map { Str.from_bytes(it) }.to_a }
+
+test "Buffers_read" {
+  story = "once upon a time in Gopherland ... "
+  bs = buffers([bytes_of("once "), bytes_of("upon "), bytes_of("a "), bytes_of("time "), bytes_of("in "), bytes_of("Gopherland ... ")])
+  got = io.read_all(bs).unwrap
+  assert_eq Str.from_bytes(got), story
+  assert_eq bs.size, 0
+}
+
+test "Buffers_consume" {
+  e: [Byte] = []
+  tests: [([[Byte]], Int, [Str])] = [
+    ([bytes_of("foo"), bytes_of("bar")], 0, ["foo", "bar"]),
+    ([bytes_of("foo"), bytes_of("bar")], 2, ["o", "bar"]),
+    ([bytes_of("foo"), bytes_of("bar")], 3, ["bar"]),
+    ([bytes_of("foo"), bytes_of("bar")], 4, ["ar"]),
+    ([e, e, e, bytes_of("bar")], 1, ["ar"]),
+    ([e, e, e, bytes_of("foo")], 0, ["foo"]),
+    ([e, e, e], 0, [])
+  ]
+  for tt in tests {
+    input, n, want = tt
+    b = buffers(input)
+    b.consume(n)
+    assert_eq bufs_s(b), want
+  }
+}
+
+test "Buffers_WriteTo" {
+  for use_copy in [false, true] {
+    for chunks in [0, 10, 1023, 1024, 1025] {
+      want: [Byte] = []
+      for i in 0...chunks {
+        want << i.as_u8
+      }
+      s, c = tcp_conn_pair
+      reader = spawn { ~io.read_all(s) }
+      parts: [[Byte]] = []
+      for i in 0...chunks {
+        parts << want[i...i + 1]
+      }
+      bs = buffers(parts)
+      n = 0
+      if use_copy {
+        n = io.copy(c, bs).unwrap
+      } else {
+        n = bs.write_to!(c).unwrap
+      }
+      assert_eq bs.size, 0
+      assert_eq n, want.size
+      c.close!
+      assert_eq reader.wait.unwrap, want
+      s.close!
+    }
+  }
+}
+
+test "WritevError" {
+  ln = new_local_listener("tcp")
+  t = spawn { ln.~accept }
+  c1 = dial("tcp", ln.addr).unwrap
+  c2 = t.wait.unwrap
+  c2.close!
+  buf: [Byte] = [0; 1 << 20]
+  parts: [[Byte]] = []
+  for _i in 0...(1 << 10) {
+    parts << buf
+  }
+  bs = buffers(parts)
+  assert bs.write_to!(c1).err?, "Buffers.write_to!(closed conn) succeeded, want error"
+  c1.close!
+  ln.close!
+}

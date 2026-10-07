@@ -1,0 +1,283 @@
+#![test(external)]
+# Go's os DirFS and CopyFS tests (os_test.go's TestDirFS ... TestCopyFS,
+# file_test.go), translated. alx's DirFS is io/fs's dir_fs (os doesn't
+# import io/fs); CopyFS is os.copy_fs. Go's testdata/dirfs (a, b, dir/x) is
+# made in a temp dir. Not translated: TestRootDirFS (os.Root).
+
+import "os"
+import "io/fs"
+import "testing/fstest"
+import "path/filepath"
+import "testing"
+
+def dirfs_testdata(t: testing.T) -> Str {
+  d = t.temp_dir + "/dirfs"
+  os.mkdir_all(d + "/dir", 0o755).unwrap
+  os.write_file(d + "/a", [], 0o644).unwrap
+  os.write_file(d + "/b", [], 0o644).unwrap
+  os.write_file(d + "/dir/x", [], 0o644).unwrap
+  d
+}
+
+test "DirFS" { |t|
+  dir = dirfs_testdata(t)
+  fsys = fs.dir_fs(dir)
+  fstest.test_fs(fsys, ["a", "b", "dir/x"]).unwrap
+  assert fsys.read_dir("nonexistent").err?, "fs.ReadDir of nonexistent directory succeeded"
+  nonesuch = "dir/nonesuch"
+  e = fsys.open(nonesuch).err
+  t.fatal("fs.Open of nonexistent file succeeded") if e == none
+  assert e.unwrap.message.include?(nonesuch), "error #{e} does not contain #{nonesuch}"
+  assert !e.unwrap.message.include?("dirfs"), "error #{e} contains the root"
+  d = fs.dir_fs(".")
+  assert d.open("testdata\\dirfs").err?, "Open testdata\\dirfs succeeded"
+  assert d.open("NUL").err?, "Open NUL succeeded"
+}
+
+test "DirFSRootDir" { |t|
+  dir = dirfs_testdata(t)
+  t.chdir(dir)
+  cwd = os.getwd.unwrap
+  cwd = cwd[1...cwd.size] # trim the leading /
+  d = fs.dir_fs("/")
+  f = d.open(cwd + "/a").unwrap
+  f.close!.unwrap
+}
+
+test "DirFSEmptyDir" { |t|
+  dir = dirfs_testdata(t)
+  t.chdir(filepath.dir(dir))
+  d = fs.dir_fs("")
+  cwd = os.getwd.unwrap
+  for p in ["dirfs/a", cwd + "/dirfs/a"] {
+    assert d.open(p).err?, "DirFS(\"\").Open(#{p}) succeeded"
+  }
+}
+
+test "DirFSPathsValid" { |t|
+  d = t.temp_dir
+  os.write_file(d + "/control.txt", "Hello, world!".bytes, 0o644).unwrap
+  os.write_file(d + "/e:xperi\\ment.txt", "Hello, colon and backslash!".bytes, 0o644).unwrap
+  fsys = fs.dir_fs(d)
+  fs.walk_dir(fsys, ".") { |_p, e, _err|
+    if en = e {
+      t.error("#{en.name} INVALID") if !fs.valid_path?(en.name)
+    }
+  }.unwrap
+}
+
+test "ReadFileProc" { |t|
+  name = "/proc/sys/fs/pipe-max-size"
+  t.skip("no #{name}") if os.stat(name).err?
+  data = os.read_file(name).unwrap
+  assert data.size > 0 && data[data.size - 1] == 10, "read #{name}: not newline-terminated"
+}
+
+test "DirFSReadFileProc" { |t|
+  fsys = fs.dir_fs("/")
+  name = "proc/sys/fs/pipe-max-size"
+  t.skip("no /#{name}") if fs.stat(fsys, name).err?
+  data = fs.read_file(fsys, name).unwrap
+  assert data.size > 0 && data[data.size - 1] == 10, "read #{name}: not newline-terminated"
+}
+
+# Go's verifyCopyFS, over a DirFS original.
+def verify_copy_fs[F](t: testing.T, origin: F, copied: fs.DirFS) {
+  test_dir = t.temp_dir + "/test"
+  os.mkdir(test_dir, os.MODE_PERM).unwrap
+  want_dir_mode = os.stat(test_dir).unwrap.go_mode
+  f = os.create(test_dir + "/tmp").unwrap
+  want_file_rw_mode = f.stat.unwrap.go_mode
+  f.close!.unwrap
+  fs.walk_dir(origin, ".") { |p, d, _err|
+    en = d.unwrap
+    if en.is_dir {
+      if en.name != "." {
+        dinfo = ~fs.stat(copied, p)
+        assert dinfo.mode.bits == want_dir_mode, "dir #{en.name} mode is #{dinfo.mode}, want #{want_dir_mode}"
+      }
+    } else {
+      data = ~fs.read_file(origin, p)
+      new_data = ~fs.read_file(copied, p)
+      assert data == new_data, "file #{p} content differs"
+      fst = ~fs.stat(origin, p)
+      cst = ~fs.stat(copied, p)
+      assert (cst.mode.bits & 0o111 & want_file_rw_mode) == (fst.mode.bits & 0o111 & want_file_rw_mode), "file #{p} execute mode differs"
+      rw = cst.mode.bits - (cst.mode.bits & 0o111)
+      assert rw == want_file_rw_mode, "file #{p} rw mode is #{rw}, want #{want_file_rw_mode}"
+    }
+  }.unwrap
+}
+
+def map_fs_of(pairs: [(Str, Str)]) -> fstest.MapFS {
+  files: Map[Str, fstest.MapFile] = {}
+  for kv in pairs {
+    files[kv[0]] = fstest.map_file(kv[1].bytes.to_a)
+  }
+  fstest.map_fs(files)
+}
+
+test "CopyFS" { |t|
+  fsys = fs.dir_fs(dirfs_testdata(t))
+  tmp_dir = t.temp_dir + "/copy1"
+  os.copy_fs(tmp_dir, fsys).unwrap
+  tmp_fsys = fs.dir_fs(tmp_dir)
+  fstest.test_fs(tmp_fsys, ["a", "b", "dir/x"]).unwrap
+  verify_copy_fs(t, fsys, tmp_fsys)
+  e = os.copy_fs(tmp_dir, fsys).err
+  assert e != none && fs.is_exist(e.unwrap), "CopyFS should have failed with ErrExist (disk), got: #{e}"
+  mfs = map_fs_of([("william", "Shakespeare\n"), ("carl", "Gauss\n"), ("daVinci", "Leonardo\n"), ("einstein", "Albert\n"), ("dir/newton", "Sir Isaac\n")])
+  tmp_dir2 = t.temp_dir + "/copy2"
+  os.copy_fs(tmp_dir2, mfs).unwrap
+  tmp_fsys2 = fs.dir_fs(tmp_dir2)
+  fstest.test_fs(tmp_fsys2, ["william", "carl", "daVinci", "einstein", "dir/newton"]).unwrap
+  verify_copy_fs(t, mfs, tmp_fsys2)
+  e2 = os.copy_fs(tmp_dir2, mfs).err
+  assert e2 != none && fs.is_exist(e2.unwrap), "CopyFS should have failed with ErrExist (memory), got: #{e2}"
+}
+
+test "CopyFSWithSymlinks" { |t|
+  tmp_dir = t.temp_dir
+  outside_dir = tmp_dir + "/copyfs_out"
+  os.mkdir(outside_dir, 0o755).unwrap
+  outside_file = outside_dir + "/file.out.txt"
+  os.write_file(outside_file, "Testing CopyFS outside".bytes, 0o644).unwrap
+  inside_dir = tmp_dir + "/copyfs_in"
+  os.mkdir(inside_dir, 0o755).unwrap
+  inside_file = inside_dir + "/file.in.txt"
+  os.write_file(inside_file, "Testing CopyFS inside".bytes, 0o644).unwrap
+  link_in_dir = inside_dir + "/in_symlinks"
+  os.mkdir(link_in_dir, 0o755).unwrap
+  link_out_dir = inside_dir + "/out_symlinks"
+  os.mkdir(link_out_dir, 0o755).unwrap
+  os.symlink(outside_file, link_out_dir + "/file.abs.out.link").unwrap
+  os.symlink(filepath.rel(link_out_dir, outside_file).unwrap, link_out_dir + "/file.rel.out.link").unwrap
+  os.symlink(filepath.rel(link_in_dir, inside_file).unwrap, link_in_dir + "/file.rel.in.link").unwrap
+  fsys = fs.dir_fs(inside_dir)
+  dup_dir = tmp_dir + "/copyfs_dup"
+  os.mkdir(dup_dir, 0o755).unwrap
+  os.copy_fs(dup_dir, fsys).unwrap
+  tmp_fsys = fs.dir_fs(dup_dir)
+  fstest.test_fs(tmp_fsys, ["file.in.txt", "out_symlinks/file.abs.out.link", "out_symlinks/file.rel.out.link", "in_symlinks/file.rel.in.link"]).unwrap
+  fs.walk_dir(fsys, ".") { |p, d, _err|
+    en = d.unwrap
+    if !en.is_dir {
+      fi = ~en.info
+      if filepath.ext(p) == ".link" {
+        assert (fi.mode.bits & fs.MODE_SYMLINK) != 0, "original file #{p} should be a symlink"
+        # Go copies the link as a link and then stats through it.
+        tmpfi = ~fs.stat(tmp_fsys, p)
+        assert (tmpfi.mode.bits & fs.MODE_SYMLINK) == 0, "copied file #{p} should not be a symlink"
+      }
+      data = ~fs.read_file(fsys, p)
+      new_data = ~fs.read_file(tmp_fsys, p)
+      assert data == new_data, "file #{p} contents differ"
+      base = filepath.base(p)
+      target = ""
+      target = outside_file if base == "file.abs.out.link" || base == "file.rel.out.link"
+      target = inside_file if base == "file.rel.in.link"
+      if target != "" {
+        assert ~os.read_file(target) == new_data, "file #{p} contents differ from target"
+      }
+    }
+  }.unwrap
+}
+
+# ---------------------------------------------------------------- file_test.go
+
+test "DirFSReadLink" { |t|
+  root = t.temp_dir
+  subdir = root + "/dir"
+  os.mkdir(subdir, 0o777).unwrap
+  links = [
+    (root + "/parent-link", "../foo"),
+    (root + "/sneaky-parent-link", "dir/../../foo"),
+    (root + "/abs-link", root + "/foo"),
+    (root + "/rel-link", "foo"),
+    (root + "/rel-sub-link", "dir/foo"),
+    (subdir + "/parent-link", "../foo"),
+  ]
+  for l in links { os.symlink(l[1], l[0]).unwrap }
+  fsys = fs.dir_fs(root)
+  want = [
+    ("rel-link", "foo"),
+    ("rel-sub-link", "dir/foo"),
+    ("dir/parent-link", "../foo"),
+    ("parent-link", "../foo"),
+    ("sneaky-parent-link", "dir/../../foo"),
+    ("abs-link", root + "/foo"),
+  ]
+  for w in want {
+    r = fs.read_link(fsys, w[0])
+    assert r.ok? && r.unwrap == w[1], "fs.ReadLink(fsys, #{w[0]}) = #{r.ok}, #{r.err}; want #{w[1]}"
+  }
+  nonesuch = "dir/nonesuch"
+  e = fs.read_link(fsys, nonesuch).err
+  t.fatal("fs.ReadLink of nonexistent file succeeded") if e == none
+  case e.unwrap {
+    fs.FsError.Path(at) => assert_eq at.path, nonesuch
+    _ => t.fatal("fs.ReadLink error = #{e}; want a PathError")
+  }
+}
+
+test "DirFSLstat" { |t|
+  root = t.temp_dir
+  os.mkdir(root + "/dir", 0o777).unwrap
+  os.symlink("dir", root + "/link").unwrap
+  fsys = fs.dir_fs(root)
+  for w in [("link", fs.MODE_SYMLINK), ("dir", fs.MODE_DIR)] {
+    info = fs.lstat(fsys, w[0]).unwrap
+    assert_eq info.mode.type.bits, w[1]
+  }
+  nonesuch = "dir/nonesuch"
+  e = fs.lstat(fsys, nonesuch).err
+  t.fatal("fs.Lstat of nonexistent file succeeded") if e == none
+  case e.unwrap {
+    fs.FsError.Path(at) => assert_eq at.path, nonesuch
+    _ => t.fatal("fs.Lstat error = #{e}; want a PathError")
+  }
+}
+
+test "DirFSWalkDir" { |pt|
+  root = pt.temp_dir
+  os.mkdir(root + "/dir", 0o777).unwrap
+  os.symlink("dir", root + "/link").unwrap
+  os.write_file(root + "/dir/a", [], 0o666).unwrap
+  fsys = fs.dir_fs(root)
+  pt.run("SymlinkRoot") { |t|
+    want: Map[Str, U32] = {"link" => fs.MODE_DIR, "link/a" => 0}
+    marks: Map[Str, Int] = {}
+    fs.walk_dir(fsys, "link") { |p, entry, err|
+      marks[p] += 1
+      if want.key?(p) {
+        w = want[p]
+        got = entry.unwrap.type.bits
+        t.error("#{p} entry type = #{got}; want #{w}") if got != w
+      } else {
+        t.error("Unexpected path #{p} in walk")
+      }
+      t.error("#{p}: #{err}") if err != none
+    }.unwrap
+    for p, _w in want {
+      assert (marks.key?(p) ? marks[p] : 0) == 1, "#{p} visited #{marks.key?(p) ? marks[p] : 0} times; expected 1"
+    }
+  }
+  pt.run("SymlinkPresent") { |t|
+    want: Map[Str, U32] = {"." => fs.MODE_DIR, "dir" => fs.MODE_DIR, "dir/a" => 0, "link" => fs.MODE_SYMLINK}
+    marks: Map[Str, Int] = {}
+    fs.walk_dir(fsys, ".") { |p, entry, err|
+      marks[p] += 1
+      if want.key?(p) {
+        w = want[p]
+        got = entry.unwrap.type.bits
+        t.error("#{p} entry type = #{got}; want #{w}") if got != w
+      } else {
+        t.error("Unexpected path #{p} in walk")
+      }
+      t.error("#{p}: #{err}") if err != none
+    }.unwrap
+    for p, _w in want {
+      assert (marks.key?(p) ? marks[p] : 0) == 1, "#{p} visited #{marks.key?(p) ? marks[p] : 0} times; expected 1"
+    }
+  }
+}

@@ -1,0 +1,213 @@
+#![overflow(wrap)]
+# SVCB and HTTPS resources (RFC 9460): Go's svcb.go. See dnsmessage.alx for
+# how Go's API maps here.
+
+# An SVCB resource body.
+pub struct SVCBResource {
+  priority: U16
+  target: Name
+  # In strictly increasing order by key.
+  params: [SVCParam]
+
+  pub def real_type -> U16 { TYPE_SVCB }
+  pub def body -> ResourceBody { ResourceBody.SVCB(priority: priority, target: target, params: params) }
+
+  # The same record as an HTTPS resource body.
+  pub def https_resource -> HTTPSResource { HTTPSResource.new(priority: priority, target: target, params: params) }
+
+  pub def go_string -> Str {
+    "dnsmessage.SVCBResource{" +
+      "Priority: " + print_u16(priority) + ", " +
+      "Target: " + target.go_string + ", " +
+      "Params: []dnsmessage.SVCParam{" +
+      join_go(params.map { it.go_string }) + "}}"
+  }
+
+  # The value of the parameter with this key, if it is there.
+  pub def get_param(key: U16) -> [Byte]? { params_get(params, key) }
+
+  # Sets a parameter, keeping the parameters sorted by key.
+  pub def set_param!(key: U16, value: [Byte]) { self.params = params_set(params, key, value) }
+
+  # Removes the parameter with this key; whether it was there.
+  pub def delete_param!(key: U16) -> Bool {
+    ps, found = params_delete(params, key)
+    self.params = ps
+    found
+  }
+
+  def pack_rdata(msg: [Byte]) -> ~[Byte] {
+    out = pack_u16(msg, priority)
+    out = target.pack_name(out, none, 0).rescue { |e|
+      fail nest("SVCBResource.Target", e)
+      []
+    }
+    previous_key: U16 = 0
+    for i in 0...params.size {
+      param = params[i]
+      fail nest("SVCBResource.Params", DnsMessageError.ParamOutOfOrder) if i > 0 && param.key <= previous_key
+      fail nest("SVCBResource.Params", DnsMessageError.TooLongSVCBValue) if param.value.size > 65535
+      out = pack_u16(out, param.key)
+      out = pack_u16(out, param.value.size.as_u16)
+      out = out + param.value
+      previous_key = param.key
+    }
+    out
+  }
+}
+
+# An HTTPS resource body: an SVCB record for HTTPS (Go embeds SVCBResource;
+# here the fields are its own).
+pub struct HTTPSResource {
+  priority: U16
+  target: Name
+  params: [SVCParam]
+
+  pub def real_type -> U16 { TYPE_HTTPS }
+  pub def body -> ResourceBody { ResourceBody.HTTPS(priority: priority, target: target, params: params) }
+
+  # The same record as an SVCB resource body (Go's r.SVCBResource).
+  pub def svcb_resource -> SVCBResource { SVCBResource.new(priority: priority, target: target, params: params) }
+
+  pub def go_string -> Str { "dnsmessage.HTTPSResource{SVCBResource: " + svcb_resource.go_string + "}" }
+
+  pub def get_param(key: U16) -> [Byte]? { params_get(params, key) }
+  pub def set_param!(key: U16, value: [Byte]) { self.params = params_set(params, key, value) }
+
+  pub def delete_param!(key: U16) -> Bool {
+    ps, found = params_delete(params, key)
+    self.params = ps
+    found
+  }
+}
+
+def params_get(params: [SVCParam], key: U16) -> [Byte]? {
+  for p in params {
+    return p.value if p.key == key
+    break if p.key > key
+  }
+  none
+}
+
+def params_set(params: [SVCParam], key: U16, value: [Byte]) -> [SVCParam] {
+  i = 0
+  while i < params.size {
+    break if params[i].key >= key
+    i += 1
+  }
+  if i < params.size && params[i].key == key {
+    params[i].value = value
+    return params
+  }
+  out: [SVCParam] = []
+  out = out + params[0...i]
+  out << SVCParam.new(key: key, value: value)
+  out + params[i...params.size]
+}
+
+def params_delete(params: [SVCParam], key: U16) -> ([SVCParam], Bool) {
+  for i in 0...params.size {
+    if params[i].key == key {
+      out: [SVCParam] = []
+      out = out + params[0...i] + params[i + 1...params.size]
+      return (out, true)
+    }
+    break if params[i].key > key
+  }
+  (params, false)
+}
+
+# A service parameter: a key and its value in wire format.
+pub struct SVCParam {
+  key: U16
+  value: [Byte]
+
+  pub def go_string -> Str {
+    "dnsmessage.SVCParam{" +
+      "Key: " + svc_param_key_go_string(key) + ", " +
+      "Value: []byte{" + print_byte_slice(value) + "}}"
+  }
+}
+
+# Service parameter keys (Go's SVCParamKey values).
+pub SVC_PARAM_MANDATORY: U16 = 0
+pub SVC_PARAM_ALPN: U16 = 1
+pub SVC_PARAM_NO_DEFAULT_ALPN: U16 = 2
+pub SVC_PARAM_PORT: U16 = 3
+pub SVC_PARAM_IPV4_HINT: U16 = 4
+pub SVC_PARAM_ECH: U16 = 5
+pub SVC_PARAM_IPV6_HINT: U16 = 6
+pub SVC_PARAM_DOH_PATH: U16 = 7
+pub SVC_PARAM_OHTTP: U16 = 8
+pub SVC_PARAM_TLS_SUPPORTED_GROUPS: U16 = 9
+
+def svc_param_key_name(k: U16) -> Str {
+  case k {
+    0 => "Mandatory"
+    1 => "ALPN"
+    2 => "NoDefaultALPN"
+    3 => "Port"
+    4 => "IPv4Hint"
+    5 => "ECH"
+    6 => "IPv6Hint"
+    7 => "DOHPath"
+    8 => "OHTTP"
+    9 => "TLSSupportedGroups"
+    _ => ""
+  }
+}
+
+# The name of a parameter key ("ALPN"), or its number (Go's SVCParamKey.String).
+pub def svc_param_key_string(k: U16) -> Str {
+  n = svc_param_key_name(k)
+  n == "" ? print_u16(k) : n
+}
+
+# Go's SVCParamKey.GoString.
+pub def svc_param_key_go_string(k: U16) -> Str {
+  n = svc_param_key_name(k)
+  n == "" ? print_u16(k) : "dnsmessage.SVCParam" + n
+}
+
+def unpack_svcb_resource(msg: [Byte], off: Int, length: U16) -> ~SVCBResource {
+  r = SVCBResource.new()
+  body_end = off + length.to_i
+  priority = unpack_u16(msg, off).rescue { |e| fail nest("Priority", e) }
+  params_off = off + 2
+  r.priority = priority
+  params_off = r.target.unpack_name!(msg, params_off).rescue { |e| fail nest("Target", e) }
+
+  # First pass: validate the parameters.
+  n = 0
+  o = params_off
+  previous_key: U16 = 0
+  while o < body_end {
+    key = unpack_u16(msg, o).rescue { |e| fail nest("Params key", e) }
+    o2 = o + 2
+    fail nest("Params", DnsMessageError.ParamOutOfOrder) if n > 0 && key <= previous_key
+    size = unpack_u16(msg, o2).rescue { |e| fail nest("Params value length", e) }
+    o3 = o2 + 2
+    fail DnsMessageError.ResourceLen if o3 + size.to_i > body_end
+    o = o3 + size.to_i
+    previous_key = key
+    n += 1
+  }
+  fail DnsMessageError.ResourceLen if o != body_end
+
+  # Second pass: copy them out.
+  params: [SVCParam] = []
+  o = params_off
+  for _i in 0...n {
+    key = unpack_u16(msg, o).rescue { |e| fail nest("param key", e) }
+    o2 = o + 2
+    size = unpack_u16(msg, o2).rescue { |e| fail nest("param length", e) }
+    o3 = o2 + 2
+    fail nest("param value", DnsMessageError.CalcLen) if msg.size - o3 < size.to_i
+    value: [Byte] = [0; size.to_i]
+    copy(value, msg[o3...o3 + size.to_i])
+    params << SVCParam.new(key: key, value: value)
+    o = o3 + size.to_i
+  }
+  r.params = params
+  r
+}

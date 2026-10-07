@@ -1,0 +1,194 @@
+#![test(external)]
+# Go's flag examples (example_test.go, example_flagset_test.go,
+# example_func_test.go, example_textvar_test.go, example_value_test.go),
+# translated. Go's Example defines its flags on CommandLine in init and
+# never parses (no output); here they go on a FlagSet that parses a list,
+# with the output Go prints for the same program. net.IP is a small IP
+# type over netip.Addr.
+
+import "flag"
+import "io"
+import "net/netip"
+import "net/url"
+import "os"
+import "strings"
+import "time"
+
+# Go's interval: a []time.Duration Value set once from a comma list.
+struct Interval {
+  st: [[time.Duration]]
+
+  pub def to_s -> Str {
+    s = "["
+    if st.size > 0 {
+      i = 0
+      while i < st[0].size {
+        s += " " if i > 0
+        s += st[0][i].to_s
+        i += 1
+      }
+    }
+    s + "]"
+  }
+
+  pub def set!(value: Str) -> ~Unit {
+    fail "interval flag already set" if st[0].size > 0
+    for dt in strings.split(value, ",") {
+      d = ~time.parse_duration(dt)
+      self.st[0] << d
+    }
+  }
+}
+
+example "Example" {
+  fs = flag.new_flag_set("example", flag.CONTINUE_ON_ERROR)
+  fs.set_output!(os.stdout)
+  species = fs.string!("species", "gopher", "the species we are studying")
+  gopher_type = Atomic.new("")
+  fs.string_var!(gopher_type, "gopher_type", "pocket", "the variety of gopher")
+  fs.string_var!(gopher_type, "g", "pocket", "the variety of gopher (shorthand)")
+  e: [time.Duration] = []
+  interval_flag = Interval.new(st: [e])
+  fs.var!(interval_flag, "deltaT", "comma-separated list of intervals to use between events")
+  fs.parse!(["-species", "mole", "-g", "eastern", "-deltaT", "1m,90s,2h", "rest"]).unwrap
+  puts "#{species.load} #{gopher_type.load} #{interval_flag.to_s} #{fs.args}"
+  _r = fs.parse!(["-deltaT", "1s"])
+  fs.print_defaults
+} outputs "mole eastern [1m0s 1m30s 2h0m0s] [rest]\ninvalid value \"1s\" for flag -deltaT: interval flag already set\nUsage of example:\n  -deltaT value\n    \tcomma-separated list of intervals to use between events\n  -g string\n    \tthe variety of gopher (shorthand) (default \"pocket\")\n  -gopher_type string\n    \tthe variety of gopher (default \"pocket\")\n  -species string\n    \tthe species we are studying (default \"gopher\")\n  -deltaT value\n    \tcomma-separated list of intervals to use between events\n  -g string\n    \tthe variety of gopher (shorthand) (default \"pocket\")\n  -gopher_type string\n    \tthe variety of gopher (default \"pocket\")\n  -species string\n    \tthe species we are studying (default \"gopher\")\n"
+
+def start(args: [Str]) {
+  fs = flag.new_flag_set("start", flag.CONTINUE_ON_ERROR)
+  fs.set_output!(io.Discard.new) # Go: stderr, not in the output
+  addr = fs.string!("addr", ":8080", "`address` to listen on")
+  if e = fs.parse!(args).err {
+    print "error: #{e.message}"
+    return
+  }
+  puts "starting server on #{addr.load}"
+}
+
+def stop(args: [Str]) {
+  fs = flag.new_flag_set("stop", flag.CONTINUE_ON_ERROR)
+  fs.set_output!(io.Discard.new) # Go: stderr, not in the output
+  timeout = fs.duration!("timeout", time.second, "stop timeout duration")
+  if e = fs.parse!(args).err {
+    print "error: #{e.message}"
+    return
+  }
+  puts "stopping server (timeout=#{timeout.load})"
+}
+
+def httpd(args: [Str]) {
+  sub = args[2...args.size]
+  case args[1] {
+    "start" => start(sub)
+    "stop" => stop(sub)
+    _ => puts "error: unknown command - #{args[1]}"
+  }
+}
+
+example "FlagSet" {
+  httpd(["httpd", "start", "-addr", ":9999"])
+  httpd(["httpd", "stop"])
+  httpd(["http", "start", "-log-level", "verbose"])
+} outputs "starting server on :9999\nstopping server (timeout=1s)\nerror: flag provided but not defined: -log-level"
+
+def show_ip(ip: netip.Addr?) -> Str {
+  if a = ip {
+    return "{ip: #{a}, loopback: #{a.loopback?}}"
+  }
+  "{ip: <nil>, loopback: false}"
+}
+
+example "Func" {
+  fs = flag.new_flag_set("ExampleFunc", flag.CONTINUE_ON_ERROR)
+  fs.set_output!(os.stdout)
+  ip: netip.Addr? = none
+  fs.func!("ip", "`IP address` to parse") { |s|
+    r = netip.parse_addr(s)
+    ip = r.ok
+    fail "could not parse IP" if r.err?
+  }
+  _r = fs.parse!(["-ip", "127.0.0.1"])
+  puts show_ip(ip)
+  puts ""
+  _r2 = fs.parse!(["-ip", "256.0.0.1"])
+  puts show_ip(ip)
+  puts ""
+} outputs "{ip: 127.0.0.1, loopback: true}\n\ninvalid value \"256.0.0.1\" for flag -ip: could not parse IP\nUsage of ExampleFunc:\n  -ip IP address\n    \tIP address to parse\n{ip: <nil>, loopback: false}\n\n"
+
+example "BoolFunc" {
+  fs = flag.new_flag_set("ExampleBoolFunc", flag.CONTINUE_ON_ERROR)
+  fs.set_output!(os.stdout)
+  fs.bool_func!("log", "logs a dummy message") { |s| puts "dummy message: #{s}" }
+  _r = fs.parse!(["-log"])
+  _r2 = fs.parse!(["-log=0"])
+} outputs "dummy message: true\ndummy message: 0\n"
+
+# Go's net.IP, as far as TextVar needs it.
+struct IP {
+  addr: netip.Addr?
+
+  pub def unmarshal_text!(text: [Byte]) -> ~Unit {
+    s = Str.from_bytes(text)
+    r = netip.parse_addr(s)
+    fail "invalid IP address: #{s}" if r.err?
+    self.addr = r.unwrap
+  }
+
+  pub def marshal_text -> [Byte] {
+    if a = addr {
+      return a.to_s.bytes.to_a
+    }
+    []
+  }
+
+  pub def to_s -> Str {
+    if a = addr {
+      return a.to_s
+    }
+    "<nil>"
+  }
+}
+
+example "TextVar" {
+  fs = flag.new_flag_set("ExampleTextVar", flag.CONTINUE_ON_ERROR)
+  fs.set_output!(os.stdout)
+  ip = Atomic.new(IP.new)
+  fs.text_var!(ip, "ip", IP.new(addr: netip.parse_addr("192.168.0.100").unwrap), "`IP address` to parse")
+  _r = fs.parse!(["-ip", "127.0.0.1"])
+  puts "{ip: #{ip.load}}"
+  puts ""
+  ip.store(IP.new)
+  _r2 = fs.parse!(["-ip", "256.0.0.1"])
+  puts "{ip: #{ip.load}}"
+  puts ""
+} outputs "{ip: 127.0.0.1}\n\ninvalid value \"256.0.0.1\" for flag -ip: invalid IP address: 256.0.0.1\nUsage of ExampleTextVar:\n  -ip IP address\n    \tIP address to parse (default 192.168.0.100)\n{ip: <nil>}\n\n"
+
+# Go's URLValue: the parsed URL goes to a shared cell (Go: *url.URL), a
+# one-element slice (D36; a Value needs a zero value, which an Atomic
+# field doesn't have).
+struct URLValue {
+  u: [url.Url]
+
+  pub def to_s -> Str {
+    if u.size > 0 {
+      return u[0].to_s
+    }
+    ""
+  }
+
+  pub def set!(s: Str) -> ~Unit {
+    v = ~url.parse(s)
+    self.u[0] = v
+  }
+}
+
+example "Value" {
+  cell = [url.Url.new]
+  fs = flag.new_flag_set("ExampleValue", flag.EXIT_ON_ERROR)
+  fs.var!(URLValue.new(u: cell), "url", "URL to parse")
+  fs.parse!(["-url", "https://golang.org/pkg/flag/"]).unwrap
+  v = cell[0]
+  puts "{scheme: \"#{v.scheme}\", host: \"#{v.host}\", path: \"#{v.path}\"}"
+} outputs "{scheme: \"https\", host: \"golang.org\", path: \"/pkg/flag/\"}\n"

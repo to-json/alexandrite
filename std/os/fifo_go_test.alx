@@ -1,0 +1,218 @@
+#![test(external)]
+# Go's os/fifo_test.go, exec_test.go and copy_test.go (TestCopyFileToFile),
+# translated.
+
+import "os"
+import "os/signal"
+import "io"
+import "bufio"
+import "bytes"
+import "time"
+
+extern def c_mkfifo(p: Str, mode: I32) -> I32 = "mkfifo"
+extern def c_fcntl(fd: I32, cmd: I32) -> I32 = "fcntl"
+
+def mkfifo(name: Str) {
+  assert c_mkfifo(name, 0o600) == 0, "mkfifo #{name} failed"
+}
+
+# F_GETFL is 3 on macOS and Linux; O_NONBLOCK 4 (macOS) or 0o4000 (Linux),
+# bits the other doesn't use.
+def nonblock?(fd: Int) -> Bool {
+  fl = c_fcntl(fd.to_i32, 3).to_i
+  (fl & 4) != 0 || (fl & 0o4000) != 0
+}
+
+# Go's testPipeEOF over any reader and writer.
+def test_pipe_eof(r: os.File, w: os.File) {
+  park_delay = time.millisecond * 10
+  write = Chan[Int].new(1)
+  wr = write
+  wf = w
+  writer = spawn {
+    f = wf
+    loop {
+      i = wr.recv
+      break if i == none
+      time.sleep(park_delay)
+      f.write_string!("line #{i.unwrap}\n").unwrap
+    }
+    time.sleep(park_delay)
+    f.close!.unwrap
+    0
+  }
+  rbuf = bufio.new_reader(r)
+  for i in 0...3 {
+    write << i
+    b = rbuf.read_bytes!(10).unwrap.unwrap
+    assert_eq Str.from_bytes(b), "line #{i}\n"
+  }
+  write.close
+  assert rbuf.read_bytes!(10).unwrap == none, "ReadBytes: want none at EOF"
+  writer.wait.unwrap
+  r.close!.unwrap
+}
+
+# Opening a FIFO's read end waits for a writer: in a task, that must not
+# stop the worker the writer's task may need (port-issues #166).
+test "FifoEOF" { |t|
+  fifo_name = t.temp_dir + "/fifo"
+  mkfifo(fifo_name)
+  rc = Chan[os.File].new(1)
+  ch = rc
+  name = fifo_name
+  spawn {
+    ch << os.open(name).unwrap
+  }
+  w = os.open_file(fifo_name, os.O_WRONLY, 0).unwrap
+  r = rc.recv.unwrap
+  test_pipe_eof(r, w)
+}
+
+test "NonPollable" { |t|
+  non_pollable = "/dev/net/tun"
+  f = os.open_file(non_pollable, os.O_RDWR, 0)
+  t.skip("can't open #{non_pollable}: #{f.err}") if f.err?
+  ff = f.unwrap
+  ff.close!.unwrap
+  attempts = 2000
+  start = Chan[Bool].new(0)
+  st = start
+  opener = spawn {
+    st.close
+    for _i in 0...attempts {
+      g = os.open_file(non_pollable, os.O_RDWR, 0).unwrap
+      g.close!.unwrap
+    }
+    0
+  }
+  dir = t.temp_dir
+  start.recv
+  for i in 0...attempts {
+    name = "#{dir}/#{i}"
+    mkfifo(name)
+    rd = os.open_file(name, os.O_RDONLY | os.O_NONBLOCK, 0o600).unwrap
+    wr = os.open_file(name, os.O_WRONLY | os.O_NONBLOCK, 0o600).unwrap
+    msg = "message"
+    wr.write!(msg.bytes.to_a).unwrap
+    b: [Byte] = [0; 7]
+    rd.read!(b).unwrap
+    rd.close!.unwrap
+    wr.close!.unwrap
+  }
+  opener.wait.unwrap
+}
+
+test "OpenFileNonBlocking" { |t|
+  name = t.temp_dir + "/f"
+  os.write_file(name, "x".bytes, 0o666).unwrap
+  f = os.open_file(name, os.O_RDONLY | os.O_NONBLOCK, 0o666).unwrap
+  assert nonblock?(f.fd), "file opened with O_NONBLOCK but in blocking mode"
+  f.close!.unwrap
+}
+
+test "FIFONonBlockingEOF" { |t|
+  fifo_name = t.temp_dir + "/issue-66239-fifo"
+  mkfifo(fifo_name)
+  r = os.open_file(fifo_name, os.O_RDONLY | os.O_NONBLOCK, 0).unwrap
+  w = os.open_file(fifo_name, os.O_WRONLY, 0).unwrap
+  data = "Hello Gophers!"
+  w.write_string!(data).unwrap
+  wc = w
+  closer = spawn {
+    time.sleep(time.millisecond * 200)
+    f = wc
+    f.close!.unwrap
+    0
+  }
+  buf: [Byte] = [0; data.size]
+  n = io.read_full(r, buf).unwrap
+  assert n == data.size && Str.from_bytes(buf) == data, "ReadFull: got #{Str.from_bytes(buf)}, want #{data}"
+  # Go loops, skipping EAGAIN, until io.EOF; reads wait here, so the next
+  # one returns 0 once the writer closes.
+  assert_eq r.read!(buf).unwrap, 0
+  closer.wait.unwrap
+  r.close!.unwrap
+}
+
+# ----------------------------------------------------------------- exec_test.go
+
+test "ProcessLiteral" {
+  c = Chan[signal.Signal].new(1)
+  n = signal.notify(c, [signal.interrupt])
+  p = os.new_process(os.getpid)
+  p.signal(os.INTERRUPT).unwrap
+  got = false
+  select {
+    when v = c.recv => got = v != none
+    when _ = time.after(time.second).recv => got = false
+  }
+  n.stop
+  assert got, "timeout waiting for signal"
+}
+
+test "ProcessReleaseTwice" {
+  r, w = os.pipe.unwrap
+  files: [os.File?] = [r, w, w]
+  p = os.start_process("/usr/bin/true", ["true"], os.ProcAttr.new(dir: "", env: none, files: files)).unwrap
+  p.release!.unwrap
+  # Go wants EINVAL from a second Release only on Windows.
+  assert p.release!.ok?, "second Release failed"
+  r.close!.unwrap
+  w.close!.unwrap
+}
+
+# ----------------------------------------------------------------- copy_test.go
+
+# Go's newRandReader: pseudo-random bytes.
+def rand_bytes(n: Int) -> [Byte] {
+  out: [Byte] = [0; n]
+  s = 88172645463325252
+  for i in 0...n {
+    s = s ^ (s << 13)
+    s = s ^ (s >> 7)
+    s = s ^ (s << 17)
+    out[i] = (s & 255).as_u8
+  }
+  out
+}
+
+test "CopyFileToFile" { |pt|
+  size = 1024 * 1024
+  dir = pt.temp_dir
+  src = os.create(dir + "/src").unwrap
+  data = rand_bytes(size)
+  io.copy_n(src, bytes.new_buffer(data.dup), size).unwrap
+  src.seek!(0, 0).unwrap
+  for src_start in [0, 100, size] {
+    remaining = size - src_start
+    for dst_start in [0, 200] {
+      for limit in [remaining, remaining - 100, size * 2, 0] {
+        next if limit < 0
+        pt.run("srcStart=#{src_start}/dstStart=#{dst_start}/limit=#{limit}") { |t|
+          dst = os.create_temp(dir, "dst").unwrap
+          s = src
+          s.seek!(src_start, io.SEEK_START).unwrap
+          zeros: [Byte] = [0; dst_start]
+          dst.write!(zeros).unwrap
+          r = limit == 0 ? io.copy(dst, s) : io.copy_n(dst, s, limit)
+          if limit > remaining {
+            assert r.err?, "Copy: want an error at the end"
+          } else {
+            assert r.ok?, "Copy: #{r.err}; want nil"
+          }
+          want_copied = remaining
+          want_copied = limit < want_copied ? limit : want_copied if limit != 0
+          assert_eq r.unwrap, want_copied if r.ok?
+          dst.close!.unwrap
+          got = os.read_file(dst.name).unwrap
+          os.remove(dst.name).unwrap
+          assert_eq got.size, dst_start + want_copied
+          assert got[dst_start...got.size] == data[src_start...src_start + want_copied], "copied bytes differ"
+          assert_eq s.seek!(0, io.SEEK_CURRENT).unwrap, src_start + want_copied
+        }
+      }
+    }
+  }
+  src.close!.unwrap
+}

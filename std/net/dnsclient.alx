@@ -1,0 +1,871 @@
+# The package's own DNS client (Go's dnsclient.go, dnsclient_unix.go and
+# the DNS half of lookup.go): queries the servers of resolv.conf over UDP
+# (TCP for truncated answers or `options use-vc`), with the search list,
+# rotation, attempts and timeouts of resolv.conf, and the hosts file in the
+# order nsswitch.conf gives.
+
+import "context"
+import "golang.org/x/net/dns/dnsmessage"
+import "math/rand"
+import "slices"
+import "time"
+
+# Go's maxDNSPacketSize (https://dnsflagday.net/2020/).
+MAX_DNS_PACKET_SIZE = 1232
+
+# Go's errLameReferral, errCannotUnmarshalDNSMessage, ... texts.
+ERR_LAME_REFERRAL = "lame referral"
+ERR_CANNOT_UNMARSHAL_DNS_MESSAGE = "cannot unmarshal DNS message"
+ERR_CANNOT_MARSHAL_DNS_MESSAGE = "cannot marshal DNS message"
+ERR_SERVER_MISBEHAVING = "server misbehaving"
+ERR_INVALID_DNS_RESPONSE = "invalid DNS response"
+ERR_NO_ANSWER_FROM_DNS_SERVER = "no answer from DNS server"
+
+# The DNS client's own errors (Go's errNoSuchHost, errLameReferral,
+# errServerTemporarilyMisbehaving, ...): their text, whether temporary,
+# whether "not found".
+error DnsClientError {
+  Err(text: Str, temporary: Bool, not_found: Bool)
+
+  def message -> Str {
+    case self {
+      Err(t, _, _) => t
+    }
+  }
+
+  def timeout? -> Bool { false }
+
+  def temporary? -> Bool {
+    case self {
+      Err(_, tmp, _) => tmp
+    }
+  }
+}
+
+def client_error(text: Str) -> DnsClientError { DnsClientError.Err(text, false, false) }
+
+def err_no_such_host -> DnsClientError { DnsClientError.Err(ERR_NO_SUCH_HOST, false, true) }
+
+def no_such_host?(e: Error) -> Bool {
+  case e {
+    DnsClientError.Err(t, _, nf) => nf && t == ERR_NO_SUCH_HOST
+    _ => false
+  }
+}
+
+def client_error_text?(e: Error, text: Str) -> Bool {
+  case e {
+    DnsClientError.Err(t, _, _) => t == text
+    _ => false
+  }
+}
+
+# Go's net.Error Timeout() and Temporary() of any error.
+def err_timeout?(e: Error) -> Bool {
+  case e {
+    NetError.Timeout => true
+    NetError.Other(at) => NetError.Other(at).timeout?
+    NetError.Lookup(at) => NetError.Lookup(at).timeout?
+    DNSError.Lookup(d) => d.is_timeout
+    _ => false
+  }
+}
+
+def err_temporary?(e: Error) -> Bool {
+  case e {
+    DnsClientError.Err(_, tmp, _) => tmp
+    _ => is_temporary(e)
+  }
+}
+
+# Go's err.(*OpError): a NetError of an operation.
+def op_error?(e: Error) -> Bool {
+  case e {
+    NetError.ConnRefused(at) => at.op != ""
+    NetError.AddrInUse(at) => at.op != ""
+    NetError.Timeout(at) => at.op != ""
+    NetError.Closed(at) => at.op != ""
+    NetError.BadAddr(at) => at.op != ""
+    NetError.Lookup(at) => at.op != ""
+    NetError.Other(at) => at.op != ""
+    _ => false
+  }
+}
+
+# Go's newDNSError.
+def new_dns_error(e: Error, name: Str, server: Str) -> DNSError {
+  case e {
+    DNSError.Lookup(d) => {
+      return DNSError.Lookup(DNSFailure.new(err: d.err, name: name, server: server, is_timeout: d.is_timeout, is_temporary: d.is_temporary, is_not_found: d.is_not_found, ctx_err: d.ctx_err))
+    }
+    _ => nil
+  }
+  DNSError.Lookup(DNSFailure.new(err: e.message, name: name, server: server, is_timeout: err_timeout?(e), is_temporary: err_temporary?(e), is_not_found: no_such_host?(e), ctx_err: ctx_err_of(e)))
+}
+
+# Which context error e is or holds (Go's errors.Is(err,
+# context.Canceled / DeadlineExceeded), with errCanceled and errTimeout
+# counting): a canceled operation, or a timeout that isn't a system call's
+# (alx's errTimeout and a socket deadline's are the same error).
+def ctx_err_of(e: Error) -> Int {
+  case e {
+    context.ContextError.Canceled => return CTX_CANCELED
+    context.ContextError.DeadlineExceeded => return CTX_DEADLINE
+    NetError.Timeout(at) => return at.code == 0 ? CTX_DEADLINE : 0
+    NetError.Other(at) => return at.err == ERR_CANCELED ? CTX_CANCELED : 0
+    NetError.Lookup(at) => {
+      if d = at.dns {
+        return d.ctx_err
+      }
+    }
+    _ => nil
+  }
+  0
+}
+
+def dns_error_with_name(e: Error, name: Str) -> Error {
+  case e {
+    DNSError.Lookup(d) => DNSError.Lookup(DNSFailure.new(err: d.err, name: name, server: d.server, is_timeout: d.is_timeout, is_temporary: d.is_temporary, is_not_found: d.is_not_found, ctx_err: d.ctx_err))
+    _ => e
+  }
+}
+
+def unmarshal_error(name: Str, server: Str) -> DNSError { dns_error(ERR_CANNOT_UNMARSHAL_DNS_MESSAGE, name, server, "") }
+
+# ------------------------------------------------------------ dnsclient.go
+
+# Go's randInt / randIntn.
+def rand_intn(n: Int) -> Int { rand.intn(n) }
+
+# Go's reverseaddr: the in-addr.arpa. or ip6.arpa. name of an address, for
+# PTR lookups.
+def reverseaddr(addr: Str) -> ~Str<DNSError> {
+  ip = parse_ip(addr) || fail dns_error("unrecognized address", addr, "", "")
+  b = ip.to16.unwrap.bytes
+  if ip.to4.present? {
+    return "#{b[15]}.#{b[14]}.#{b[13]}.#{b[12]}.in-addr.arpa."
+  }
+  buf: [Byte] = []
+  i = b.size - 1
+  while i >= 0 {
+    v = b[i]
+    buf << HEX_DIGIT[v & 0xf]
+    buf << 46
+    buf << HEX_DIGIT[v >> 4]
+    buf << 46
+    i -= 1
+  }
+  Str.from_bytes(buf) + "ip6.arpa."
+}
+
+# Go's equalASCIIName: names equal ignoring ASCII case.
+def equal_ascii_name?(x: dnsmessage.Name, y: dnsmessage.Name) -> Bool {
+  return false if x.length != y.length
+  for i in 0...x.length.to_i {
+    a = x.data[i]
+    b = y.data[i]
+    a += 0x20 if a >= 65 && a <= 90
+    b += 0x20 if b >= 65 && b <= 90
+    return false if a != b
+  }
+  true
+}
+
+# Go's SRV: one DNS SRV record.
+pub struct SRV {
+  target: Str
+  port: Int
+  priority: Int
+  weight: Int
+}
+
+# Go's MX: one DNS MX record.
+pub struct MX {
+  host: Str
+  pref: Int
+}
+
+# Go's NS: one DNS NS record.
+pub struct NS {
+  host: Str
+}
+
+# Go's byPriorityWeight.shuffleByWeight on addrs[lo...hi] (RFC 2782).
+def shuffle_by_weight(addrs: [SRV], lo0: Int, hi: Int) {
+  lo = lo0
+  sum = 0
+  for i in lo...hi {
+    sum += addrs[i].weight
+  }
+  while sum > 0 && hi - lo > 1 {
+    s = 0
+    n = rand_intn(sum)
+    for i in lo...hi {
+      s += addrs[i].weight
+      if s > n {
+        if i > lo {
+          t = addrs[lo]
+          addrs[lo] = addrs[i]
+          addrs[i] = t
+        }
+        break
+      }
+    }
+    sum -= addrs[lo].weight
+    lo += 1
+  }
+}
+
+# Go's byPriorityWeight.sort: by priority, shuffled by weight within one
+# (RFC 2782).
+def sort_srv(addrs: [SRV]) {
+  slices.sort_func(addrs, ->(a: SRV, b: SRV) -> Int {
+    return a.priority < b.priority ? -1 : 1 if a.priority != b.priority
+    return 0 if a.weight == b.weight
+    a.weight < b.weight ? -1 : 1
+  })
+  i = 0
+  for j in 1...addrs.size {
+    if addrs[i].priority != addrs[j].priority {
+      shuffle_by_weight(addrs, i, j)
+      i = j
+    }
+  }
+  shuffle_by_weight(addrs, i, addrs.size)
+}
+
+# Go's byPref.sort: shuffled, then by preference (RFC 5321).
+def sort_mx(s: [MX]) {
+  for i in 0...s.size {
+    j = rand_intn(i + 1)
+    t = s[i]
+    s[i] = s[j]
+    s[j] = t
+  }
+  slices.sort_func(s, ->(a: MX, b: MX) -> Int {
+    return 0 if a.pref == b.pref
+    a.pref < b.pref ? -1 : 1
+  })
+}
+
+# ------------------------------------------------------- dnsclient_unix.go
+
+# Whether to send an EDNS0 additional header (Go's GODEBUG netedns0;
+# ALX_NETEDNS0=0 turns it off).
+NETEDNS0 = Atomic.new(true)
+
+# Go's newRequest: a query's id and its UDP and TCP (length-prefixed)
+# encodings.
+def new_request(q: dnsmessage.Question, ad: Bool) -> ~(U16, [Byte], [Byte]) {
+  id = rand_intn(65536).to_u16
+  b = dnsmessage.new_builder([0, 0], dnsmessage.Header.new(id: id, recursion_desired: true, authentic_data: ad))
+  b.~start_questions!
+  b.~question!(q)
+  if NETEDNS0.load {
+    b.~start_additionals!
+    rh = dnsmessage.ResourceHeader.new
+    rh.~set_edns0!(MAX_DNS_PACKET_SIZE, dnsmessage.RCODE_SUCCESS, false)
+    b.~opt_resource!(rh, dnsmessage.OPTResource.new)
+  }
+  tcp_req = b.~finish!
+  udp_req = tcp_req[2...tcp_req.size]
+  l = tcp_req.size - 2
+  tcp_req[0] = ((l >> 8) & 0xff).to_u8
+  tcp_req[1] = (l & 0xff).to_u8
+  (id, udp_req, tcp_req)
+}
+
+# Go's checkResponse.
+def check_response?(req_id: U16, req_q: dnsmessage.Question, resp_h: dnsmessage.Header, resp_q: dnsmessage.Question) -> Bool {
+  return false unless resp_h.response
+  return false if req_id != resp_h.id
+  req_q.type == resp_q.type && req_q.class == resp_q.class && equal_ascii_name?(req_q.name, resp_q.name)
+}
+
+# Go's dnsPacketRoundTrip: invalid answers are ignored (they may be
+# forgeries, golang.org/issue/13281) until a good one or the deadline.
+def dns_packet_round_trip(c: Conn, id: U16, query: dnsmessage.Question, b: [Byte]) -> ~(dnsmessage.Parser, dnsmessage.Header) {
+  c.~write!(b)
+  buf: [Byte] = [0; MAX_DNS_PACKET_SIZE]
+  loop {
+    n = c.~read!(buf)
+    fail io_eof if n == 0
+    p = dnsmessage.Parser.new
+    hr = p.start!(buf[0...n].dup)
+    next if hr.err?
+    qr = p.question!
+    next if qr.err?
+    next unless check_response?(id, query, hr.unwrap, qr.unwrap)
+    return (p, hr.unwrap)
+  }
+  fail io_eof
+}
+
+# Go's io.EOF, for a connection closed before an answer.
+def io_eof -> DnsClientError { client_error("EOF") }
+
+# Go's io.ReadFull: n bytes into b.
+def read_full(c: Conn, b: [Byte], n: Int) -> ~Unit {
+  got = 0
+  while got < n {
+    m = c.~read!(b[got...n])
+    if m == 0 {
+      fail io_eof if got == 0
+      fail client_error("unexpected EOF")
+    }
+    got += m
+  }
+}
+
+# Go's dnsStreamRoundTrip.
+def dns_stream_round_trip(c: Conn, id: U16, query: dnsmessage.Question, b: [Byte]) -> ~(dnsmessage.Parser, dnsmessage.Header) {
+  c.~write!(b)
+  lb: [Byte] = [0; 2]
+  ~read_full(c, lb, 2)
+  l = lb[0].to_i << 8 | lb[1].to_i
+  buf: [Byte] = [0; l]
+  ~read_full(c, buf, l)
+  p = dnsmessage.Parser.new
+  hr = p.start!(buf)
+  fail client_error(ERR_CANNOT_UNMARSHAL_DNS_MESSAGE) if hr.err?
+  qr = p.question!
+  fail client_error(ERR_CANNOT_UNMARSHAL_DNS_MESSAGE) if qr.err?
+  fail client_error(ERR_INVALID_DNS_RESPONSE) unless check_response?(id, query, hr.unwrap, qr.unwrap)
+  (p, hr.unwrap)
+}
+
+# Whether c carries datagrams (Go's c.(PacketConn)): a UDP, IP or unixgram
+# socket, or a datagram pipe (packet_pipe, for tests' fake servers). A
+# plain pipe is a stream, as Go's.
+def packet_conn?(c: Conn) -> Bool {
+  n = c.nfd.net
+  n.start_with?("udp") || n.start_with?("ip") || n == "unixgram" || n == "packetpipe"
+}
+
+# A pipe whose first end the DNS client treats as a datagram connection
+# (tests' fake DNS servers, as Go's fakeDNSPacketConn).
+def packet_pipe -> (Conn, Conn) {
+  c, s = pipe
+  pe = c.pp.unwrap
+  (Conn.new(nfd: new_fd(-1, 0, 0, "packetpipe", none, none, false), pp: pe), s)
+}
+
+# Go's Resolver.dial: the resolver's dial function, or a Dialer's.
+def resolver_dial(r: Resolver, ctx: context.Context, network: Str, server: Str) -> ~Conn {
+  res = r.dial.present? ? r.dial.unwrap.call(ctx, network, server) : Dialer.new.dial_context(ctx, network, server)
+  if e = res.err {
+    fail map_err(e)
+  }
+  res.unwrap
+}
+
+# Go's mapErr: context errors as errCanceled / errTimeout.
+def map_err(e: Error) -> Error {
+  case e {
+    context.ContextError.Canceled => wrap_error("", "", "", "", "", ERR_CANCELED)
+    context.ContextError.DeadlineExceeded => timeout_error("", "", "", "")
+    _ => e
+  }
+}
+
+# Go's Resolver.exchange: one query to one server (over UDP, retried over
+# TCP when the answer is truncated, or over TCP only).
+def exchange(r: Resolver, ctx0: context.Context, server: Str, q0: dnsmessage.Question, timeout_ns: Int, use_tcp: Bool, ad: Bool) -> ~(dnsmessage.Parser, dnsmessage.Header) {
+  q = dnsmessage.Question.new(name: q0.name, type: q0.type, class: dnsmessage.CLASS_INET)
+  rr = new_request(q, ad)
+  fail client_error(ERR_CANNOT_MARSHAL_DNS_MESSAGE) if rr.err?
+  id, udp_req, tcp_req = rr.unwrap
+  networks = use_tcp ? ["tcp"] : ["udp", "tcp"]
+  for network in networks {
+    ctx, cancel = context.with_deadline(ctx0, time.unix(0, sat_add(alx_wall_ns(), timeout_ns)))
+    cr = resolver_dial(r, ctx, network, server)
+    if e = cr.err {
+      cancel.call
+      fail e
+    }
+    c = cr.unwrap
+    if d = ctx_deadline_ns(ctx) {
+      c.set_deadline(time.unix(0, d))
+    }
+    res = packet_conn?(c) ? dns_packet_round_trip(c, id, q, udp_req) : dns_stream_round_trip(c, id, q, tcp_req)
+    c.close!
+    cancel.call
+    if e = res.err {
+      fail e
+    }
+    p, h = res.unwrap
+    sr = p.skip_question!
+    fail client_error(ERR_INVALID_DNS_RESPONSE) unless sr.err? && dnsmessage.section_done?(sr.err.unwrap)
+    # A truncated UDP answer is retried over TCP (RFC 5966); a truncated
+    # TCP one is used as it is (as glibc, go.dev/issue/64896).
+    next if h.truncated && network == "udp"
+    return (p, h)
+  }
+  fail client_error(ERR_NO_ANSWER_FROM_DNS_SERVER)
+}
+
+# Go's checkHeader: sanity checks of an answer's header.
+def check_header(p: dnsmessage.Parser, h: dnsmessage.Header) -> ~Unit {
+  rcode, has_add = extract_extended_rcode(p, h)
+  fail err_no_such_host if rcode == dnsmessage.RCODE_NAME_ERROR
+  q = p
+  ar = q.answer_header!
+  done = false
+  if e = ar.err {
+    fail client_error(ERR_CANNOT_UNMARSHAL_DNS_MESSAGE) unless dnsmessage.section_done?(e)
+    done = true
+  }
+  # libresolv continues to the next server on an invalid referral
+  # (golang.org/issue/15434).
+  fail client_error(ERR_LAME_REFERRAL) if rcode == dnsmessage.RCODE_SUCCESS && !h.authoritative && !h.recursion_available && done && !has_add
+  if rcode != dnsmessage.RCODE_SUCCESS && rcode != dnsmessage.RCODE_NAME_ERROR {
+    fail DnsClientError.Err(ERR_SERVER_MISBEHAVING, true, false) if rcode == dnsmessage.RCODE_SERVER_FAILURE
+    fail client_error(ERR_SERVER_MISBEHAVING)
+  }
+}
+
+# Go's skipToAnswer: advances p to the first answer of type qtype.
+def skip_to_answer(p: dnsmessage.Parser, qtype: U16) -> ~Unit {
+  loop {
+    hr = p.answer_header!
+    if e = hr.err {
+      fail err_no_such_host if dnsmessage.section_done?(e)
+      fail client_error(ERR_CANNOT_UNMARSHAL_DNS_MESSAGE)
+    }
+    return if hr.unwrap.type == qtype
+    fail client_error(ERR_CANNOT_UNMARSHAL_DNS_MESSAGE) if p.skip_answer!.err?
+  }
+}
+
+# Go's extractExtendedRCode: the RCode with the OPT record's extension,
+# and whether there are additional records.
+def extract_extended_rcode(p0: dnsmessage.Parser, hdr: dnsmessage.Header) -> (U16, Bool) {
+  p = p0.copy
+  p.skip_all_answers!
+  p.skip_all_authorities!
+  has_add = false
+  loop {
+    ar = p.additional_header!
+    return (hdr.rcode, has_add) if ar.err?
+    has_add = true
+    ahdr = ar.unwrap
+    return (ahdr.extended_rcode(hdr.rcode), has_add) if ahdr.type == dnsmessage.TYPE_OPT
+    return (hdr.rcode, has_add) if p.skip_additional!.err?
+  }
+  (hdr.rcode, has_add)
+}
+
+# Go's tryOneName: one rooted name at each server in turn, attempts times.
+def try_one_name(r: Resolver, ctx: context.Context, cfg: DnsConfig, name: Str, qtype: U16) -> ~(dnsmessage.Parser, Str) {
+  last_err: Error? = none
+  offset = cfg.server_offset
+  slen = cfg.servers.size
+  nr = dnsmessage.new_name(name)
+  fail dns_error(ERR_CANNOT_MARSHAL_DNS_MESSAGE, name, "", "") if nr.err?
+  q = dnsmessage.Question.new(name: nr.unwrap, type: qtype, class: dnsmessage.CLASS_INET)
+  for i in 0...cfg.attempts {
+    for j in 0...slen {
+      server = cfg.servers[(offset + j) % slen]
+      xr = exchange(r, ctx, server, q, cfg.timeout_ns, cfg.use_tcp, cfg.trust_ad)
+      if e = xr.err {
+        de = new_dns_error(e, name, server)
+        if op_error?(e) {
+          # Socket-level errors are temporary.
+          f = de.failure
+          de = DNSError.Lookup(DNSFailure.new(err: f.err, name: f.name, server: f.server, is_timeout: f.is_timeout, is_temporary: true, is_not_found: f.is_not_found, ctx_err: f.ctx_err))
+        }
+        last_err = de
+        next
+      }
+      p, h = xr.unwrap
+      cr = check_header(p, h)
+      if e = cr.err {
+        # The name doesn't exist: another server won't help.
+        fail new_dns_error(err_no_such_host, name, server) if no_such_host?(e)
+        last_err = new_dns_error(e, name, server)
+        next
+      }
+      sr = skip_to_answer(p, qtype)
+      if e = sr.err {
+        fail new_dns_error(err_no_such_host, name, server) if no_such_host?(e)
+        last_err = new_dns_error(e, name, server)
+        next
+      }
+      return (p, server)
+    }
+  }
+  if e = last_err {
+    fail e
+  }
+  fail dns_error(ERR_NO_ANSWER_FROM_DNS_SERVER, name, "", "")
+}
+
+# Go's Resolver.lookup: name with the search list (cfg none: the system's
+# resolv.conf).
+def dns_lookup(r: Resolver, ctx: context.Context, name: Str, qtype: U16, cfg0: DnsConfig?) -> ~(dnsmessage.Parser, Str) {
+  # Not "invalid domain name": a detail of this lookup mechanism; libc
+  # resolvers report no such host.
+  fail dns_error(ERR_NO_SUCH_HOST, name, "", "notfound") unless domain_name?(name)
+  cfg = cfg0 || get_system_dns_config
+  last: Error? = none
+  for fqdn in name_list(cfg, name) {
+    res = try_one_name(r, ctx, cfg, fqdn, qtype)
+    if res.ok? {
+      return res.unwrap
+    }
+    e = res.err.unwrap
+    last = e
+    # A temporary error with strict_errors stops the search.
+    break if err_temporary?(e) && r.strict_errors
+  }
+  if e = last {
+    # The name asked for, not a suffixed one (golang.org/issue/6324).
+    fail dns_error_with_name(e, name)
+  }
+  fail dns_error(ERR_NO_SUCH_HOST, name, "", "notfound")
+}
+
+# Go's avoidDNS: names never sent to DNS (.onion, RFC 7686).
+def avoid_dns?(name0: Str) -> Bool {
+  return true if name0 == ""
+  name = name0
+  name = name[0...name.size - 1] if name[name.size - 1] == 46
+  strings_has_suffix_fold?(name, ".onion")
+}
+
+# Go's dnsConfig.nameList: the names to query for name, in order.
+def name_list(conf: DnsConfig, name0: Str) -> [Str] {
+  rooted = name0.size > 0 && name0[name0.size - 1] == 46
+  return [] if name0.size > 254 || name0.size == 254 && !rooted
+  if rooted {
+    return [] if avoid_dns?(name0)
+    return [name0]
+  }
+  has_ndots = count_any_byte(name0, ".") >= conf.ndots
+  name = name0 + "."
+  names: [Str] = []
+  names << name if has_ndots && !avoid_dns?(name)
+  for suffix in conf.search {
+    fqdn = name + suffix
+    names << fqdn if !avoid_dns?(fqdn) && fqdn.size <= 254
+  }
+  names << name if !has_ndots && !avoid_dns?(name)
+  names
+}
+
+# Go's goLookupHostOrder.
+def go_lookup_host_order(r: Resolver, ctx: context.Context, name: Str, order: Int, conf: DnsConfig?) -> ~[Str] {
+  if order == HOST_LOOKUP_FILES_DNS || order == HOST_LOOKUP_FILES {
+    addrs, _ = lookup_static_host(name)
+    return addrs if addrs.size > 0
+    fail dns_error(ERR_NO_SUCH_HOST, name, "", "notfound") if order == HOST_LOOKUP_FILES
+  }
+  ips, _ = ~go_lookup_ip_cname_order(r, ctx, "ip", name, order, conf)
+  out: [Str] = []
+  for ip in ips {
+    out << ip.to_s
+  }
+  out
+}
+
+# Go's goLookupIPFiles: the hosts file's addresses for name, sorted, and
+# its canonical name.
+def go_lookup_ip_files(name: Str) -> ([IPAddr], Str) {
+  addr, canonical = lookup_static_host(name)
+  addrs: [IPAddr] = []
+  for haddr0 in addr {
+    haddr, zone = split_host_zone(haddr0)
+    if ip = parse_ip(haddr) {
+      addrs << IPAddr.new(ip: ip, zone: zone)
+    }
+  }
+  sort_by_rfc6724(addrs)
+  (addrs, canonical)
+}
+
+# Go's goLookupIP.
+def go_lookup_ip_order(r: Resolver, ctx: context.Context, network: Str, host: Str, order: Int, conf: DnsConfig?) -> ~[IPAddr] {
+  addrs, _ = ~go_lookup_ip_cname_order(r, ctx, network, host, order, conf)
+  addrs
+}
+
+# Go's goLookupIPCNAMEOrder: addresses (and the canonical name) from the
+# hosts file and DNS in `order`; network "CNAME" also asks for CNAME
+# records.
+def go_lookup_ip_cname_order(r: Resolver, ctx: context.Context, network: Str, name: Str, order: Int, conf0: DnsConfig?) -> ~([IPAddr], dnsmessage.Name) {
+  if order == HOST_LOOKUP_FILES_DNS || order == HOST_LOOKUP_FILES {
+    addrs, canonical = go_lookup_ip_files(name)
+    if addrs.size > 0 {
+      return (addrs, ~dnsmessage.new_name(canonical))
+    }
+    fail dns_error(ERR_NO_SUCH_HOST, name, "", "notfound") if order == HOST_LOOKUP_FILES
+  }
+  fail dns_error(ERR_NO_SUCH_HOST, name, "", "notfound") unless domain_name?(name)
+  conf = conf0 || get_system_dns_config
+  qtypes: [U16] = [dnsmessage.TYPE_A, dnsmessage.TYPE_AAAA]
+  qtypes << dnsmessage.TYPE_CNAME if network == "CNAME"
+  v = ip_version(network)
+  qtypes = [dnsmessage.TYPE_A] if v == 52
+  qtypes = [dnsmessage.TYPE_AAAA] if v == 54
+  addrs: [IPAddr] = []
+  cname = dnsmessage.Name.new
+  last_err: Error? = none
+  for fqdn in name_list(conf, name) {
+    # The queries go one after another (Go sends A and AAAA together
+    # unless single-request: see the header).
+    hit_strict = false
+    for qtype in qtypes {
+      res = try_one_name(r, ctx, conf, fqdn, qtype)
+      if e = res.err {
+        if err_temporary?(e) && r.strict_errors {
+          # This error ends the search.
+          hit_strict = true
+          last_err = e
+        } elsif !last_err.present? || fqdn == name + "." {
+          # The error for the name itself wins.
+          last_err = e
+        }
+        next
+      }
+      p, server = res.unwrap
+      # The servers of resolv.conf are recursive resolvers: the answer
+      # holds the A and AAAA records of the canonical name, perhaps after
+      # CNAME records (RFC 1034 section 4.3.1).
+      loop {
+        hr = p.answer_header!
+        if e = hr.err {
+          last_err = unmarshal_error(name, server) unless dnsmessage.section_done?(e)
+          break
+        }
+        h = hr.unwrap
+        if h.type == dnsmessage.TYPE_A {
+          ar = p.a_resource!
+          if ar.err? {
+            last_err = unmarshal_error(name, server)
+            break
+          }
+          a = ar.unwrap
+          addrs << IPAddr.new(ip: ip_from(a.a.to_a), zone: "")
+          cname = h.name if cname.length == 0 && h.name.length != 0
+        } elsif h.type == dnsmessage.TYPE_AAAA {
+          ar6 = p.aaaa_resource!
+          if ar6.err? {
+            last_err = unmarshal_error(name, server)
+            break
+          }
+          a6 = ar6.unwrap
+          addrs << IPAddr.new(ip: ip_from(a6.aaaa.to_a), zone: "")
+          cname = h.name if cname.length == 0 && h.name.length != 0
+        } elsif h.type == dnsmessage.TYPE_CNAME {
+          cr = p.cname_resource!
+          if cr.err? {
+            last_err = unmarshal_error(name, server)
+            break
+          }
+          cn = cr.unwrap.cname
+          cname = cn if cname.length == 0 && cn.length > 0
+        } elsif p.skip_answer!.err? {
+          last_err = unmarshal_error(name, server)
+          break
+        }
+      }
+    }
+    if hit_strict {
+      # With strict_errors, an error of either family drops all addresses
+      # (flakiness can't make a dual-stack name single-stack).
+      addrs = []
+      break
+    }
+    break if addrs.size > 0 || network == "CNAME" && cname.length > 0
+  }
+  if e = last_err {
+    # The name asked for, not a suffixed one (golang.org/issue/6324).
+    last_err = dns_error_with_name(e, name)
+  }
+  sort_by_rfc6724(addrs)
+  if addrs.size == 0 && !(network == "CNAME" && cname.length > 0) {
+    if order == HOST_LOOKUP_DNS_FILES {
+      faddrs, canonical = go_lookup_ip_files(name)
+      if faddrs.size > 0 {
+        return (faddrs, ~dnsmessage.new_name(canonical))
+      }
+    }
+    if e = last_err {
+      fail e
+    }
+  }
+  (addrs, cname)
+}
+
+# Go's goLookupCNAME.
+def go_lookup_cname_order(r: Resolver, ctx: context.Context, host: Str, order: Int, conf: DnsConfig?) -> ~Str {
+  res = go_lookup_ip_cname_order(r, ctx, "CNAME", host, order, conf)
+  if e = res.err {
+    fail e
+  }
+  _, cname = res.unwrap
+  cname.to_s
+}
+
+# Go's goLookupPTR.
+def go_lookup_ptr_order(r: Resolver, ctx: context.Context, addr: Str, order: Int, conf: DnsConfig?) -> ~[Str] {
+  if order == HOST_LOOKUP_FILES || order == HOST_LOOKUP_FILES_DNS {
+    names = lookup_static_addr(addr)
+    return names if names.size > 0
+    fail dns_error(ERR_NO_SUCH_HOST, addr, "", "notfound") if order == HOST_LOOKUP_FILES
+  }
+  arpa = ~reverseaddr(addr)
+  lr = dns_lookup(r, ctx, arpa, dnsmessage.TYPE_PTR, conf)
+  if e = lr.err {
+    case e {
+      DNSError.Lookup(d) => {
+        if d.is_not_found && order == HOST_LOOKUP_DNS_FILES {
+          names = lookup_static_addr(addr)
+          return names if names.size > 0
+        }
+      }
+      _ => nil
+    }
+    fail e
+  }
+  p, server = lr.unwrap
+  ptrs: [Str] = []
+  loop {
+    hr = p.answer_header!
+    if e = hr.err {
+      break if dnsmessage.section_done?(e)
+      fail unmarshal_error(addr, server)
+    }
+    if hr.unwrap.type != dnsmessage.TYPE_PTR {
+      fail unmarshal_error(addr, server) if p.skip_answer!.err?
+      next
+    }
+    pr = p.ptr_resource!
+    fail unmarshal_error(addr, server) if pr.err?
+    ptrs << pr.unwrap.ptr.to_s
+  }
+  ptrs
+}
+
+# The order and configuration for a lookup of a host by r (Go's
+# systemConf().hostLookupOrder).
+def host_order(r: Resolver, host: Str) -> (Int, DnsConfig?) {
+  o = system_conf.host_lookup_order(r, host)
+  return (o, none) if o == HOST_LOOKUP_CGO
+  (o, get_system_dns_config)
+}
+
+# The stubs the lookups of lookup.alx call (Go's lookup_unix.go with the
+# order already known to be the go resolver's).
+def go_lookup_ip(r: Resolver, ctx: context.Context, network: Str, host: Str) -> ~[IPAddr] {
+  o, conf = host_order(r, host)
+  o = HOST_LOOKUP_FILES_DNS if o == HOST_LOOKUP_CGO
+  ~go_lookup_ip_order(r, ctx, network, host, o, conf)
+}
+
+def go_lookup_cname(r: Resolver, ctx: context.Context, host: Str) -> ~Str {
+  o, conf = host_order(r, host)
+  o = HOST_LOOKUP_FILES_DNS if o == HOST_LOOKUP_CGO
+  ~go_lookup_cname_order(r, ctx, host, o, conf)
+}
+
+def go_lookup_ptr(r: Resolver, ctx: context.Context, addr: Str) -> ~[Str] {
+  o = system_conf.addr_lookup_order(r, addr)
+  o = HOST_LOOKUP_FILES_DNS if o == HOST_LOOKUP_CGO
+  ~go_lookup_ptr_order(r, ctx, addr, o, none)
+}
+
+# ---------------------------------------------------------------- lookup.go
+
+# Go's goLookupSRV: the SRV records of _service._proto.name (or of name if
+# both are empty), sorted by priority and weight, and the target name.
+def go_lookup_srv(r: Resolver, ctx: context.Context, service: Str, proto: Str, name: Str) -> ~(Str, [SRV]) {
+  target = service == "" && proto == "" ? name : "_" + service + "._" + proto + "." + name
+  p, server = ~dns_lookup(r, ctx, target, dnsmessage.TYPE_SRV, none)
+  cname = dnsmessage.Name.new
+  srvs: [SRV] = []
+  loop {
+    hr = p.answer_header!
+    if e = hr.err {
+      break if dnsmessage.section_done?(e)
+      fail unmarshal_error(name, server)
+    }
+    h = hr.unwrap
+    if h.type != dnsmessage.TYPE_SRV {
+      fail unmarshal_error(name, server) if p.skip_answer!.err?
+      next
+    }
+    cname = h.name if cname.length == 0 && h.name.length != 0
+    sr = p.srv_resource!
+    fail unmarshal_error(name, server) if sr.err?
+    s = sr.unwrap
+    srvs << SRV.new(target: s.target.to_s, port: s.port.to_i, priority: s.priority.to_i, weight: s.weight.to_i)
+  }
+  sort_srv(srvs)
+  (cname.to_s, srvs)
+}
+
+# Go's goLookupMX: sorted by preference.
+def go_lookup_mx(r: Resolver, ctx: context.Context, name: Str) -> ~[MX] {
+  p, server = ~dns_lookup(r, ctx, name, dnsmessage.TYPE_MX, none)
+  mxs: [MX] = []
+  loop {
+    hr = p.answer_header!
+    if e = hr.err {
+      break if dnsmessage.section_done?(e)
+      fail unmarshal_error(name, server)
+    }
+    if hr.unwrap.type != dnsmessage.TYPE_MX {
+      fail unmarshal_error(name, server) if p.skip_answer!.err?
+      next
+    }
+    mr = p.mx_resource!
+    fail unmarshal_error(name, server) if mr.err?
+    m = mr.unwrap
+    mxs << MX.new(host: m.mx.to_s, pref: m.pref.to_i)
+  }
+  sort_mx(mxs)
+  mxs
+}
+
+# Go's goLookupNS.
+def go_lookup_ns(r: Resolver, ctx: context.Context, name: Str) -> ~[NS] {
+  p, server = ~dns_lookup(r, ctx, name, dnsmessage.TYPE_NS, none)
+  nss: [NS] = []
+  loop {
+    hr = p.answer_header!
+    if e = hr.err {
+      break if dnsmessage.section_done?(e)
+      fail unmarshal_error(name, server)
+    }
+    if hr.unwrap.type != dnsmessage.TYPE_NS {
+      fail unmarshal_error(name, server) if p.skip_answer!.err?
+      next
+    }
+    nr = p.ns_resource!
+    fail unmarshal_error(name, server) if nr.err?
+    nss << NS.new(host: nr.unwrap.ns.to_s)
+  }
+  nss
+}
+
+# Go's goLookupTXT: each record's strings joined.
+def go_lookup_txt(r: Resolver, ctx: context.Context, name: Str) -> ~[Str] {
+  p, server = ~dns_lookup(r, ctx, name, dnsmessage.TYPE_TXT, none)
+  txts: [Str] = []
+  loop {
+    hr = p.answer_header!
+    if e = hr.err {
+      break if dnsmessage.section_done?(e)
+      fail unmarshal_error(name, server)
+    }
+    if hr.unwrap.type != dnsmessage.TYPE_TXT {
+      fail unmarshal_error(name, server) if p.skip_answer!.err?
+      next
+    }
+    tr = p.txt_resource!
+    fail unmarshal_error(name, server) if tr.err?
+    txts << tr.unwrap.txt.join("")
+  }
+  txts
+}

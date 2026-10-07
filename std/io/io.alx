@@ -1,25 +1,79 @@
 # Package io: Go's io, with the Rust-shaped errors of GO-VS-RUBY F3.
 #
-# Shape (differences from Go):
+#   Go                                     alx
+#   Reader, Writer, Closer, Seeker, ...    the same interfaces (read!, write!, close!, seek!)
+#   ReaderAt / WriterAt                    read_at(p, off) -> ~Int / write_at(p, off) -> ~Int
+#   ReaderFrom / WriterTo                  read_from!(r) -> ~Int / write_to!(w) -> ~Int
+#   ByteReader, ByteScanner, ByteWriter    read_byte! -> ~Byte?, unread_byte!, write_byte!(c)
+#   RuneReader, RuneScanner                read_rune! -> ~(Rune, Int)?, unread_rune!
+#   StringWriter                           write_string!(s) -> ~Int
+#   SeekStart, SeekCurrent, SeekEnd        SEEK_START, SEEK_CURRENT, SEEK_END
+#   EOF                                    (none: a read! of 0 bytes; see below)
+#   ErrUnexpectedEOF, ErrShortWrite,       StreamError.UnexpectedEof, ShortWrite,
+#   ErrShortBuffer, ErrNoProgress,         ShortBuffer, NoProgress, ClosedPipe
+#   ErrClosedPipe
+#   errWhence / errOffset (Seek)           StreamError.InvalidWhence / InvalidOffset
+#   Copy(dst, src)                         copy(dst, src) -> ~Int
+#   CopyBuffer(dst, src, buf)              copy_buffer(dst, src, buf) (buf: [Byte]?; none = Go's nil)
+#   CopyN(dst, src, n)                     copy_n(dst, src, n) -> ~Int
+#   ReadAll(r)                             read_all(r) -> ~[Byte]
+#   ReadAtLeast(r, buf, min)               read_at_least(r, buf, min) -> ~Int
+#   ReadFull(r, buf)                       read_exact(r, buf) -> ~Unit (UnexpectedEof unless full);
+#                                          read_full(r, buf) -> ~Int (a short count at the end)
+#   WriteString(w, s)                      write_string(w, s) -> ~Int; write_all(w, p) (Rust's)
+#   LimitReader(r, n) / LimitedReader      limit_reader(r, n) -> LimitedReader[R] (.r, .n)
+#   NewSectionReader(r, off, n)            new_section_reader(r, off, n) -> SectionReader[R]
+#                                          (read!, read_at, seek!, size, outer)
+#   NewOffsetWriter(w, off)                new_offset_writer(w, off) -> OffsetWriter[W]
+#   MultiReader(r...) / MultiWriter(w...)  multi_reader([r...]) / multi_writer([w...])
+#   TeeReader(r, w)                        tee_reader(r, w) -> TeeReader[R, W]
+#   NopCloser(r)                           nop_closer(r) -> NopCloser[R]
+#   Pipe()                                 pipe -> (PipeReader, PipeWriter)
+#   Discard                                Discard.new() (also a ReaderFrom)
+#
+# Differences from Go:
 #  - End of input is not an error. `read!` returns 0 at EOF (and for an empty
 #    p); the optional readers elsewhere return none. Go's `io.EOF` therefore
-#    doesn't exist; `StreamError.UnexpectedEof` is Go's `ErrUnexpectedEOF`, raised by
-#    `read_exact` / `copy_n` when the input ends too early.
+#    doesn't exist, and a read can't return data together with an error: a
+#    failing call loses the count Go would report beside the error (Copy's
+#    `written`, ReadAtLeast's `n`). `StreamError.UnexpectedEof` is Go's
+#    `ErrUnexpectedEOF`. Where Go returns EOF, alx returns 0 (read_at_least
+#    with nothing read) or, for copy_n, fails with UnexpectedEof (Go: EOF with
+#    the short count). A reader returning (0, nil) in Go (allowed but
+#    discouraged) has no alx spelling: 0 is the end.
+#  - ReadFull is read_exact (fails with UnexpectedEof on a short read, also
+#    when nothing was read, where Go says EOF); read_full is the
+#    Rust-flavoured variant returning the short count instead of failing.
+#  - ReaderAt.read_at returns a short count at the end of the data (Go also
+#    returns EOF there). WriterAt.write_at isn't a `!` method either (as
+#    os.File's): an in-memory one writes through shared storage.
 #  - `Reader` / `Writer` are structural interfaces (F2): any struct with
 #    `def read!(p: [Byte]) -> ~Int` / `def write!(p: [Byte]) -> ~Int` is one,
 #    and so is one whose method can't fail (`bytes.Buffer`): an infallible
 #    method satisfies a fallible interface method.
-#  - Structs are values, so the free functions below (`copy`, `read_all`,
-#    `write_all`, ...) receive a COPY of the reader / writer they are given.
-#    The std types (`os.File`, `bytes.Buffer`, `bufio.Reader` / `Writer` /
-#    `Scanner`) keep their state in shared storage (GO-VS-RUBY D36), so a copy
-#    is the same reader / writer: `io.copy(buf, file)` fills the caller's
-#    `buf`, and a half-read `bytes.Buffer` or `bufio.Reader` continues where
-#    the callee stopped. A reader or writer of your own follows the same
-#    convention (a one-element slice holding the mutable fields); one that keeps
-#    plain mutable fields is only advanced in the copy. An interface value held
-#    in a variable is a place: `w.write!(p)` mutates it in place (R7), and so
-#    does `w.write_string!(s)` for the interfaces here.
+#  - The functions and wrappers are generic over the reader / writer type, so
+#    Copy's fast paths (src a WriterTo, dst a ReaderFrom), WriteString's
+#    StringWriter path and Copy's buffer sizing for a LimitedReader are
+#    decided at compile time (S6, `if R is WriterTo`). An interface value
+#    (an `io.Reader` local) only has the interface's own methods, so those
+#    paths aren't taken for it (Go asks the dynamic type).
+#  - Structs are values, so the functions and wrappers receive a COPY of the
+#    reader / writer they are given. The std types (`os.File`, `bytes.Buffer`,
+#    `bufio.Reader` / `Writer` / `Scanner`, and the wrappers here) keep their
+#    state in shared storage (GO-VS-RUBY D36), so a copy is the same reader /
+#    writer: `io.copy(buf, file)` fills the caller's `buf`, and a half-read
+#    `bytes.Buffer` or `bufio.Reader` continues where the callee stopped. A
+#    reader or writer of your own follows the same convention (a one-element
+#    slice holding the mutable fields); one that keeps plain mutable fields is
+#    only advanced in the copy. An interface value held in a variable is a
+#    place: `w.write!(p)` mutates it in place (R7).
+#  - LimitedReader's R and N are read with `.r` / `.n` (`set_n!` changes N).
+#  - NopCloser always has write_to (forwarding to the reader's own when it
+#    has one, else copying); Go adds WriteTo only when the reader has it.
+#  - MultiReader / MultiWriter don't flatten nested multi readers / writers
+#    (Go does, to bound the call depth; the result is the same).
+#  - Pipe: a 0-byte write reaches the reader as a 0-byte read, which alx
+#    readers take for the end of input. CloseWithError(nil) is `close!`.
 #  - The sizes of an I/O call are bytes; offsets are Ints.
 #  - Blocking: a read on a pipe or terminal blocks its worker thread (the
 #    event loop arrives with L3).
@@ -34,6 +88,14 @@ pub error StreamError {
   ShortBuffer
   # Reads kept returning nothing without reaching the end.
   NoProgress
+  # A read or write on a closed pipe.
+  ClosedPipe
+  # A writer reported an impossible count.
+  InvalidWrite
+  # Seek: an unknown whence.
+  InvalidWhence
+  # Seek / write_at: an offset before the start.
+  InvalidOffset
   # A negative or otherwise impossible count or offset.
   InvalidArgument(what: Str)
 
@@ -43,6 +105,10 @@ pub error StreamError {
       ShortWrite => "short write"
       ShortBuffer => "short buffer"
       NoProgress => "multiple read! calls return no data or error"
+      ClosedPipe => "io: read/write on closed pipe"
+      InvalidWrite => "invalid write result"
+      InvalidWhence => "Seek: invalid whence"
+      InvalidOffset => "Seek: invalid offset"
       InvalidArgument(what) => "invalid argument: #{what}"
     }
   }
@@ -104,6 +170,12 @@ pub interface ReadSeeker {
   def seek!(offset: Int, whence: Int) -> ~Int
 }
 
+pub interface ReadSeekCloser {
+  def read!(p: [Byte]) -> ~Int
+  def seek!(offset: Int, whence: Int) -> ~Int
+  def close! -> ~Unit
+}
+
 pub interface WriteSeeker {
   def write!(p: [Byte]) -> ~Int
   def seek!(offset: Int, whence: Int) -> ~Int
@@ -115,10 +187,64 @@ pub interface ReadWriteSeeker {
   def seek!(offset: Int, whence: Int) -> ~Int
 }
 
-CHUNK = 32768
+# Reads from r until its end (Go's ReaderFrom); returns the count.
+pub interface ReaderFrom {
+  def read_from!(r: Reader) -> ~Int
+}
+
+# Writes everything it has to w (Go's WriterTo); returns the count.
+pub interface WriterTo {
+  def write_to!(w: Writer) -> ~Int
+}
+
+# Reads at an offset without moving any position; a short count only at the
+# end of the data.
+pub interface ReaderAt {
+  def read_at(p: [Byte], off: Int) -> ~Int
+}
+
+# Writes all of p at an offset.
+pub interface WriterAt {
+  def write_at(p: [Byte], off: Int) -> ~Int
+}
+
+# The next byte; none at the end.
+pub interface ByteReader {
+  def read_byte! -> ~Byte?
+}
+
+pub interface ByteScanner {
+  def read_byte! -> ~Byte?
+  def unread_byte! -> ~Unit
+}
+
+pub interface ByteWriter {
+  def write_byte!(c: Byte) -> ~Unit
+}
+
+# The next rune and its size in bytes; none at the end.
+pub interface RuneReader {
+  def read_rune! -> ~(Rune, Int)?
+}
+
+pub interface RuneScanner {
+  def read_rune! -> ~(Rune, Int)?
+  def unread_rune! -> ~Unit
+}
+
+# This package's `copy` shadows the builtin (S12); this is the builtin's.
+def bcopy(dst: [Byte], src: [Byte]) -> Int {
+  n = dst.size < src.size ? dst.size : src.size
+  i = 0
+  while i < n {
+    dst[i] = src[i]
+    i += 1
+  }
+  n
+}
 
 # Writes all of p; fails with ShortWrite if the writer stops accepting bytes.
-pub def write_all(w: Writer, p: [Byte]) -> ~Unit {
+pub def write_all[W](w: W, p: [Byte]) -> ~Unit {
   out = w
   off = 0
   while off < p.size {
@@ -128,9 +254,14 @@ pub def write_all(w: Writer, p: [Byte]) -> ~Unit {
   }
 }
 
-# Writes s; returns s.size.
-pub def write_string(w: Writer, s: Str) -> ~Int {
+# Writes s (through w's write_string! when it has one); returns s.size.
+pub def write_string[W](w: W, s: Str) -> ~Int {
   out = w
+  if W is StringWriter {
+    n = out.~write_string!(s)
+    fail StreamError.ShortWrite if n != s.size
+    return n
+  }
   b = s.bytes.to_a
   off = 0
   while off < b.size {
@@ -143,7 +274,7 @@ pub def write_string(w: Writer, s: Str) -> ~Int {
 
 # Reads until p is full or the input ends; returns the count (less than
 # p.size only at the end of input). Never fails at EOF.
-pub def read_full(r: Reader, p: [Byte]) -> ~Int {
+pub def read_full[R](r: R, p: [Byte]) -> ~Int {
   src = r
   got = 0
   while got < p.size {
@@ -156,13 +287,32 @@ pub def read_full(r: Reader, p: [Byte]) -> ~Int {
 
 # Reads exactly p.size bytes; fails with UnexpectedEof if the input ends first
 # (Go's ReadFull). Nothing is read for an empty p.
-pub def read_exact(r: Reader, p: [Byte]) -> ~Unit {
+pub def read_exact[R](r: R, p: [Byte]) -> ~Unit {
   n = ~read_full(r, p)
   fail StreamError.UnexpectedEof if n < p.size
 }
 
+# Reads into buf until at least min bytes are in (Go's ReadAtLeast); returns
+# the count. 0 when the input ended before any byte (Go's EOF); fails with
+# UnexpectedEof when it ended after some but fewer than min, and with
+# ShortBuffer when buf.size < min.
+pub def read_at_least[R](r: R, buf: [Byte], min: Int) -> ~Int {
+  fail StreamError.ShortBuffer if buf.size < min
+  src = r
+  n = 0
+  while n < min {
+    nn = src.~read!(buf[n...buf.size])
+    if nn == 0 {
+      fail StreamError.UnexpectedEof if n > 0
+      return 0
+    }
+    n += nn
+  }
+  n
+}
+
 # Everything up to the end of input.
-pub def read_all(r: Reader) -> ~[Byte] {
+pub def read_all[R](r: R) -> ~[Byte] {
   src = r
   out: [Byte] = []
   chunk: [Byte] = [0; 8192]
@@ -178,51 +328,506 @@ pub def read_all(r: Reader) -> ~[Byte] {
   out
 }
 
-# Copies src to dst until the end of src; returns the byte count.
-pub def copy(dst: Writer, src: Reader) -> ~Int {
+# Copies src to dst until the end of src; returns the byte count. Uses
+# src.write_to! when src is a WriterTo, else dst.read_from! when dst is a
+# ReaderFrom.
+pub def copy[W, R](dst: W, src: R) -> ~Int {
+  ~copy_with(dst, src, none)
+}
+
+# copy through buf (none: a buffer of its own). Panics on an empty buf.
+pub def copy_buffer[W, R](dst: W, src: R, buf: [Byte]?) -> ~Int {
+  if b = buf {
+    panic "empty buffer in CopyBuffer" if b.size == 0
+  }
+  ~copy_with(dst, src, buf)
+}
+
+def copy_with[W, R](dst: W, src: R, buf: [Byte]?) -> ~Int {
   from = src
   to = dst
-  buf: [Byte] = [0; 32768]
+  if R is WriterTo {
+    return from.~write_to!(to)
+  } elsif W is ReaderFrom {
+    return to.~read_from!(from)
+  }
+  b: [Byte] = []
+  if given = buf {
+    b = given
+  } else {
+    size = 32 * 1024
+    size = from.limit_size(size) if R is LimitSized
+    fresh: [Byte] = [0; size]
+    b = fresh
+  }
   total = 0
   loop {
-    n = from.~read!(buf)
+    n = from.~read!(b)
     break if n == 0
-    off = 0
-    while off < n {
-      m = to.~write!(buf[off...n])
-      fail StreamError.ShortWrite if m <= 0
-      off += m
-    }
-    total += n
+    m = to.~write!(b[0...n])
+    fail StreamError.InvalidWrite if m < 0 || m > n
+    total += m
+    fail StreamError.ShortWrite if m != n
   }
   total
 }
 
-# Copies exactly n bytes; fails with UnexpectedEof if src ends first.
-pub def copy_n(dst: Writer, src: Reader, n: Int) -> ~Int {
-  fail StreamError.InvalidArgument("negative count") if n < 0
-  from = src
-  to = dst
-  buf: [Byte] = [0; 32768]
-  total = 0
-  while total < n {
-    want = n - total
-    want = buf.size if want > buf.size
-    got = from.~read!(buf[0...want])
-    fail StreamError.UnexpectedEof if got == 0
-    off = 0
-    while off < got {
-      m = to.~write!(buf[off...got])
-      fail StreamError.ShortWrite if m <= 0
-      off += m
-    }
-    total += got
-  }
-  total
+# Copies exactly n bytes (Go's Copy of a LimitReader); fails with
+# UnexpectedEof if src ends first. A negative n copies nothing.
+pub def copy_n[W, R](dst: W, src: R, n: Int) -> ~Int {
+  return 0 if n <= 0
+  written = ~copy(dst, limit_reader(src, n))
+  fail StreamError.UnexpectedEof if written < n
+  written
 }
 
 # A Writer that accepts and drops everything (Go's io.Discard).
 pub struct Discard {
   pub def write!(p: [Byte]) -> Int { p.size }
   pub def write_string!(s: Str) -> Int { s.size }
+
+  # Reads r to its end, dropping the bytes; returns the count.
+  pub def read_from![R](r: R) -> ~Int {
+    src = r
+    buf: [Byte] = [0; 8192]
+    n = 0
+    loop {
+      k = src.~read!(buf)
+      return n if k == 0
+      n += k
+    }
+  }
+}
+
+# copy's buffer sizing for a LimitedReader (Go's copyBuffer looks at l.N).
+interface LimitSized {
+  def limit_size(size: Int) -> Int
+}
+
+# ----------------------------------------------------------- LimitedReader
+
+struct LimitedState[R] {
+  r: R
+  n: Int
+}
+
+# Reads from R, at most N bytes in all (Go's LimitedReader).
+pub struct LimitedReader[R] {
+  st: [LimitedState[R]]
+
+  pub def read!(p: [Byte]) -> ~Int {
+    left = st[0].n
+    return 0 if left <= 0
+    q = p
+    q = p[0...left] if p.size > left
+    n = self.st[0].r.~read!(q)
+    self.st[0].n = left - n
+    n
+  }
+
+  # The underlying reader.
+  pub def r -> R { st[0].r }
+  # The bytes left.
+  pub def n -> Int { st[0].n }
+  pub def set_n!(n: Int) { self.st[0].n = n }
+
+  def limit_size(size: Int) -> Int {
+    left = st[0].n
+    return size if size <= left
+    left < 1 ? 1 : left
+  }
+}
+
+# A reader of at most n bytes of r (Go's LimitReader).
+pub def limit_reader[R](r: R, n: Int) -> LimitedReader[R] {
+  LimitedReader[R].new(st: [LimitedState[R].new(r: r, n: n)])
+}
+
+# ----------------------------------------------------------- SectionReader
+
+# Reads, seeks and read_ats within [off, off+n) of a ReaderAt (Go's
+# SectionReader).
+pub struct SectionReader[R] {
+  r: R
+  base: Int
+  limit: Int
+  nn: Int
+  st: [Int]
+
+  pub def read!(p: [Byte]) -> ~Int {
+    off = st[0]
+    return 0 if off >= limit
+    q = p
+    q = p[0...(limit - off)] if p.size > limit - off
+    n = r.~read_at(q, off)
+    self.st[0] = off + n
+    n
+  }
+
+  pub def seek!(offset: Int, whence: Int) -> ~Int {
+    o = offset
+    case whence {
+      SEEK_START => { o += base }
+      SEEK_CURRENT => { o += st[0] }
+      SEEK_END => { o += limit }
+      _ => { fail StreamError.InvalidWhence }
+    }
+    fail StreamError.InvalidOffset if o < base
+    self.st[0] = o
+    o - base
+  }
+
+  # Reads at off within the section; a short count at its end.
+  pub def read_at(p: [Byte], off: Int) -> ~Int {
+    return 0 if off < 0 || off >= size
+    at = off + base
+    if p.size > limit - at {
+      return r.~read_at(p[0...(limit - at)], at)
+    }
+    r.~read_at(p, at)
+  }
+
+  # The section's size in bytes.
+  pub def size -> Int { limit - base }
+
+  # The ReaderAt, offset and size it was made with (Go's Outer).
+  pub def outer -> (R, Int, Int) { (r, base, nn) }
+}
+
+# A SectionReader over r reading from off, at most n bytes.
+pub def new_section_reader[R](r: R, off: Int, n: Int) -> SectionReader[R] {
+  max = 9223372036854775807
+  remaining = off <= max - n ? n + off : max
+  SectionReader[R].new(r: r, base: off, limit: remaining, nn: n, st: [off])
+}
+
+# ------------------------------------------------------------ OffsetWriter
+
+# Writes to a WriterAt at base + a current offset (Go's OffsetWriter).
+struct OffState[W] {
+  w: W
+  off: Int
+}
+
+pub struct OffsetWriter[W] {
+  base: Int
+  st: [OffState[W]]
+
+  pub def write!(p: [Byte]) -> ~Int {
+    off = st[0].off
+    n = st[0].w.~write_at(p, off)
+    self.st[0].off = off + n
+    n
+  }
+
+  # Writes p at base + off.
+  pub def write_at(p: [Byte], off: Int) -> ~Int {
+    fail StreamError.InvalidOffset if off < 0
+    st[0].w.~write_at(p, off + base)
+  }
+
+  # SEEK_START / SEEK_CURRENT only (Go: SeekEnd is an invalid whence).
+  pub def seek!(offset: Int, whence: Int) -> ~Int {
+    o = offset
+    case whence {
+      SEEK_START => { o += base }
+      SEEK_CURRENT => { o += st[0].off }
+      _ => { fail StreamError.InvalidWhence }
+    }
+    fail StreamError.InvalidOffset if o < base
+    self.st[0].off = o
+    o - base
+  }
+}
+
+pub def new_offset_writer[W](w: W, off: Int) -> OffsetWriter[W] {
+  OffsetWriter[W].new(base: off, st: [OffState[W].new(w: w, off: off)])
+}
+
+# ------------------------------------------------------------ Multi, Tee
+
+# The concatenation of its readers, read in order (Go's MultiReader).
+pub struct MultiReader[R] {
+  st: [[R]]
+
+  pub def read!(p: [Byte]) -> ~Int {
+    while st[0].size > 0 {
+      n = self.st[0][0].~read!(p)
+      return n if n > 0
+      return 0 if p.size == 0
+      rs = st[0]
+      self.st[0] = rs[1...rs.size]
+    }
+    0
+  }
+
+  # Copies what is left of every reader to w; returns the count.
+  pub def write_to![W](w: W) -> ~Int {
+    buf: [Byte] = [0; 32768]
+    sum = 0
+    while st[0].size > 0 {
+      sum += ~copy_first(w, buf)
+      rs = st[0]
+      self.st[0] = rs[1...rs.size]
+    }
+    sum
+  }
+
+  def copy_first[W](w: W, buf: [Byte]) -> ~Int {
+    r = st[0][0]
+    if R is WriterTo {
+      return r.~write_to!(w)
+    }
+    ~copy_buffer(w, r, buf)
+  }
+}
+
+pub def multi_reader[R](readers: [R]) -> MultiReader[R] {
+  rs: [R] = []
+  for r in readers { rs << r }
+  MultiReader[R].new(st: [rs])
+}
+
+# Writes to every one of its writers (Go's MultiWriter, like Unix tee(1)):
+# the first failure or short write stops it.
+pub struct MultiWriter[W] {
+  st: [[W]]
+
+  pub def write!(p: [Byte]) -> ~Int {
+    i = 0
+    while i < st[0].size {
+      n = self.st[0][i].~write!(p)
+      fail StreamError.ShortWrite if n != p.size
+      i += 1
+    }
+    p.size
+  }
+
+  pub def write_string!(s: Str) -> ~Int {
+    p = s.bytes.to_a
+    i = 0
+    while i < st[0].size {
+      n = 0
+      if W is StringWriter {
+        n = self.st[0][i].~write_string!(s)
+      } else {
+        n = self.st[0][i].~write!(p)
+      }
+      fail StreamError.ShortWrite if n != s.size
+      i += 1
+    }
+    s.size
+  }
+}
+
+pub def multi_writer[W](writers: [W]) -> MultiWriter[W] {
+  ws: [W] = []
+  for w in writers { ws << w }
+  MultiWriter[W].new(st: [ws])
+}
+
+# Writes to w everything it reads from r (Go's TeeReader); a failed write
+# fails the read.
+struct TeeState[R, W] {
+  r: R
+  w: W
+}
+
+pub struct TeeReader[R, W] {
+  st: [TeeState[R, W]]
+
+  pub def read!(p: [Byte]) -> ~Int {
+    n = self.st[0].r.~read!(p)
+    if n > 0 {
+      self.st[0].w.~write!(p[0...n])
+    }
+    n
+  }
+}
+
+pub def tee_reader[R, W](r: R, w: W) -> TeeReader[R, W] {
+  TeeReader[R, W].new(st: [TeeState[R, W].new(r: r, w: w)])
+}
+
+# A ReadCloser whose close! does nothing (Go's NopCloser).
+pub struct NopCloser[R] {
+  st: [R]
+
+  pub def read!(p: [Byte]) -> ~Int { self.st[0].~read!(p) }
+  pub def close! -> ~Unit {}
+
+  # The reader's own write_to! when it has one, else a copy.
+  pub def write_to![W](w: W) -> ~Int {
+    if R is WriterTo {
+      return self.st[0].~write_to!(w)
+    }
+    ~copy_with(w, st[0], none)
+  }
+}
+
+pub def nop_closer[R](r: R) -> NopCloser[R] {
+  NopCloser[R].new(st: [r])
+}
+
+# ------------------------------------------------------------------ Pipe
+
+# A close reason, set once: none for not closed; (err: none) is a plain
+# close (the reader sees EOF / the writer ClosedPipe).
+struct CloseReason {
+  err: Error?
+}
+
+struct PipeCore {
+  wr_mu: Mutex[Int]
+  wr_ch: Chan[[Byte]]
+  rd_ch: Chan[Int]
+  done: Chan[Int]
+  once: Atomic[Bool]
+  rerr: Mutex[CloseReason?]
+  werr: Mutex[CloseReason?]
+
+  def close_done {
+    if once.compare_and_swap(false, true) {
+      done.close
+    }
+  }
+
+  def closed? -> Bool {
+    c = false
+    select {
+      when _v = done.recv => { c = true }
+      else => {}
+    }
+    c
+  }
+
+  # 0 at EOF; fails with the writer's error or ClosedPipe.
+  def read_close -> ~Int {
+    r = rerr.lock { |v| v }
+    w = werr.lock { |v| v }
+    if r.none? {
+      if cw = w {
+        if e = cw.err {
+          fail e
+        }
+        return 0
+      }
+    }
+    fail StreamError.ClosedPipe
+  }
+
+  def write_close -> ~Int {
+    r = rerr.lock { |v| v }
+    w = werr.lock { |v| v }
+    if w.none? {
+      if cr = r {
+        if e = cr.err {
+          fail e
+        }
+      }
+    }
+    fail StreamError.ClosedPipe
+  }
+
+  def read(b: [Byte]) -> ~Int {
+    return ~read_close if closed?
+    got: [Byte]? = none
+    select {
+      when bw = wr_ch.recv => { got = bw }
+      when _v = done.recv => {}
+    }
+    if bw = got {
+      nr = bcopy(b, bw)
+      rd_ch << nr
+      return nr
+    }
+    ~read_close
+  }
+
+  def write(b: [Byte]) -> ~Int {
+    return ~write_close if closed?
+    r = wr_mu.lock { |v|
+      v += 1
+      write_locked(b)
+    }
+    ~r
+  }
+
+  def write_locked(b0: [Byte]) -> ~Int {
+    b = b0
+    n = 0
+    first = true
+    while first || b.size > 0 {
+      first = false
+      sent = false
+      select {
+        when wr_ch.send(b.dup) => { sent = true }
+        when _v = done.recv => {}
+      }
+      return ~write_close if !sent
+      nw = rd_ch.recv || 0
+      b = b[nw...b.size]
+      n += nw
+    }
+    n
+  }
+
+  def close_read(err: Error?) {
+    rerr.lock { |v|
+      v = CloseReason.new(err: err) if v.none?
+    }
+    close_done
+  }
+
+  def close_write(err: Error?) {
+    werr.lock { |v|
+      v = CloseReason.new(err: err) if v.none?
+    }
+    close_done
+  }
+}
+
+# The read half of a pipe.
+pub struct PipeReader {
+  p: PipeCore
+
+  # Reads what one write! offers (all or part of it); 0 once the writer
+  # closed (or its close_with_error! error).
+  pub def read!(data: [Byte]) -> ~Int { p.~read(data) }
+
+  # Later writes fail with ClosedPipe.
+  pub def close! -> ~Unit { p.close_read(none) }
+
+  # Later writes fail with err.
+  pub def close_with_error!(err: Error) -> ~Unit { p.close_read(err) }
+}
+
+# The write half of a pipe.
+pub struct PipeWriter {
+  p: PipeCore
+
+  # Blocks until readers have consumed all of data, or the read half closed.
+  pub def write!(data: [Byte]) -> ~Int { p.~write(data) }
+
+  # Later reads return 0 (end of input).
+  pub def close! -> ~Unit { p.close_write(none) }
+
+  # Later reads fail with err.
+  pub def close_with_error!(err: Error) -> ~Unit { p.close_write(err) }
+}
+
+# A synchronous in-memory pipe (Go's Pipe): each write! blocks until reads
+# have taken all of its data; there is no buffering. Safe for concurrent
+# use: parallel writes are sequential, parallel reads share the data.
+pub def pipe -> (PipeReader, PipeWriter) {
+  c = PipeCore.new(
+    wr_mu: Mutex.new(0),
+    wr_ch: Chan[[Byte]].new,
+    rd_ch: Chan[Int].new,
+    done: Chan[Int].new,
+    once: Atomic.new(false),
+    rerr: Mutex[CloseReason?].new(none),
+    werr: Mutex[CloseReason?].new(none),
+  )
+  (PipeReader.new(p: c), PipeWriter.new(p: c))
 }

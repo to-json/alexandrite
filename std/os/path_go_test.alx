@@ -1,0 +1,251 @@
+#![test(external)]
+# Go's os/path_test.go, read_test.go and stat_test.go, translated. Go reads
+# its own sources ("read_test.go", the "exec" directory); a fixture made in
+# a temp dir stands in.
+
+import "os"
+import "path/filepath"
+import "io/fs"
+import "testing"
+
+# ---------------------------------------------------------------- path_test.go
+
+test "MkdirAll" { |t|
+  t.chdir(t.temp_dir)
+  path = "_TestMkdirAll_/dir/./dir2"
+  os.mkdir_all(path, 0o777).unwrap
+  os.mkdir_all(path, 0o777).unwrap # second time
+  fpath = path + "/file"
+  f = os.create(fpath).unwrap
+  e = os.mkdir_all(fpath, 0o777).err
+  t.fatal("MkdirAll #{fpath}: no error") if e == none
+  assert e.unwrap.path_error?, "MkdirAll #{fpath} returned #{e}, not a PathError"
+  assert_eq filepath.clean(e.unwrap.path), filepath.clean(fpath)
+  ffpath = fpath + "/subdir"
+  e2 = os.mkdir_all(ffpath, 0o777).err
+  t.fatal("MkdirAll #{ffpath}: no error") if e2 == none
+  assert e2.unwrap.path_error?
+  assert_eq filepath.clean(e2.unwrap.path), filepath.clean(fpath)
+  f.close!.unwrap
+}
+
+test "MkdirAllAbsPath" { |t|
+  path = filepath.join([t.temp_dir, "/a/b/c"])
+  os.mkdir_all(path, 0o777).unwrap
+  assert os.stat(path).unwrap.is_dir, "after MkdirAll(#{path}, 0o777), #{path} is not a directory"
+}
+
+test "MkdirAllWithSymlink" { |t|
+  tmp_dir = t.temp_dir
+  dir = tmp_dir + "/dir"
+  os.mkdir(dir, 0o755).unwrap
+  link = tmp_dir + "/link"
+  os.symlink("dir", link).unwrap
+  os.mkdir_all(link + "/foo", 0o755).unwrap
+}
+
+# ---------------------------------------------------------------- read_test.go
+
+def check_named_size(path: Str, size: Int) {
+  assert_eq os.stat(path).unwrap.size, size
+}
+
+test "ReadFile" { |t|
+  t.chdir(t.temp_dir)
+  assert os.read_file("rumpelstilzchen").err?, "ReadFile rumpelstilzchen: error expected, none found"
+  os.write_file("read_test.go", "package os_test\n\nfunc TestReadFile() {}\n".bytes, 0o644).unwrap
+  contents = os.read_file("read_test.go").unwrap
+  check_named_size("read_test.go", contents.size)
+}
+
+test "WriteFile" {
+  f = os.create_temp("", "os-test").unwrap
+  msg = "Programming today is a race between software engineers striving to " + "build bigger and better idiot-proof programs, and the Universe trying " + "to produce bigger and better idiots. So far, the Universe is winning."
+  os.write_file(f.name, msg.bytes, 0o644).unwrap
+  data = os.read_file(f.name).unwrap
+  f.close!.unwrap
+  os.remove(f.name).unwrap
+  assert_eq Str.from_bytes(data), msg
+}
+
+test "ReadOnlyWriteFile" { |t|
+  t.skip("Root can write to read-only files anyway, so skip the read-only test.") if os.getuid == 0
+  filename = t.temp_dir + "/blurp.txt"
+  os.write_file(filename, "shmorp".bytes, 0o444).unwrap
+  assert os.write_file(filename, "florp".bytes, 0o444).err?, "Expected an error when writing to read-only file #{filename}"
+  assert_eq os.read_file_string(filename).unwrap, "shmorp"
+}
+
+test "ReadDir" { |t|
+  t.chdir(t.temp_dir)
+  assert os.read_dir("rumpelstilzchen").err?, "ReadDir rumpelstilzchen: error expected, none found"
+  filename = t.temp_dir + "/foo"
+  f = os.create(filename).unwrap
+  f.close!.unwrap
+  e = os.read_dir(filename).err
+  assert e != none && e.unwrap.failure.err == "not a directory", "ReadDir #{filename}: ENOTDIR expected, got #{e}"
+  os.write_file("read_test.go", [], 0o644).unwrap
+  os.mkdir("exec", 0o755).unwrap
+  list = os.read_dir(".").unwrap
+  found_file = list.any? { |d| !d.is_dir && d.name == "read_test.go" }
+  found_sub_dir = list.any? { |d| d.is_dir && d.name == "exec" }
+  assert found_file, "ReadDir .: read_test.go file not found"
+  assert found_sub_dir, "ReadDir .: exec directory not found"
+}
+
+test "ReadDirFD" { |t|
+  dir = "/dev/fd"
+  t.skip("no #{dir}") if os.stat(dir).err?
+  os.read_dir(dir).unwrap
+}
+
+# ---------------------------------------------------------------- stat_test.go
+
+def test_is_dir(t: testing.T, path: Str, fi: os.FileInfo) {
+  t.error("#{path} should be a directory") if !fi.is_dir
+  t.error("#{path} should not be a symlink") if fi.is_symlink
+}
+
+def test_is_symlink(t: testing.T, path: Str, fi: os.FileInfo) {
+  t.error("#{path} should not be a directory") if fi.is_dir
+  t.error("#{path} should be a symlink") if !fi.is_symlink
+}
+
+def test_is_file(t: testing.T, path: Str, fi: os.FileInfo) {
+  t.error("#{path} should not be a directory") if fi.is_dir
+  t.error("#{path} should not be a symlink") if fi.is_symlink
+}
+
+# kind: 0 directory, 1 file, 2 symlink to a directory, 3 symlink to a file.
+def check_stat(t: testing.T, path: Str, fi: os.FileInfo, kind: Int) {
+  if kind == 0 || kind == 2 {
+    test_is_dir(t, path, fi)
+  } else {
+    test_is_file(t, path, fi)
+  }
+}
+
+def check_lstat(t: testing.T, path: Str, fi: os.FileInfo, kind: Int) {
+  case kind {
+    0 => test_is_dir(t, path, fi)
+    1 => test_is_file(t, path, fi)
+    _ => test_is_symlink(t, path, fi)
+  }
+}
+
+def test_stat_and_lstat(t: testing.T, path: Str, kind: Int) {
+  is_link = kind >= 2
+  sfi = os.stat(path).unwrap
+  check_stat(t, path, sfi, kind)
+  lsfi = os.lstat(path).unwrap
+  check_lstat(t, path, lsfi, kind)
+  if is_link {
+    t.error("stat and lstat of #{path} should not be the same") if os.same_file(sfi, lsfi)
+  } else {
+    t.error("stat and lstat of #{path} should be the same") if !os.same_file(sfi, lsfi)
+  }
+  f = os.open(path).unwrap
+  sfi2 = f.stat.unwrap
+  f.close!.unwrap
+  check_stat(t, path, sfi2, kind)
+  t.error("stat of open #{path} file and stat of #{path} should be the same") if !os.same_file(sfi, sfi2)
+  if is_link {
+    t.error("stat of opened #{path} file and lstat of #{path} should not be the same") if os.same_file(sfi2, lsfi)
+  } else {
+    t.error("stat of opened #{path} file and lstat of #{path} should be the same") if !os.same_file(sfi2, lsfi)
+  }
+  parentdir = filepath.dir(path) + "/"
+  base = filepath.base(path)
+  return if path.end_with?("/")
+  parent = os.open(parentdir).unwrap
+  fis = parent.readdir!(-1).unwrap
+  parent.close!.unwrap
+  found = fis.select { it.name == base }
+  if found.size == 0 {
+    t.error("failed to find #{path} in its parent")
+    return
+  }
+  lsfi2 = found[0]
+  check_lstat(t, path, lsfi2, kind)
+  t.error("lstat of #{base} file in #{parentdir} directory and #{path} should be the same") if !os.same_file(lsfi, lsfi2)
+}
+
+def test_symlink_same_file(t: testing.T, path: Str, link: Str) {
+  pathfi = os.stat(path).unwrap
+  linkfi = os.stat(link).unwrap
+  t.error("os.Stat(#{path}) and os.Stat(#{link}) are not the same file") if !os.same_file(pathfi, linkfi)
+  linkfi2 = os.lstat(link).unwrap
+  t.error("os.Stat(#{path}) and os.Lstat(#{link}) are the same file") if os.same_file(pathfi, linkfi2)
+}
+
+def test_symlink_same_file_open(t: testing.T, link: Str) {
+  f = os.open(link).unwrap
+  fi = f.stat.unwrap
+  f.close!.unwrap
+  fi2 = os.stat(link).unwrap
+  t.error("os.Open(#{link}).Stat() and os.Stat(#{link}) are not the same file") if !os.same_file(fi, fi2)
+}
+
+test "DirAndSymlinkStats" { |t|
+  tmpdir = t.temp_dir
+  dir = tmpdir + "/dir"
+  os.mkdir(dir, 0o777).unwrap
+  test_stat_and_lstat(t, dir, 0)
+  dirlink = tmpdir + "/link"
+  os.symlink(dir, dirlink).unwrap
+  test_stat_and_lstat(t, dirlink, 2)
+  test_symlink_same_file(t, dir, dirlink)
+  test_symlink_same_file_open(t, dirlink)
+  linklink = tmpdir + "/linklink"
+  os.symlink(dirlink, linklink).unwrap
+  test_stat_and_lstat(t, linklink, 2)
+  test_symlink_same_file(t, dir, linklink)
+  test_symlink_same_file_open(t, linklink)
+}
+
+test "FileAndSymlinkStats" { |t|
+  tmpdir = t.temp_dir
+  file = tmpdir + "/file"
+  os.write_file(file, [], 0o644).unwrap
+  test_stat_and_lstat(t, file, 1)
+  filelink = tmpdir + "/link"
+  os.symlink(file, filelink).unwrap
+  test_stat_and_lstat(t, filelink, 3)
+  test_symlink_same_file(t, file, filelink)
+  test_symlink_same_file_open(t, filelink)
+  linklink = tmpdir + "/linklink"
+  os.symlink(filelink, linklink).unwrap
+  test_stat_and_lstat(t, linklink, 3)
+  test_symlink_same_file(t, file, linklink)
+  test_symlink_same_file_open(t, linklink)
+}
+
+test "SymlinkWithTrailingSlash" { |t|
+  tmpdir = t.temp_dir
+  dir = tmpdir + "/dir"
+  os.mkdir(dir, 0o777).unwrap
+  dirlink = tmpdir + "/link"
+  os.symlink(dir, dirlink).unwrap
+  with_slash = dirlink + os.PATH_SEPARATOR
+  test_stat_and_lstat(t, with_slash, 0)
+  fi1 = os.stat(dir).unwrap
+  fi2 = os.stat(with_slash).unwrap
+  assert os.same_file(fi1, fi2), "os.Stat(#{dir}) and os.Stat(#{with_slash}) are not the same file"
+}
+
+test "ClosedStat" { |t|
+  name = t.temp_dir + "/hello"
+  os.write_file(name, "Hello, Gophers\n".bytes, 0o644).unwrap
+  f = os.open(name).unwrap
+  f.close!.unwrap
+  r = f.stat
+  assert r.err?, "Stat succeeded on closed File"
+  assert os.is_closed(r.err.unwrap), "error from Stat on closed file did not match ErrClosed: #{r.err}"
+}
+
+test "StatNotExist" { |t|
+  name = t.temp_dir + "/notfound"
+  assert fs.is_not_exist(os.stat(name).err.unwrap)
+  name2 = t.temp_dir + "/notfounddir/notfound"
+  assert fs.is_not_exist(os.stat(name2).err.unwrap)
+}

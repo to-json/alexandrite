@@ -1,8 +1,13 @@
 # Soak test: N didChange messages of a SIZE-byte document through a pipe into
 # a built alx-lsp (fake compiler), asserting the server's peak RSS stays low.
 #
-#   soak run SERVER FAKE_RULES N SIZE MAX_MB [ALX]  (ALX: use the real exec client with this stand-in compiler)
-#   soak feed N SIZE                             (the client side: framed messages)
+#   soak run SERVER FAKE_RULES N SIZE MAX_MB [ALX [REQS]]
+#       ALX: use the real exec client with this stand-in compiler
+#       REQS: after the edits, REQS completion and REQS documentSymbol requests
+#   soak feed N SIZE [ALX [REQS]]                (the client side: framed messages)
+#
+# The document is `x = 1` lines with a declaration (a def, or a struct with a
+# method) every ~5 KB, so the symbol index has something in it.
 #
 # `run` starts this same binary in `feed` mode and pipes it into the server;
 # os/exec reports each stage's peak RSS (ProcessState.max_rss).
@@ -18,15 +23,27 @@ def num(s: Str) -> ~Int {
   strconv.atoi(s).unwrap
 }
 
-def feed(n: Int, size: Int, alx: Str) -> ~Unit {
+def feed(n: Int, size: Int, alx: Str, reqs: Int) -> ~Unit {
   w = bufio.new_writer(os.stdout)
   uri = "file:///w/soak.alx"
   ~jsonrpc.write_frame(w, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"rootUri\":\"file:///w\",\"capabilities\":{\"general\":{\"positionEncodings\":[\"utf-8\"]}},\"initializationOptions\":{\"alx\":{\"path\":#{jsonrpc.json_string(alx)}}}}}")
-  body = strings.repeat("x = 1\n", size / 6)
+  parts: [Str] = []
+  k = 0
+  while k * 5000 < size {
+    n_lines = (k + 1) * 5000 > size ? (size - k * 5000) / 6 : 830
+    parts << strings.repeat("x = 1\n", n_lines)
+    parts << (k % 2 == 0 ? "def f#{k} -> Int { #{k} }\n" : "struct S#{k} {\n  def m -> Int { 1 }\n}\n")
+    k += 1
+  }
+  body = parts.join("")
   ~jsonrpc.write_frame(w, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"#{uri}\",\"languageId\":\"alexandrite\",\"version\":0,\"text\":#{jsonrpc.json_string(body)}}}}")
   for i in 1...(n + 1) {
     t = "# #{i}\n" + body + (i % 100 == 0 ? "BROKEN\n" : "")
     ~jsonrpc.write_frame(w, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\"#{uri}\",\"version\":#{i}},\"contentChanges\":[{\"text\":#{jsonrpc.json_string(t)}}]}}")
+  }
+  for j in 0...reqs {
+    ~jsonrpc.write_frame(w, "{\"jsonrpc\":\"2.0\",\"id\":#{10 + 2 * j},\"method\":\"textDocument/completion\",\"params\":{\"textDocument\":{\"uri\":\"#{uri}\"},\"position\":{\"line\":#{j % 1000},\"character\":2}}}")
+    ~jsonrpc.write_frame(w, "{\"jsonrpc\":\"2.0\",\"id\":#{11 + 2 * j},\"method\":\"textDocument/documentSymbol\",\"params\":{\"textDocument\":{\"uri\":\"#{uri}\"}}}")
   }
   ~jsonrpc.write_frame(w, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"shutdown\"}")
   ~jsonrpc.write_frame(w, "{\"jsonrpc\":\"2.0\",\"method\":\"exit\"}")
@@ -35,7 +52,7 @@ def feed(n: Int, size: Int, alx: Str) -> ~Unit {
 def soak -> ~Unit {
   mode = os.args[1]
   if mode == "feed" {
-    ~feed(~num(os.args[2]), ~num(os.args[3]), os.args.size > 4 ? os.args[4] : "")
+    ~feed(~num(os.args[2]), ~num(os.args[3]), os.args.size > 4 ? os.args[4] : "", os.args.size > 5 ? ~num(os.args[5]) : 0)
     return
   }
   server = os.args[2]
@@ -44,10 +61,11 @@ def soak -> ~Unit {
   size = ~num(os.args[5])
   max_mb = ~num(os.args[6])
   alx = os.args.size > 7 ? os.args[7] : "" # a stand-in compiler: the real exec client is used
-  me = exec.command(os.args[0], ["feed", os.args[4], os.args[5], alx])
+  reqs = os.args.size > 8 ? os.args[8] : "0"
+  me = exec.command(os.args[0], ["feed", os.args[4], os.args[5], alx, reqs])
   cap = me.pipe(exec.command(server, [])).~capture
   rss = cap.states[1].max_rss / 1048576
-  puts "soak: #{n} changes of #{size} bytes: server exit #{cap.states[1].exit_code}, peak RSS #{rss} MB (limit #{max_mb})"
+  puts "soak: #{n} changes of #{size} bytes, #{reqs} completion + #{reqs} documentSymbol requests: server exit #{cap.states[1].exit_code}, peak RSS #{rss} MB (limit #{max_mb})"
   if rss > max_mb || cap.states[1].exit_code != 0 {
     puts "SOAK FAIL"
     os.exit(1)

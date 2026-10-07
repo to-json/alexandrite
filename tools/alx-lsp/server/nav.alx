@@ -1,0 +1,424 @@
+# Navigation and completion (M2): document symbols, go to definition and
+# completion, all from the outline scanner (package outline). Nothing here
+# type-checks: a name is found by where it is declared, not by what it is.
+#
+# Pure helpers again: `serve` hands in copies of the texts it holds (a `Src`
+# per file) and gets JSON back. Files on disk are read on demand and dropped
+# after the request; there is no cache (a package directory of 840 KB reads
+# and scans in a few milliseconds).
+#
+# What a name resolves against, in order:
+#   - the buffer, then other open buffers of its directory, then the
+#     directory's files on disk (test files only when the buffer is one);
+#   - `pkg.name`, where the buffer says `import "x/y"` (or `import pkg "x/y"`):
+#     the package directory under the std dir, or under the module root when
+#     the path starts with the module path of the nearest alx.mod. Required
+#     modules (the module cache) are not looked up.
+
+import "alx.dev/lsp/jsonrpc"
+import "alx.dev/lsp/outline"
+import "alx.dev/lsp/position"
+import "alx.dev/lsp/protocol"
+import "os"
+import "path"
+import "slices"
+import "strings"
+
+MAX_DIR_FILES = 300 # a directory with more .alx files is not scanned
+MAX_DIRS = 2000     # import-path completion walks at most this many directories
+
+# A file to search: its URI, its text and its outline.
+pub struct Src {
+  uri: Str
+  text: Str
+  syms: [outline.Sym]
+}
+
+# The identifier around (or, `left`, just before) a byte offset, and the
+# identifier before a `.` that precedes it (`qual`: `pkg` in `pkg.name`).
+pub struct Word {
+  qual: Str
+  word: Str
+  lo: Int
+  hi: Int
+}
+
+# The language's keywords (compiler/src/lexer.rs) and the words the parser
+# treats as keywords where they start a declaration or a clause.
+pub def keywords -> [Str] {
+  [
+    "def", "if", "unless", "else", "elsif", "while", "next", "break", "return", "true", "false",
+    "struct", "enum", "interface", "fn", "for", "in", "case", "defer", "fail", "spawn", "none",
+    "pub", "import", "error", "refine", "extern", "test", "bench", "example", "outputs",
+    "using", "select", "self", "it", "is", "like", "loop",
+  ]
+}
+
+def word?(c: Byte) -> Bool { (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 95 }
+
+def upper?(s: Str) -> Bool { s.size > 0 && s[0] >= 65 && s[0] <= 90 }
+
+pub def word_at(text: Str, off0: Int, left: Bool) -> Word {
+  off = off0 < 0 ? 0 : (off0 > text.size ? text.size : off0)
+  lo = off
+  while lo > 0 && word?(text[lo - 1]) {
+    lo -= 1
+  }
+  hi = off
+  if !left {
+    while hi < text.size && word?(text[hi]) {
+      hi += 1
+    }
+    hi += 1 if hi > lo && hi < text.size && (text[hi] == 63 || text[hi] == 33)
+  }
+  qual = ""
+  if lo > 0 && text[lo - 1] == 46 {
+    q = lo - 1
+    while q > 0 && word?(text[q - 1]) {
+      q -= 1
+    }
+    qual = text[q...lo - 1]
+  }
+  Word.new(qual: qual, word: text[lo...hi], lo: lo, hi: hi)
+}
+
+def quoted?(kind: Str) -> Bool { kind == "import" || kind == "test" || kind == "bench" || kind == "example" }
+
+# The end of a symbol's name in its text.
+def name_hi(s: outline.Sym) -> Int { s.lo + s.name.size + (quoted?(s.kind) ? 2 : 0) }
+
+def owner_kind?(kind: Str) -> Bool { kind == "struct" || kind == "enum" || kind == "error" || kind == "interface" || kind == "refine" }
+
+# Is the declaration `pub`? (its line, before the name, says so)
+def public?(text: Str, s: outline.Sym) -> Bool {
+  ls = s.lo
+  while ls > 0 && text[ls - 1] != 10 {
+    ls -= 1
+  }
+  strings.contains(text[ls...s.lo], "pub ")
+}
+
+def range_json(ix: position.Index, lo: Int, hi: Int, enc: Int) -> Str {
+  l1, c1 = ix.position(lo, enc)
+  l2, c2 = ix.position(hi, enc)
+  "{\"start\":{\"line\":#{l1},\"character\":#{c1}},\"end\":{\"line\":#{l2},\"character\":#{c2}}}"
+}
+
+# LSP SymbolKind.
+def symbol_kind(k: Str) -> Int {
+  return 6 if k == "method"
+  return 23 if k == "struct"
+  return 10 if k == "enum" || k == "error"
+  return 11 if k == "interface"
+  return 5 if k == "refine"
+  return 14 if k == "const"
+  return 2 if k == "import"
+  12
+}
+
+# LSP CompletionItemKind.
+def item_kind(k: Str) -> Int {
+  return 2 if k == "method"
+  return 22 if k == "struct"
+  return 13 if k == "enum" || k == "error"
+  return 8 if k == "interface"
+  return 7 if k == "refine"
+  return 21 if k == "const"
+  return 9 if k == "import"
+  3
+}
+
+def symbol_json(s: outline.Sym, ix: position.Index, enc: Int, kids: [Str]) -> Str {
+  start = ix.offset(s.line, 0, position.UTF8)
+  "{\"name\":#{jsonrpc.quote(s.name)},\"detail\":\"#{s.kind}\",\"kind\":#{symbol_kind(s.kind)},\"range\":#{range_json(ix, start, s.hi, enc)},\"selectionRange\":#{range_json(ix, s.lo, name_hi(s), enc)},\"children\":[#{kids.join(",")}]}"
+}
+
+# textDocument/documentSymbol: DocumentSymbol[], methods as children of
+# their type.
+pub def symbols_json(syms: [outline.Sym], text: Str, enc: Int) -> Str {
+  ix = position.index(text)
+  parts: [Str] = []
+  i = 0
+  while i < syms.size {
+    s = syms[i]
+    kids: [Str] = []
+    j = i + 1
+    if s.owner == "" && owner_kind?(s.kind) {
+      while j < syms.size && syms[j].kind == "method" && syms[j].owner == s.name && syms[j].lo < s.hi {
+        kids << symbol_json(syms[j], ix, enc, [])
+        j += 1
+      }
+    }
+    parts << symbol_json(s, ix, enc, kids)
+    i = j
+  }
+  "[" + parts.join(",") + "]"
+}
+
+# The path an import name stands for in these symbols (`fp` for
+# `import fp "path/filepath"`, else the path's last element).
+def import_named(syms: [outline.Sym], name: Str) -> Str? {
+  for s in syms {
+    next unless s.kind == "import"
+    return s.name if (s.owner != "" ? s.owner : path.base(s.name)) == name
+  }
+  none
+}
+
+# The module root and module path of the nearest alx.mod above `dir`.
+def module_of(dir: Str) -> (Str, Str) {
+  d = dir
+  loop {
+    t = os.read_file_string(d + "/alx.mod")
+    if t.ok? {
+      for l in t.unwrap.split("\n") {
+        ws = strings.fields(l)
+        return (d, ws[1]) if ws.size >= 2 && ws[0] == "module"
+      }
+      return ("", "")
+    }
+    up = path.dir(d)
+    return ("", "") if up == d || up == "" || up == "."
+    d = up
+  }
+  ("", "")
+}
+
+def dir?(p: Str) -> Bool {
+  st = os.stat(p)
+  st.ok? && st.unwrap.is_dir
+}
+
+# The directory of an imported package ("" when it can't be found).
+pub def pkg_dir(imp: Str, std: Str, file: Str) -> Str {
+  return std + "/" + imp if std != "" && dir?(std + "/" + imp)
+  root, mp = module_of(path.dir(file))
+  return "" if mp == ""
+  return root if imp == mp
+  return root + imp[mp.size...imp.size] if imp.start_with?(mp + "/") && dir?(root + imp[mp.size...imp.size])
+  ""
+}
+
+def test_file?(p: Str) -> Bool { p.end_with?("_test.alx") }
+
+# The .alx files of a directory as sources, minus the paths in `skip`
+# (open buffers); test files only with `tests`.
+pub def dir_sources(dir: Str, skip: [Str], tests: Bool) -> [Src] {
+  out: [Src] = []
+  return out if dir == ""
+  es = os.read_dir(dir)
+  return out unless es.ok?
+  names = es.unwrap.select { !it.is_dir && it.name.end_with?(".alx") && (tests || !test_file?(it.name)) }
+  return out if names.size > MAX_DIR_FILES
+  for e in names {
+    p = dir + "/" + e.name
+    next if skip.any? { it == p }
+    t = os.read_file_string(p)
+    next unless t.ok?
+    text = t.unwrap
+    out << Src.new(uri: protocol.path_to_uri(p), text: text, syms: outline.outline(text))
+  }
+  out
+}
+
+def location_json(src: Src, s: outline.Sym, enc: Int) -> Str {
+  ix = position.index(src.text)
+  "{\"uri\":#{jsonrpc.quote(src.uri)},\"range\":#{range_json(ix, s.lo, name_hi(s), enc)}}"
+}
+
+def locations_json(locs: [Str]) -> Str {
+  return "null" if locs.size == 0
+  return locs[0] if locs.size == 1
+  "[" + locs.join(",") + "]"
+}
+
+def top?(s: outline.Sym) -> Bool { s.owner == "" && s.kind != "import" && !quoted?(s.kind) }
+
+# The sources a name in `cur` can see: itself, the other open buffers of
+# its directory (`others`), and its directory on disk.
+def unit_sources(cur: Src, others: [Src]) -> [Src] {
+  fp = protocol.uri_to_path(cur.uri)
+  skip = [fp] + others.map { protocol.uri_to_path(it.uri) }
+  [cur] + others + dir_sources(fp == "" ? "" : path.dir(fp), skip, test_file?(fp))
+}
+
+# textDocument/definition at byte offset `off` of `cur`: a Location, a
+# Location[] (a method name with an unknown receiver), or null.
+pub def definition_json(cur: Src, others: [Src], off: Int, enc: Int, std: Str) -> Str {
+  w = word_at(cur.text, off, false)
+  return "null" if w.word == ""
+  fp = protocol.uri_to_path(cur.uri)
+  if w.qual != "" && !upper?(w.qual) {
+    if imp = import_named(cur.syms, w.qual) {
+      dir = pkg_dir(imp, std, fp)
+      for src in dir_sources(dir, [], false) {
+        for s in src.syms {
+          return location_json(src, s, enc) if top?(s) && s.name == w.word && public?(src.text, s)
+        }
+      }
+      return "null"
+    }
+  }
+  if w.qual == "" && import_named(cur.syms, w.word) != none {
+    for s in cur.syms {
+      return location_json(cur, s, enc) if s.kind == "import" && (s.owner != "" ? s.owner : path.base(s.name)) == w.word
+    }
+  }
+  srcs = unit_sources(cur, others)
+  locs: [Str] = []
+  if upper?(w.qual) {
+    for src in srcs {
+      for s in src.syms {
+        locs << location_json(src, s, enc) if s.kind == "method" && s.owner == w.qual && s.name == w.word
+      }
+    }
+    return locations_json(locs)
+  }
+  for src in srcs {
+    for s in src.syms {
+      return location_json(src, s, enc) if top?(s) && s.name == w.word
+    }
+  }
+  # a method: the receiver's type is unknown here, so every method so named
+  for src in srcs {
+    for s in src.syms {
+      locs << location_json(src, s, enc) if s.kind == "method" && s.name == w.word && locs.size < 20
+    }
+  }
+  locations_json(locs)
+}
+
+def item_json(label: Str, kind: Int, detail: Str) -> Str {
+  "{\"label\":#{jsonrpc.quote(label)},\"kind\":#{kind},\"detail\":#{jsonrpc.quote(detail)}}"
+}
+
+# Inside `import "...`: the offset of the path's first byte in `line`.
+def import_prefix(line: Str) -> Int? {
+  ind = line.size - strings.trim_left(line, " \t").size
+  return none unless line[ind...line.size].start_with?("import ")
+  q = strings.index_byte(line, 34)
+  return none if q < 0 || strings.index_byte(line[q + 1...line.size], 34) >= 0
+  return none if strings.contains(strings.trim_space(line[ind + 6...q]), " ")
+  q + 1
+}
+
+# Package directories under `root` (relative paths, with `prefix`): those
+# holding a non-test .alx file; testdata, internal and dot directories left out.
+def package_dirs(root: Str, prefix: Str) -> [Str] {
+  out: [Str] = []
+  todo = [""]
+  seen = 0
+  while todo.size > 0 && seen < MAX_DIRS {
+    rel = todo[todo.size - 1]
+    todo = todo[0...todo.size - 1]
+    seen += 1
+    es = os.read_dir(rel == "" ? root : root + "/" + rel)
+    next unless es.ok?
+    pkg = false
+    for e in es.unwrap {
+      if e.is_dir {
+        n = e.name
+        next if n == "testdata" || n == "internal" || n.start_with?(".") || n == "target" || n == "node_modules"
+        todo << (rel == "" ? n : rel + "/" + n)
+      } else if e.name.end_with?(".alx") && !test_file?(e.name) {
+        pkg = true
+      }
+    }
+    out << (rel == "" ? prefix : (prefix == "" ? rel : prefix + "/" + rel)) if pkg && (rel != "" || prefix != "")
+  }
+  slices.sort(out)
+  out
+}
+
+# textDocument/completion at byte offset `off` of `cur`: a CompletionList.
+pub def completion_json(cur: Src, others: [Src], off0: Int, enc: Int, std: Str) -> Str {
+  off = off0 > cur.text.size ? cur.text.size : off0
+  ix = position.index(cur.text)
+  ln, _c = ix.line_col(off)
+  lstart = ix.offset(ln, 0, position.UTF8)
+  fp = protocol.uri_to_path(cur.uri)
+  items: [Str] = []
+  if q = import_prefix(cur.text[lstart...off]) {
+    plo = lstart + q
+    partial = cur.text[plo...off]
+    rng = range_json(ix, plo, off, enc)
+    cands = std == "" ? [] : package_dirs(std, "")
+    root, mp = module_of(fp == "" ? "" : path.dir(fp))
+    cands = cands + package_dirs(root, mp) if mp != ""
+    for p in cands {
+      next unless p.start_with?(partial)
+      items << "{\"label\":#{jsonrpc.quote(p)},\"kind\":9,\"textEdit\":{\"range\":#{rng},\"newText\":#{jsonrpc.quote(p)}}}"
+    }
+    return "{\"isIncomplete\":false,\"items\":[#{items.join(",")}]}"
+  }
+  w = word_at(cur.text, off, true)
+  seen: Map[Str, Bool] = {}
+  if w.qual != "" {
+    if !upper?(w.qual) {
+      if imp = import_named(cur.syms, w.qual) {
+        for src in dir_sources(pkg_dir(imp, std, fp), [], false) {
+          for s in src.syms {
+            next unless top?(s) && !seen.has_key?(s.name) && public?(src.text, s)
+            seen[s.name] = true
+            items << item_json(s.name, item_kind(s.kind), s.kind)
+          }
+        }
+      }
+    } else {
+      for src in unit_sources(cur, others) {
+        for s in src.syms {
+          next unless s.kind == "method" && s.owner == w.qual && !seen.has_key?(s.name)
+          seen[s.name] = true
+          items << item_json(s.name, 2, w.qual)
+        }
+      }
+    }
+    return "{\"isIncomplete\":false,\"items\":[#{items.join(",")}]}"
+  }
+  for k in keywords {
+    seen[k] = true
+    items << item_json(k, 14, "keyword")
+  }
+  for s in cur.syms {
+    next unless s.kind == "import"
+    n = s.owner != "" ? s.owner : path.base(s.name)
+    next if seen.has_key?(n)
+    seen[n] = true
+    items << item_json(n, 9, s.name)
+  }
+  for src in unit_sources(cur, others) {
+    for s in src.syms {
+      next unless top?(s) && !seen.has_key?(s.name)
+      seen[s.name] = true
+      items << item_json(s.name, item_kind(s.kind), s.kind)
+    }
+  }
+  "{\"isIncomplete\":false,\"items\":[#{items.join(",")}]}"
+}
+
+pub def nav_method?(m: Str) -> Bool {
+  m == "textDocument/documentSymbol" || m == "textDocument/definition" || m == "textDocument/completion"
+}
+
+# The std directory names resolve against: as for checks (std_dir_for),
+# else the repo's std above the file, else $ALX_STD_DIR ("" if none: the
+# embedded std has no files to point at).
+pub def nav_std(setting: Str, ws_std: Str, file: Str) -> Str {
+  s = std_dir_for(setting, ws_std, file)
+  s = repo_std(file) if s == "" && file != ""
+  s = os.getenv("ALX_STD_DIR") || "" if s == ""
+  s
+}
+
+# The result of a navigation request on `cur` (`open`: the client has it
+# open; otherwise there is nothing to answer from).
+pub def answer(method: Str, cur: Src, others: [Src], open: Bool, params: Str, enc: Int, std: Str) -> Str {
+  if method == "textDocument/documentSymbol" {
+    return open ? symbols_json(cur.syms, cur.text, enc) : "[]"
+  }
+  return (method == "textDocument/definition" ? "null" : "{\"isIncomplete\":false,\"items\":[]}") unless open
+  ix = position.index(cur.text)
+  off = ix.offset(jsonrpc.int_at(params, ["position", "line"]) || 0, jsonrpc.int_at(params, ["position", "character"]) || 0, enc)
+  return definition_json(cur, others, off, enc, std) if method == "textDocument/definition"
+  completion_json(cur, others, off, enc, std)
+}

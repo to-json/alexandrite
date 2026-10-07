@@ -23,6 +23,7 @@ import "strings"
 #          body, including `def self.name` and an interface's methods)
 #   name   the bare name; an import's path; a test's string, unquoted
 #   owner  a method's type (or refinement); an import's alias; else ""
+#          (names and owners are copies, not slices of the text)
 #   lo     byte offset of the name (a test's or import's opening quote)
 #   hi     byte offset just past the declaration: past its closing brace,
 #          or the end of its line when it has no body
@@ -178,13 +179,55 @@ def skip_attrs(s: Str, i0: Int) -> Int {
   i
 }
 
-# A declaration head found at a statement start.
+# A declaration head found at a statement start. Only numbers: a head is
+# made per statement, and strings in it would tie the caller's results to
+# it (alx explain mem: "stored into more than one of the caller's objects").
 struct Head {
-  kind: Str
+  kind: Int # see kind_name
   name_lo: Int
   name_hi: Int
-  owner: Str # an import's alias
-  next: Int  # where scanning resumes
+  alias_lo: Int # an import's alias
+  alias_hi: Int
+}
+
+def kind_name(k: Int) -> Str {
+  case k {
+    1 => "def"
+    2 => "method"
+    3 => "extern"
+    4 => "struct"
+    5 => "enum"
+    6 => "interface"
+    7 => "error"
+    8 => "refine"
+    9 => "import"
+    10 => "test"
+    11 => "bench"
+    12 => "example"
+    _ => "const"
+  }
+}
+
+# The type keyword at i (struct, enum, interface, error, refine) as a kind
+# with its length, or (0, 0).
+def type_kw(s: Str, i: Int) -> (Int, Int) {
+  return (4, 6) if kw(s, i, "struct")
+  return (5, 4) if kw(s, i, "enum")
+  return (6, 9) if kw(s, i, "interface")
+  return (7, 5) if kw(s, i, "error")
+  return (8, 6) if kw(s, i, "refine")
+  (0, 0)
+}
+
+def test_kw(s: Str, i: Int) -> (Int, Int) {
+  return (10, 4) if kw(s, i, "test")
+  return (11, 5) if kw(s, i, "bench")
+  return (12, 7) if kw(s, i, "example")
+  (0, 0)
+}
+
+def head(kind: Int, lo: Int, hi: Int) -> Head {
+  Head.new(kind: kind, name_lo: lo, name_hi: hi, alias_lo: 0, alias_hi: 0)
 }
 
 # The declaration starting at i, if any. `member`: inside a type's body,
@@ -199,7 +242,7 @@ def head_at(s: Str, i0: Int, member: Bool, top: Bool) -> Head? {
     i = skip_blank(s, i + 5) if member && at(s, i, "self.")
     e = def_name_end(s, i)
     return none if e == i
-    return Head.new(kind: member ? "method" : "def", name_lo: i, name_hi: e, owner: "", next: e)
+    return head(member ? 2 : 1, i, e)
   }
   return none if member
   if kw(s, i, "extern") {
@@ -208,15 +251,13 @@ def head_at(s: Str, i0: Int, member: Bool, top: Bool) -> Head? {
     k = skip_blank(s, k + 3)
     e = def_name_end(s, k)
     return none if e == k
-    return Head.new(kind: "extern", name_lo: k, name_hi: e, owner: "", next: e)
+    return head(3, k, e)
   }
-  for w in ["struct", "enum", "interface", "error", "refine"] {
-    if kw(s, i, w) {
-      k = skip_blank(s, i + w.size)
-      return none unless k < s.size && upper?(s[k])
-      e = word_end(s, k)
-      return Head.new(kind: w, name_lo: k, name_hi: e, owner: "", next: e)
-    }
+  tk, tn = type_kw(s, i)
+  if tk > 0 {
+    k = skip_blank(s, i + tn)
+    return none unless k < s.size && upper?(s[k])
+    return head(tk, k, word_end(s, k))
   }
   if kw(s, i, "import") {
     k = skip_blank(s, i + 6)
@@ -229,24 +270,23 @@ def head_at(s: Str, i0: Int, member: Bool, top: Bool) -> Head? {
     return none unless k < s.size && s[k] == 34
     e = quoted_end(s, k)
     return none unless e > k + 1 && s[e - 1] == 34
-    return Head.new(kind: "import", name_lo: k, name_hi: e, owner: s[alias_lo...alias_hi], next: e)
+    return Head.new(kind: 9, name_lo: k, name_hi: e, alias_lo: alias_lo, alias_hi: alias_hi)
   }
-  for w in ["test", "bench", "example"] {
-    if kw(s, i, w) {
-      k = skip_blank(s, i + w.size)
-      return none unless k < s.size && s[k] == 34
-      e = quoted_end(s, k)
-      return none unless e > k + 1 && s[e - 1] == 34
-      b = skip_blank(s, e)
-      return none unless b < s.size && s[b] == 123
-      return Head.new(kind: w, name_lo: k, name_hi: e, owner: "", next: e)
-    }
+  xk, xn = test_kw(s, i)
+  if xk > 0 {
+    k = skip_blank(s, i + xn)
+    return none unless k < s.size && s[k] == 34
+    e = quoted_end(s, k)
+    return none unless e > k + 1 && s[e - 1] == 34
+    b = skip_blank(s, e)
+    return none unless b < s.size && s[b] == 123
+    return head(xk, k, e)
   }
   if top && i < s.size && upper?(s[i]) {
     e = word_end(s, i)
     k = skip_blank(s, e)
     if k < s.size && ((s[k] == 61 && !(k + 1 < s.size && (s[k + 1] == 61 || s[k + 1] == 62))) || (s[k] == 58 && !(k + 1 < s.size && s[k + 1] == 58))) {
-      return Head.new(kind: "const", name_lo: i, name_hi: e, owner: "", next: e)
+      return head(13, i, e)
     }
   }
   none
@@ -254,17 +294,22 @@ def head_at(s: Str, i0: Int, member: Bool, top: Bool) -> Head? {
 
 # A declaration keyword at column 0 that ends an unclosed brace (recovery).
 def strong?(s: Str, i: Int) -> Bool {
-  for w in ["def", "fn", "pub", "struct", "enum", "interface", "extern"] {
-    return true if kw(s, i, w)
+  return true if kw(s, i, "def") || kw(s, i, "fn") || kw(s, i, "pub") || at(s, i, "ƒ") || kw(s, i, "extern")
+  tk, tn = type_kw(s, i)
+  return tk > 0 && i + tn + 1 < s.size && (tk == 4 || tk == 5 || tk == 6 || upper?(s[i + tn + 1])) if tk > 0
+  return true if kw(s, i, "import") && i + 7 < s.size && s[i + 7] == 34
+  xk, xn = test_kw(s, i)
+  xk > 0 && i + xn + 1 < s.size && s[i + xn + 1] == 34
+}
+
+# A copy of a name: a symbol must not keep the whole text alive (a slice
+# would; the language server keeps outlines and replaces texts).
+def own(s: Str) -> Str {
+  out: [Byte] = []
+  for c in s.bytes {
+    out << c
   }
-  return true if at(s, i, "ƒ")
-  for w in ["error", "refine"] {
-    return true if kw(s, i, w) && i + w.size + 1 < s.size && upper?(s[i + w.size + 1])
-  }
-  for w in ["import", "test", "bench", "example"] {
-    return true if kw(s, i, w) && i + w.size + 1 < s.size && s[i + w.size + 1] == 34
-  }
-  false
+  Str.from_bytes(out)
 }
 
 # A body that is open: the symbol, and the brace depth outside it.
@@ -343,19 +388,20 @@ pub def outline(s: Str) -> [Sym] {
             ln += 1 if s[ln_pos] == 10
             ln_pos += 1
           }
-          name = s[h.name_lo...h.name_hi]
-          name = s[h.name_lo + 1...h.name_hi - 1] if s[h.name_lo] == 34
+          kind = kind_name(h.kind)
+          name = own(s[h.name_lo...h.name_hi])
+          name = own(s[h.name_lo + 1...h.name_hi - 1]) if s[h.name_lo] == 34
           if pend >= 0 {
             out[pend].hi = i
           }
           pend = out.size
           pend_depth = depth
           pend_nest = nest
-          out << Sym.new(kind: h.kind, name: name, owner: member ? owner : h.owner, lo: lo, hi: n, line: ln)
-          if depth == 0 && (h.kind == "struct" || h.kind == "enum" || h.kind == "error" || h.kind == "interface" || h.kind == "refine") {
+          out << Sym.new(kind: kind, name: name, owner: member ? owner : own(s[h.alias_lo...h.alias_hi]), lo: lo, hi: n, line: ln)
+          if depth == 0 && h.kind >= 4 && h.kind <= 8 {
             owner_sym = pend
           }
-          i = h.next
+          i = h.name_hi
           next
         }
       }

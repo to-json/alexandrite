@@ -79,7 +79,7 @@ pub def word_at(text: Str, off0: Int, left: Bool) -> Word {
     }
     qual = text[q...lo - 1]
   }
-  Word.new(qual: qual, word: text[lo...hi], lo: lo, hi: hi)
+  Word.new(qual: fresh(qual), word: fresh(text[lo...hi]), lo: lo, hi: hi)
 }
 
 def quoted?(kind: Str) -> Bool { kind == "import" || kind == "test" || kind == "bench" || kind == "example" }
@@ -234,24 +234,55 @@ def locations_json(locs: [Str]) -> Str {
 
 def top?(s: outline.Sym) -> Bool { s.owner == "" && s.kind != "import" && !quoted?(s.kind) }
 
-# The sources a name in `cur` can see: itself, the other open buffers of
-# its directory (`others`), and its directory on disk.
-def unit_sources(cur: Src, others: [Src]) -> [Src] {
-  fp = protocol.uri_to_path(cur.uri)
-  skip = [fp] + others.map { protocol.uri_to_path(it.uri) }
-  [cur] + others + dir_sources(fp == "" ? "" : path.dir(fp), skip, test_file?(fp))
+# The files on disk a name in `cur` can see: the rest of its directory
+# (minus the open buffers, `others`).
+def disk_sources(cur: Src, others: [Src]) -> [Src] {
+  fp = fresh(protocol.uri_to_path(cur.uri))
+  skip: [Str] = [fp]
+  for o in others {
+    skip << fresh(protocol.uri_to_path(o.uri))
+  }
+  dir_sources(fp == "" ? "" : fresh(path.dir(fp)), skip, test_file?(fp))
+}
+
+# Where `word` is declared in `src`, as Location JSON: `mode` 1, a top-level
+# name; 2, a method of `qual`; 3, a method of any type.
+def find(src: Src, mode: Int, qual: Str, word: Str, enc: Int) -> [Str] {
+  out: [Str] = []
+  for s in src.syms {
+    hit = mode == 1 ? top?(s) && s.name == word : (s.kind == "method" && s.name == word && (mode == 3 || s.owner == qual))
+    out << location_json(src, s, enc) if hit
+  }
+  out
+}
+
+# `find` over the buffer, the other open buffers and the disk, in that
+# order; `first`: stop at the first file with a hit.
+def find_all(cur: Src, others: [Src], disk: [Src], mode: Int, qual: Str, word: Str, enc: Int, first: Bool) -> [Str] {
+  locs = find(cur, mode, qual, word, enc)
+  for o in others {
+    return locs if first && locs.size > 0
+    locs = locs + find(o, mode, qual, word, enc)
+  }
+  for d in disk {
+    return locs if first && locs.size > 0
+    locs = locs + find(d, mode, qual, word, enc)
+  }
+  locs
 }
 
 # textDocument/definition at byte offset `off` of `cur`: a Location, a
 # Location[] (a method name with an unknown receiver), or null.
+#
+# Memory: nothing built here keeps a reference to `cur` or `others` (the
+# JSON strings are new), so serve's copies die with the request.
 pub def definition_json(cur: Src, others: [Src], off: Int, enc: Int, std: Str) -> Str {
   w = word_at(cur.text, off, false)
   return "null" if w.word == ""
-  fp = protocol.uri_to_path(cur.uri)
+  fp = fresh(protocol.uri_to_path(cur.uri))
   if w.qual != "" && !upper?(w.qual) {
     if imp = import_named(cur.syms, w.qual) {
-      dir = pkg_dir(imp, std, fp)
-      for src in dir_sources(dir, [], false) {
+      for src in dir_sources(pkg_dir(fresh(imp), std, fp), [], false) {
         for s in src.syms {
           return location_json(src, s, enc) if top?(s) && s.name == w.word && public?(src.text, s)
         }
@@ -264,28 +295,13 @@ pub def definition_json(cur: Src, others: [Src], off: Int, enc: Int, std: Str) -
       return location_json(cur, s, enc) if s.kind == "import" && (s.owner != "" ? s.owner : path.base(s.name)) == w.word
     }
   }
-  srcs = unit_sources(cur, others)
-  locs: [Str] = []
-  if upper?(w.qual) {
-    for src in srcs {
-      for s in src.syms {
-        locs << location_json(src, s, enc) if s.kind == "method" && s.owner == w.qual && s.name == w.word
-      }
-    }
-    return locations_json(locs)
-  }
-  for src in srcs {
-    for s in src.syms {
-      return location_json(src, s, enc) if top?(s) && s.name == w.word
-    }
-  }
+  disk = disk_sources(cur, others)
+  return locations_json(find_all(cur, others, disk, 2, w.qual, w.word, enc, false)) if upper?(w.qual)
+  locs = find_all(cur, others, disk, 1, "", w.word, enc, true)
+  return locs[0] if locs.size > 0
   # a method: the receiver's type is unknown here, so every method so named
-  for src in srcs {
-    for s in src.syms {
-      locs << location_json(src, s, enc) if s.kind == "method" && s.name == w.word && locs.size < 20
-    }
-  }
-  locations_json(locs)
+  all = find_all(cur, others, disk, 3, "", w.word, enc, false)
+  locations_json(all.size > 20 ? all[0...20] : all)
 }
 
 def item_json(label: Str, kind: Int, detail: Str) -> Str {
@@ -330,70 +346,88 @@ def package_dirs(root: Str, prefix: Str) -> [Str] {
   out
 }
 
+# Completion items for the names of `src`: `mode` 1, top-level names
+# (`pub` ones only with `pub_only`); 2, methods of `qual`. `seen` holds the
+# labels given so far.
+def names(src: Src, mode: Int, qual: Str, pub_only: Bool, seen: Map[Str, Bool]) -> [Str] {
+  out: [Str] = []
+  for s in src.syms {
+    ok = mode == 1 ? top?(s) && (!pub_only || public?(src.text, s)) : s.kind == "method" && s.owner == qual
+    next unless ok && !seen.has_key?(s.name)
+    seen[fresh(s.name)] = true
+    out << item_json(s.name, item_kind(s.kind), mode == 1 ? s.kind : qual)
+  }
+  out
+}
+
+def list_json(items: [Str]) -> Str {
+  "{\"isIncomplete\":false,\"items\":[#{items.join(",")}]}"
+}
+
 # textDocument/completion at byte offset `off` of `cur`: a CompletionList.
 pub def completion_json(cur: Src, others: [Src], off0: Int, enc: Int, std: Str) -> Str {
   off = off0 > cur.text.size ? cur.text.size : off0
-  ix = position.index(cur.text)
-  ln, _c = ix.line_col(off)
-  lstart = ix.offset(ln, 0, position.UTF8)
-  fp = protocol.uri_to_path(cur.uri)
-  items: [Str] = []
-  if q = import_prefix(cur.text[lstart...off]) {
-    plo = lstart + q
-    partial = cur.text[plo...off]
-    rng = range_json(ix, plo, off, enc)
+  fp = fresh(protocol.uri_to_path(cur.uri))
+  # inside `import "`: package paths
+  ls = off
+  while ls > 0 && cur.text[ls - 1] != 10 {
+    ls -= 1
+  }
+  if q = import_prefix(cur.text[ls...off]) {
+    ix = position.index(cur.text)
+    rng = range_json(ix, ls + q, off, enc)
+    partial = fresh(cur.text[ls + q...off])
     cands = std == "" ? [] : package_dirs(std, "")
-    root, mp = module_of(fp == "" ? "" : path.dir(fp))
+    root, mp = module_of(fp == "" ? "" : fresh(path.dir(fp)))
     cands = cands + package_dirs(root, mp) if mp != ""
+    items: [Str] = []
     for p in cands {
       next unless p.start_with?(partial)
       items << "{\"label\":#{jsonrpc.quote(p)},\"kind\":9,\"textEdit\":{\"range\":#{rng},\"newText\":#{jsonrpc.quote(p)}}}"
     }
-    return "{\"isIncomplete\":false,\"items\":[#{items.join(",")}]}"
+    return list_json(items)
   }
   w = word_at(cur.text, off, true)
   seen: Map[Str, Bool] = {}
   if w.qual != "" {
+    return list_json([]) unless upper?(w.qual) || import_named(cur.syms, w.qual) != none
     if !upper?(w.qual) {
-      if imp = import_named(cur.syms, w.qual) {
-        for src in dir_sources(pkg_dir(imp, std, fp), [], false) {
-          for s in src.syms {
-            next unless top?(s) && !seen.has_key?(s.name) && public?(src.text, s)
-            seen[s.name] = true
-            items << item_json(s.name, item_kind(s.kind), s.kind)
-          }
-        }
+      items: [Str] = []
+      imp = fresh(import_named(cur.syms, w.qual) || "")
+      for src in dir_sources(pkg_dir(imp, std, fp), [], false) {
+        items = items + names(src, 1, "", true, seen)
       }
-    } else {
-      for src in unit_sources(cur, others) {
-        for s in src.syms {
-          next unless s.kind == "method" && s.owner == w.qual && !seen.has_key?(s.name)
-          seen[s.name] = true
-          items << item_json(s.name, 2, w.qual)
-        }
-      }
+      return list_json(items)
     }
-    return "{\"isIncomplete\":false,\"items\":[#{items.join(",")}]}"
+    items = names(cur, 2, w.qual, false, seen)
+    for o in others {
+      items = items + names(o, 2, w.qual, false, seen)
+    }
+    for d in disk_sources(cur, others) {
+      items = items + names(d, 2, w.qual, false, seen)
+    }
+    return list_json(items)
   }
+  items: [Str] = []
   for k in keywords {
     seen[k] = true
     items << item_json(k, 14, "keyword")
   }
   for s in cur.syms {
     next unless s.kind == "import"
-    n = s.owner != "" ? s.owner : path.base(s.name)
+    n = fresh(s.owner != "" ? s.owner : path.base(s.name))
     next if seen.has_key?(n)
     seen[n] = true
     items << item_json(n, 9, s.name)
   }
-  for src in unit_sources(cur, others) {
-    for s in src.syms {
-      next unless top?(s) && !seen.has_key?(s.name)
-      seen[s.name] = true
-      items << item_json(s.name, item_kind(s.kind), s.kind)
-    }
+  items = items + names(cur, 1, "", false, seen)
+  for o in others {
+    items = items + names(o, 1, "", false, seen)
   }
-  "{\"isIncomplete\":false,\"items\":[#{items.join(",")}]}"
+  for d in disk_sources(cur, others) {
+    items = items + names(d, 1, "", false, seen)
+  }
+  list_json(items)
 }
 
 pub def nav_method?(m: Str) -> Bool {
@@ -404,21 +438,45 @@ pub def nav_method?(m: Str) -> Bool {
 # else the repo's std above the file, else $ALX_STD_DIR ("" if none: the
 # embedded std has no files to point at).
 pub def nav_std(setting: Str, ws_std: Str, file: Str) -> Str {
-  s = std_dir_for(setting, ws_std, file)
-  s = repo_std(file) if s == "" && file != ""
-  s = os.getenv("ALX_STD_DIR") || "" if s == ""
-  s
+  # copies in and out: repo_std stores into its argument's region, and
+  # serve's own values must not be tied to what happens here
+  a = std_dir_for(fresh(setting), fresh(ws_std), fresh(file))
+  return fresh(a) if a != ""
+  b = file == "" ? "" : repo_std(fresh(file))
+  return fresh(b) if b != ""
+  fresh(os.getenv("ALX_STD_DIR") || "")
 }
 
-# The result of a navigation request on `cur` (`open`: the client has it
-# open; otherwise there is nothing to answer from).
-pub def answer(method: Str, cur: Src, others: [Src], open: Bool, params: Str, enc: Int, std: Str) -> Str {
+# The result of a navigation request on the buffer `uri` (`open`: the
+# client has it open; otherwise there is nothing to answer from), its text
+# and outline, and the other open buffers of its directory. Everything is
+# copied first: what the helpers build points into their arguments, and
+# serve's maps must not be tied to that (see serve).
+pub def answer(method: Str, uri: Str, text: Str, syms: [outline.Sym], ouris: [Str], otexts: [Str], open: Bool, params: Str, enc: Int, std: Str) -> Str {
+  t = fresh(text)
+  cur = Src.new(uri: fresh(uri), text: t, syms: copy_syms(syms))
   if method == "textDocument/documentSymbol" {
     return open ? symbols_json(cur.syms, cur.text, enc) : "[]"
   }
   return (method == "textDocument/definition" ? "null" : "{\"isIncomplete\":false,\"items\":[]}") unless open
+  others: [Src] = []
+  for i in 0...ouris.size {
+    ot = fresh(otexts[i])
+    others << Src.new(uri: fresh(ouris[i]), text: ot, syms: outline.outline(ot))
+  }
   ix = position.index(cur.text)
   off = ix.offset(jsonrpc.int_at(params, ["position", "line"]) || 0, jsonrpc.int_at(params, ["position", "character"]) || 0, enc)
-  return definition_json(cur, others, off, enc, std) if method == "textDocument/definition"
-  completion_json(cur, others, off, enc, std)
+  sd = fresh(std)
+  return definition_json(cur, others, off, enc, sd) if method == "textDocument/definition"
+  completion_json(cur, others, off, enc, sd)
+}
+
+# A copy of an outline that shares nothing with it (the index's entries
+# must not reach a function that keeps them: see serve).
+pub def copy_syms(xs: [outline.Sym]) -> [outline.Sym] {
+  out: [outline.Sym] = []
+  for s in xs {
+    out << outline.Sym.new(kind: fresh(s.kind), name: fresh(s.name), owner: fresh(s.owner), lo: s.lo, hi: s.hi, line: s.line)
+  }
+  out
 }

@@ -1153,9 +1153,10 @@ impl DefAssign {
 }
 
 fn strish(f: &TFunc, site_exprs: &HashMap<usize, &TExpr>, n: Node) -> bool {
+    let str_ty = |t: &Ty| matches!(t, Ty::Str) || matches!(t, Ty::Opt(x) if **x == Ty::Str);
     match n {
-        Node::Local(l) => f.locals[l].ty == Ty::Str,
-        Node::Site(s) => site_exprs.get(&s).is_some_and(|e| e.ty == Ty::Str),
+        Node::Local(l) => str_ty(&f.locals[l].ty),
+        Node::Site(s) => site_exprs.get(&s).is_some_and(|e| str_ty(&e.ty)),
         _ => false,
     }
 }
@@ -1265,15 +1266,22 @@ fn owners(f: &TFunc, g: &Graph, fresh: &HashMap<usize, std::collections::HashSet
             }
         }
         // A string stored into it that the walk above didn't enter (it
-        // doesn't step back into strings): in its region when everything
-        // that holds the string is part of what was checked.
+        // doesn't step back into strings): in its region when nothing
+        // long-lived holds it, and every variable that does is the
+        // container, part of what was checked above, or gone by the end of
+        // the iteration (port-issues #276: `text = last_text(..); docs[uri] = text`).
         for s in &g.sites {
             let n = Node::Site(*s);
             if s == def_site || comp.contains(&n) || !strish(f, &g.site_exprs, n) {
                 continue;
             }
             let reach = reaches_from(g, n);
-            if reach.contains(&Node::Local(*c)) && reach.iter().all(|m| *m == n || comp.contains(m)) {
+            let held_ok = |m: &Node| match m {
+                Node::Ret | Node::Global | Node::Caller(_) => false,
+                Node::Local(l) => comp.contains(m) || ok.contains(l) || after_only(l),
+                _ => true,
+            };
+            if reach.contains(&Node::Local(*c)) && reach.iter().all(held_ok) {
                 out.sites.insert(*s, Place::Into(*c));
                 out.into = true;
             }

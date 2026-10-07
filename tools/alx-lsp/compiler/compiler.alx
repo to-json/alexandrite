@@ -65,6 +65,10 @@ pub struct Outcome {
 
 pub interface Client {
   def check!(req: Request) -> Outcome
+  # `alx check --json --types`: the compiler's stdout as it is ("" when it
+  # could not run). Not decoded: the server scans the parts it needs (M2.6;
+  # derived decoding pins what it decodes, port-issues #176).
+  def types!(req: Request) -> Str
 }
 
 # ---------------------------------------------------------------- exec client
@@ -73,16 +77,7 @@ pub struct ExecClient {
   unused: Int
 
   pub def check!(req: Request) -> Outcome {
-    args = ["check", "--json", "--overlays", req.overlay_file]
-    if req.unit != "" {
-      args << "--unit"
-      args << req.unit
-    }
-    args << req.file
-    c = exec.command(req.alx, args)
-    c.check = false
-    c.env = os.environ + ["ALX_STD_DIR=#{req.std_dir}"] if req.std_dir != ""
-    r = run(c)
+    r = run(command(req, false))
     if r.err != none {
       msg = r.err.unwrap.message
       return Outcome.new(report: none, failure: "cannot run #{req.alx}: #{msg}", stderr: "")
@@ -95,6 +90,25 @@ pub struct ExecClient {
     why = cap.state.success ? "output is not JSON" : "exit #{cap.state.exit_code}"
     Outcome.new(report: none, failure: "alx check failed (#{why}): #{first_line(cap.stderr == "" ? cap.stdout : cap.stderr)}", stderr: cap.stderr)
   }
+
+  pub def types!(req: Request) -> Str {
+    r = run(command(req, true))
+    r.ok? ? r.unwrap.stdout : ""
+  }
+}
+
+def command(req: Request, types: Bool) -> exec.Cmd {
+  args = ["check", "--json", "--overlays", req.overlay_file]
+  args << "--types" if types
+  if req.unit != "" {
+    args << "--unit"
+    args << req.unit
+  }
+  args << req.file
+  c = exec.command(req.alx, args)
+  c.check = false
+  c.env = os.environ + ["ALX_STD_DIR=#{req.std_dir}"] if req.std_dir != ""
+  c
 }
 
 # The ONE place the child is run; it gets a timeout so a hung compiler cannot
@@ -157,7 +171,8 @@ pub struct Rule {
   contains: Str
   result: Report
   stderr: Str
-  raw: Str # if non-empty: this text is the compiler's stdout instead of `result`
+  raw: Str   # if non-empty: this text is the compiler's stdout instead of `result`
+  types: Str # if non-empty: what `types!` answers (the stdout of `--types`)
 }
 
 pub struct FakeClient {
@@ -178,6 +193,16 @@ pub struct FakeClient {
       }
     }
     Outcome.new(report: Report.new(unit: "script", root: path.dir(req.file), diagnostics: []), failure: "", stderr: "")
+  }
+
+  # The first rule with `types` that matches the focused file's overlay.
+  pub def types!(req: Request) -> Str {
+    self.calls[0] += 1
+    text = jsonrpc.string_at(os.read_file_string(req.overlay_file).unwrap_or(""), [req.file]) || ""
+    for r in rules {
+      return copy_str(r.types) if r.types != "" && (r.contains == "" || strings.contains(text, r.contains))
+    }
+    ""
   }
 }
 

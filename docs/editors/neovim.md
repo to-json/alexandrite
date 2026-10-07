@@ -60,16 +60,21 @@ What it does:
 - **Completion** (`<C-x><C-o>`, or a completion plugin): keywords, the
   names of the buffer and its package directory, imported package names;
   after `pkg.` the package's `pub` names; after `Type.` its methods; inside
-  `import "` the std and module package paths. No member completion on
-  values yet (`x.` offers nothing).
+  `import "` the std and module package paths. After `x.` on a value, the
+  fields and methods of its type (methods with their signature), asked of
+  the compiler (`alx check --json --types`) when you type the `.`; while the
+  buffer doesn't check, from the last check that did. If the server can't
+  tell `x`'s type, it offers nothing.
 
-None of this type-checks: names come from a scan of the declarations (the
-compiler's own check only drives diagnostics). Hover, references and rename
-are not there yet.
+Symbols, definition and name completion don't type-check: names come from a
+scan of the declarations. Only member completion asks the compiler. Hover,
+references and rename are not there yet.
 
 Memory: the server's peak RSS stays bounded however long the session (the
-soak test: 10,000 edits of a 100 KB document, then 10,000 completion and
-10,000 document-symbol requests, peak at about 22 MB).
+soak test: 10,000 edits of a 100 KB document, then 10,000 completion,
+10,000 document-symbol and 10,000 member-completion requests, peak at about
+25 MB). Each compiler run leaks about 80 KB (port-issues #273), so a very
+long session grows slowly.
 
 ## 3. Tree-sitter: parser and syntax errors
 

@@ -1,0 +1,83 @@
+import "alx.dev/lsp/outline"
+import "alx.dev/lsp/position"
+
+def recv(text: Str) -> (Str, Int, Bool) {
+  r = receiver_at(text, text.size - 1)
+  (r.ident, r.end, r.opt)
+}
+
+test "receiver_at" {
+  assert_eq recv("x = b."), ("b", 5, false)
+  assert_eq recv("  self."), ("self", 6, false)
+  assert_eq recv("p?."), ("p", 1, true)
+  assert_eq recv("a.b."), ("", 3, false)   # a chain: no identifier
+  assert_eq recv("f(1)."), ("", 4, false)  # a call
+  assert_eq recv("xs[0]."), ("", 5, false) # an index
+  assert_eq recv("r.read!."), ("", 7, false)
+  assert_eq recv("x = ."), ("", -1, false)  # nothing before the dot
+  assert_eq recv("1."), ("", -1, false)     # a number
+  assert_eq recv("\"s\"."), ("", -1, false) # a literal: not looked up
+}
+
+test "member_dot: values only" {
+  text = "import \"strings\"\nb.wr strings.re Pt.or 1..2 f(x)."
+  syms = outline.outline(text)
+  assert_eq member_dot(text, syms, 21), 18 # after `b.wr`
+  assert_eq member_dot(text, syms, 32), -1 # `strings.`: a package
+  assert_eq member_dot(text, syms, 38), -1 # `Pt.`: a type
+  assert_eq member_dot(text, syms, 42), -1 # `1..2`
+  assert_eq member_dot(text, syms, text.size), text.size - 1
+  assert_eq member_dot(text, syms, 2), -1 # no dot
+}
+
+test "blank_member keeps offsets" {
+  assert_eq blank_member("x = b.wr + 1", 5, 8), "x = b    + 1"
+  assert_eq blank_member("b.", 1, 2), "b "
+}
+
+OUT = <<~'EOS'
+  {"unit":"script","root":"/w","diagnostics":[],
+  "types":[{"lo":40,"hi":60,"name":"self","type":"Pt","kind":"self"},
+  {"lo":83,"hi":84,"name":"b","type":"strings.Builder","kind":"local"},
+  {"lo":111,"hi":112,"name":"p","type":"Pt?","kind":"local"},
+  {"lo":171,"hi":179,"name":"b.string","type":"Str","kind":"recv"}],
+  "members":{"Pt":[{"name":"x","kind":"field","type":"Int"},{"name":"sum","kind":"method","sig":"-> Int"}],
+  "Str":[{"name":"size","kind":"method","sig":""}],
+  "strings.Builder":[{"name":"write_string!","kind":"method","sig":"(s: Str) -> Int"}]}}
+EOS
+
+test "type_table and member_items" {
+  t = type_table(OUT)
+  assert t.good
+  assert_eq t.ents.size, 4
+  text = " " * 300
+  syms: [outline.Sym] = []
+  # a local by name, nearest binding before the dot
+  items = member_items(text[0...200] + "b." + text[0...10], syms, 201, [t])
+  assert_eq items, ["{\"label\":\"write_string!\",\"kind\":2,\"detail\":\"(s: Str) -> Int\"}"]
+  # optional chaining strips the `?`; fields before methods
+  assert_eq member_items(text[0...200] + "p?." + text[0...10], syms, 202, [t]).size, 2
+  # a recv entry ending at the dot (a chain)
+  chain = text[0...171] + "b.string." + text[0...10]
+  assert_eq member_items(chain, syms, 179, [t]), ["{\"label\":\"size\",\"kind\":2,\"detail\":\"\"}"]
+  # unknown: nothing; and a binding after the dot doesn't count
+  assert_eq member_items(text[0...200] + "zz." + text[0...10], syms, 202, [t]), []
+  assert_eq member_items(text[0...50] + "b." + text[0...10], syms, 51, [t]), []
+  # the second table answers when the first doesn't know
+  assert_eq member_items(text[0...200] + "b." + text[0...10], syms, 201, [empty_tab, t]).size, 1
+  # not JSON at all
+  assert !type_table("panic").good
+}
+
+test "a binding of another def doesn't count" {
+  t = type_table(OUT)
+  # a def starting after the binding of `b` (83) encloses the dot
+  text = " " * 90 + "def f {\n  b.\n}\n"
+  syms = outline.outline(text)
+  assert_eq member_items(text, syms, 100, [t]), []
+}
+
+test "shift_tab moves spans through an edit" {
+  t = shift_tab(type_table(OUT), position.diff("abc", "XXabc"))
+  assert_eq t.ents[1].lo, 85
+}

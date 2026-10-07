@@ -91,6 +91,7 @@ pub def serve[C: compiler.Client](r: bufio.Reader, w: bufio.Writer, client0: C, 
   sent: Map[Str, Str] = {} # uri -> the diagnostics JSON last published
   dirty: [Str] = []
   index: Map[Str, [outline.Sym]] = {} # uri -> the outline of its text (M2: symbols, definition, completion)
+  tabs: Map[Str, TypeTab] = {}        # uri -> the last good type table (M2.6: members after `.`)
   ctx: Map[Str, Str] = {}             # per-session scalars kept in a container: see handshake
   sess = ~handshake(r, w, self_path, real) || return 1
   enc = sess.enc
@@ -107,15 +108,9 @@ pub def serve[C: compiler.Client](r: bufio.Reader, w: bufio.Writer, client0: C, 
         if fpath == "" {
           next
         }
-        parts: [Str] = []
-        for u, t in docs {
-          op = protocol.uri_to_path(u)
-          parts << jsonrpc.quote(op) + ":" + jsonrpc.quote(t) if op != ""
-        }
         req = compiler.Request.new(alx: sess.alx, file: fpath, overlay_file: tmp_dir + "/overlays.json", unit: opts.unit, std_dir: std_dir_for(opts.std_dir, ws_std, fpath))
-        wr = os.write_file(tmp_dir + "/overlays.json", ("{" + parts.join(",") + "}").bytes.to_a, 0o600)
         out = compiler.Outcome.new(report: none, failure: "cannot write overlays: #{tmp_dir}", stderr: "")
-        if wr.ok? {
+        if write_overlays(docs, req.overlay_file, "", "") {
           out = client.check!(req)
         }
         prev = results[focus]
@@ -183,7 +178,30 @@ pub def serve[C: compiler.Client](r: bufio.Reader, w: bufio.Writer, client0: C, 
           ous << u
           ots << t
         }
-        ~send(w, jsonrpc.response(id, answer(method, uri, docs[uri] || "", index[uri] || [], ous, ots, docs.has_key?(uri), msg.params, enc, nav_std(opts.std_dir, ws_std, protocol.uri_to_path(uri)))))
+        # members after `.` on a value (M2.6): from the last good type table
+        # when it knows the receiver, else from a check of the buffer with
+        # that `.` blanked out (a fresh table), then the last good one
+        types: [TypeTab] = []
+        if method == "textDocument/completion" {
+          dot, off = member_at(docs[uri] || "", index[uri] || [], msg.params, enc)
+          fpath = protocol.uri_to_path(uri)
+          known = false
+          if t = tabs[uri] {
+            known = dot >= 0 && resolves(docs[uri] || "", index[uri] || [], dot, t)
+          }
+          if dot >= 0 && fpath != "" && !known {
+            req = compiler.Request.new(alx: sess.alx, file: fpath, overlay_file: tmp_dir + "/overlays.json", unit: opts.unit, std_dir: std_dir_for(opts.std_dir, ws_std, fpath))
+            if write_overlays(docs, req.overlay_file, uri, blank_member(docs[uri] || "", dot, off)) {
+              t = type_table(client.types!(req))
+              types << t
+              tabs[uri] = t if t.good
+            }
+          }
+          if t = tabs[uri] {
+            types << t
+          }
+        }
+        ~send(w, jsonrpc.response(id, answer(method, uri, docs[uri] || "", index[uri] || [], ous, ots, docs.has_key?(uri), msg.params, enc, nav_std(opts.std_dir, ws_std, protocol.uri_to_path(uri)), types)))
       } else {
         ~send(w, jsonrpc.error_response(id, jsonrpc.METHOD_NOT_FOUND, "method not found: #{method}"))
       }
@@ -218,6 +236,9 @@ pub def serve[C: compiler.Client](r: bufio.Reader, w: bufio.Writer, client0: C, 
         }
         docs[uri] = text
         index[uri] = outline.outline(text)
+        if t = tabs[uri] {
+          tabs[uri] = shift_tab(t, e)
+        }
         vers[uri] = jsonrpc.int_at(msg.params, ["textDocument", "version"]) || 0
         dirty << fresh(uri) unless has(dirty, uri)
       }
@@ -229,6 +250,7 @@ pub def serve[C: compiler.Client](r: bufio.Reader, w: bufio.Writer, client0: C, 
         if uri != "" {
           docs.delete(uri)
           index.delete(uri)
+          tabs.delete(uri)
           vers.delete(uri)
           gone = results[uri]
           results.delete(uri)
@@ -265,6 +287,17 @@ def publish(w: bufio.Writer, f: Str, open: Bool, text: Str, vers: Map[Str, Int],
   return if old == js || (old == none && ds.size == 0)
   sent[u] = fresh(js)
   ~send(w, jsonrpc.notification("textDocument/publishDiagnostics", js))
+}
+
+# Writes the open buffers as the overlay JSON {path: text} to `file`; the
+# buffer `focus` (a URI, "" for none) as `focus_text` instead of its text.
+def write_overlays(docs: Map[Str, Str], file: Str, focus: Str, focus_text: Str) -> Bool {
+  parts: [Str] = []
+  for u, t in docs {
+    op = protocol.uri_to_path(u)
+    parts << jsonrpc.quote(op) + ":" + jsonrpc.quote(u == focus ? focus_text : t) if op != ""
+  }
+  os.write_file(file, ("{" + parts.join(",") + "}").bytes.to_a, 0o600).ok?
 }
 
 def uri_of(params: Str) -> Str {

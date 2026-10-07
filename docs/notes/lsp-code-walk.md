@@ -18,17 +18,18 @@ The exit code is whatever `serve` returns: 0 after a clean `shutdown` and `exit`
 
 ## serve, from the top
 
-`serve` in `server/loop.alx` is long, and it's long on purpose. That isn't an accident of growth. Read the header comment of that file before you try to tidy it, because the shape is the fix for a memory leak.
+`serve` in `server/loop.alx` is long, and it used to be long on purpose: its shape was the fix for a memory leak. The compiler fix for that leak (port-issues #177) let most of the odd shape go; read the header comment of that file for the rules that are left.
 
 The state is a handful of local variables:
 
 - `docs`: URI to the text of each open buffer.
-- `uris`: the same URIs as a list.
 - `vers`: URI to the version number the editor gave us.
 - `results`: URI to the last check of that file (an `Entry`).
 - `sent`: URI to the diagnostics JSON we last published, so we don't send the same thing twice.
 - `dirty`: the buffers that changed since the last check.
 - `ctx`: a small map that holds one thing, a `shutdown` request id waiting for a reply.
+- `index`: URI to the outline of that buffer (M2).
+- `tabs`: URI to the last good type table of that buffer (M2.6).
 
 Before the loop, `handshake` answers requests until `initialize` arrives and returns a `Session` (position encoding, settings, workspace root, which `alx` to run). Anything else that arrives first gets "server not initialized".
 
@@ -59,11 +60,11 @@ A consequence you'll feel: while the compiler runs, we're not reading. Messages 
 
 Some of this code looks like it was written by someone who didn't trust the language. It was written by someone who measured it.
 
-- **`fresh(...)` everywhere.** `fresh` copies a string byte by byte. A slice of the incoming message would keep the whole message, up to 100 KB, alive. Copy what you keep.
-- **`docs` is never passed to a function.** The compiler only gives `docs` a region of its own, one that frees the old text when you replace it, while no function receives it and no named local holds one of its keys or texts. So `publish` takes a copy of one text, not the map. And `uris` exists so that no loop has to say `docs.keys`.
-- **`uri_of(msg.params)` repeated instead of a local.** Same reason. A named local tying a key to the loop brings the leak back.
+- **`fresh(...)` on what outlives an iteration.** `fresh` copies a string byte by byte. A slice of the incoming message would keep the whole message, up to 100 KB, alive. So the URIs pushed onto `dirty` and the held `shutdown` id are copies, because they're still around after the message is gone. Texts stored in `docs` are not copied any more: the region analysis now sees that the map owns them and frees the old one when you replace it.
+- **There used to be more.** Until the compiler fix for port-issues #177, `docs` could never be handed to a function, no local could name one of its keys or texts, and a list `uris` stood in for `docs.keys`. That's all gone: `serve` now names `uri` and `text` like any code would, and `write_overlays` and `publish` take the map or its texts directly. The soak went from 21 MB to 12 MB when the workarounds came out.
+- **`answer` copies its arguments.** That one is still needed (port-issues #272, and see "The memory story" in M2 below).
 
-If you add a variable that holds a key or a text from `docs`, run the soak (`alx run acceptance/run.alx -k LSP`). It sends 10,000 edits of 100 KB and fails over 150 MB. It currently peaks at 22 MB. The underlying compiler limitation is port-issues #177. If someone fixes it, most of this care can go.
+If you change how `serve` holds anything, run the soak (`alx run acceptance/run.alx -k LSP`). It sends 10,000 edits of 100 KB, then 10,000 each of completion, documentSymbol and member completion requests, and fails over 150 MB. It currently peaks at about 25 MB.
 
 ## state.alx
 
@@ -106,7 +107,8 @@ A check that can't produce a report comes back as an `Outcome` with a `failure` 
 - A check that takes longer than 20 seconds is killed and shows up as a "cannot run alx" diagnostic.
 - The server checks one file at a time, in order. Two buffers changed together get two sequential runs.
 - A unit with an uncalled function reports errors in it. That's deliberate (the plan's "check all"), and it's why the compiler's own std had to be cleaned up first.
-- There is no hover, no references, no rename, and no completion of members after `x.` on a value.
+- There is no hover, no references and no rename.
+- Every compiler run costs about 80 KB that is never freed (port-issues #273, in os/exec). A very long session grows by that much per check.
 
 ## M2: symbols, definition, completion
 
@@ -128,9 +130,9 @@ How do we know the scanner agrees with the parser? `alx parse --decls FILE...` (
 
 ### In the server
 
-`serve` keeps one more map, `index`: URI to the outline of that buffer, rebuilt on every `didOpen` and `didChange`. It follows the same rules as `docs` (read the header of loop.alx again): it's never handed to a function, and nothing named holds one of its entries.
+`serve` keeps one more map, `index`: URI to the outline of that buffer, rebuilt on every `didOpen` and `didChange`. It lives and is freed like `docs`.
 
-A request is answered by `answer` in `server/nav.alx`. The loop gives it copies: the buffer's text, its outline, and the texts of the other open buffers in the same directory. `answer` copies them again before doing anything. That looks paranoid. It isn't, see below.
+A request is answered by `answer` in `server/nav.alx`. The loop gives it the buffer's text, its outline, and the texts of the other open buffers in the same directory. `answer` copies them before doing anything. That looks paranoid. It isn't, see below.
 
 - **documentSymbol** turns the outline into `DocumentSymbol`s. A method becomes a child of the type before it. Ranges go through `position`, so they're in the client's encoding.
 - **definition** finds the word under the cursor and the word before a `.` if there is one. `pkg.name` where the buffer imports `pkg`: look in that package's directory, under the std dir or under the module root from `alx.mod`, for a `pub` top-level name. `Type.name`: methods of `Type`. Anything else: a top-level name in the buffer, then the other open buffers of the directory, then the directory's files on disk. If that finds nothing, it's probably a method on a value whose type we don't know, so it returns every method of that name.
@@ -146,5 +148,35 @@ The scanner made a small struct (`Head`) for each declaration it looked at, and 
 
 Then each request leaked about a megabyte, because a helper combined its arguments (`[cur] + others`). The region analysis then treats everything the caller passed as stored in more than one place and gives up on freeing it. The helpers now loop over their arguments instead of joining them, and copy the strings they keep in a map. port-issues #272.
 
-The way to find these is `alx explain mem main.alx` (from tools/alx-lsp) and looking for "program region" or "grows without bound" in `serve` and the `nav` functions. The soak in the `LSP` group now also sends 10,000 completion and 10,000 documentSymbol requests on the 100 KB document; it peaks at about 22 MB. Run it after any change to `nav.alx` or `outline.alx`.
+The way to find these is `alx explain mem main.alx` (from tools/alx-lsp) and looking for "program region" or "grows without bound" in `serve` and the `nav` functions. Run the soak after any change to `nav.alx`, `members.alx` or `outline.alx`.
+
+After the #177 fix I checked both again by putting the old code back. Both still leak, so both workarounds stay.
+
+## M2.6: members after `.`
+
+Type `b.` where `b` is a `strings.Builder`, and the list should hold `write_string!` and friends. The outline can't do that, because it doesn't know what `b` is. The compiler does, so we ask it. `alx check --json --types` adds two things to its report: `types`, the type of every local, parameter, `self`, `it` and receiver expression in the focused file, with their spans; and `members`, the fields and methods of each of those types. That's in `server/members.alx`.
+
+### When we ask
+
+Only when a completion request comes in right after a `.` on a value (`member_dot` says no for `Type.` and `pkg.`, which the outline already answers). Not on every diagnostics check: the type data can be bigger than the file, and nearly every check would throw it away.
+
+There's a catch. When you've just typed `b.`, the buffer doesn't parse, and a buffer that doesn't parse gets no types. So the server checks a slightly different text: the same buffer with the `.` and whatever you typed after it replaced by spaces (`blank_member`). `b.wr` becomes `b   `, which parses, and every offset stays where it was. The binding of `b` is in the answer.
+
+### Which entry is the receiver
+
+`receiver_at` looks backward from the dot. A plain identifier (`b`, `self`, `it`) is looked up by name: the nearest binding before the dot, inside the def that holds the dot (the outline tells us where that def starts, so a `b` from another function doesn't count). Anything else, a call like `f(x).` or a chain like `a.b.`, is looked up as a `recv` entry whose span ends at the dot. Blanking out the dot means the fresh check never has that entry, so chains come only from an older table that saw the chain whole. That's the next part.
+
+### The last good table
+
+A check that reports no errors gives a good table, and the server keeps it per buffer in `tabs`. On every edit its spans move through the edit, like the diagnostics do (`shift_tab`). When the fresh check fails, say because there's a second broken spot elsewhere in the file, or the def you're in doesn't type-check with the blank in it, the receiver is looked up in that table instead. If neither knows it, the answer is an empty list, not a guess.
+
+And when the last good table already knows the receiver, the server doesn't run the compiler at all. That's partly speed, and partly memory: every run of a child process leaks about 80 KB in os/exec (port-issues #273), so runs we don't need are runs we shouldn't make.
+
+### Not decoding
+
+The output is never decoded into structs with `from_json`, because derived decoding keeps what it decodes alive forever (port-issues #176). `type_table` walks the `types` array with the same scanner the message reader uses and keeps small structs; `members` stays a JSON string, and `member_items` pulls out one key's array when it needs it.
+
+### Tests
+
+`members_test.alx` covers receiver detection and the table lookups. `testdata/session_member.in` is a scripted session that runs the real compiler (the replay tool's `real:ALX` mode): a std type, a local struct, `self`, a chain from the last good table, and a buffer that doesn't parse. The soak adds 10,000 member completions; with the fake compiler's table they're answered from the last good table after the first run.
 

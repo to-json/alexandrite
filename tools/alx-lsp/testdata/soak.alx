@@ -1,10 +1,11 @@
 # Soak test: N didChange messages of a SIZE-byte document through a pipe into
 # a built alx-lsp (fake compiler), asserting the server's peak RSS stays low.
 #
-#   soak run SERVER FAKE_RULES N SIZE MAX_MB [ALX [REQS]]
+#   soak run SERVER FAKE_RULES N SIZE MAX_MB [ALX [REQS [DOTS]]]
 #       ALX: use the real exec client with this stand-in compiler
 #       REQS: after the edits, REQS completion and REQS documentSymbol requests
-#   soak feed N SIZE [ALX [REQS]]                (the client side: framed messages)
+#       DOTS: then DOTS completions after `b.` (each runs ALX --types)
+#   soak feed N SIZE [ALX [REQS [DOTS]]]         (the client side: framed messages)
 #
 # The document is `x = 1` lines with a declaration (a def, or a struct with a
 # method) every ~5 KB, so the symbol index has something in it.
@@ -23,11 +24,11 @@ def num(s: Str) -> ~Int {
   strconv.atoi(s).unwrap
 }
 
-def feed(n: Int, size: Int, alx: Str, reqs: Int) -> ~Unit {
+def feed(n: Int, size: Int, alx: Str, reqs: Int, dots: Int) -> ~Unit {
   w = bufio.new_writer(os.stdout)
   uri = "file:///w/soak.alx"
   ~jsonrpc.write_frame(w, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"rootUri\":\"file:///w\",\"capabilities\":{\"general\":{\"positionEncodings\":[\"utf-8\"]}},\"initializationOptions\":{\"alx\":{\"path\":#{jsonrpc.json_string(alx)}}}}}")
-  parts: [Str] = []
+  parts: [Str] = ["b.\n"]
   k = 0
   while k * 5000 < size {
     n_lines = (k + 1) * 5000 > size ? (size - k * 5000) / 6 : 830
@@ -45,6 +46,9 @@ def feed(n: Int, size: Int, alx: Str, reqs: Int) -> ~Unit {
     ~jsonrpc.write_frame(w, "{\"jsonrpc\":\"2.0\",\"id\":#{10 + 2 * j},\"method\":\"textDocument/completion\",\"params\":{\"textDocument\":{\"uri\":\"#{uri}\"},\"position\":{\"line\":#{j % 1000},\"character\":2}}}")
     ~jsonrpc.write_frame(w, "{\"jsonrpc\":\"2.0\",\"id\":#{11 + 2 * j},\"method\":\"textDocument/documentSymbol\",\"params\":{\"textDocument\":{\"uri\":\"#{uri}\"}}}")
   }
+  for j in 0...dots {
+    ~jsonrpc.write_frame(w, "{\"jsonrpc\":\"2.0\",\"id\":#{10 + 2 * reqs + j},\"method\":\"textDocument/completion\",\"params\":{\"textDocument\":{\"uri\":\"#{uri}\"},\"position\":{\"line\":1,\"character\":2}}}")
+  }
   ~jsonrpc.write_frame(w, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"shutdown\"}")
   ~jsonrpc.write_frame(w, "{\"jsonrpc\":\"2.0\",\"method\":\"exit\"}")
 }
@@ -52,7 +56,7 @@ def feed(n: Int, size: Int, alx: Str, reqs: Int) -> ~Unit {
 def soak -> ~Unit {
   mode = os.args[1]
   if mode == "feed" {
-    ~feed(~num(os.args[2]), ~num(os.args[3]), os.args.size > 4 ? os.args[4] : "", os.args.size > 5 ? ~num(os.args[5]) : 0)
+    ~feed(~num(os.args[2]), ~num(os.args[3]), os.args.size > 4 ? os.args[4] : "", os.args.size > 5 ? ~num(os.args[5]) : 0, os.args.size > 6 ? ~num(os.args[6]) : 0)
     return
   }
   server = os.args[2]
@@ -62,10 +66,11 @@ def soak -> ~Unit {
   max_mb = ~num(os.args[6])
   alx = os.args.size > 7 ? os.args[7] : "" # a stand-in compiler: the real exec client is used
   reqs = os.args.size > 8 ? os.args[8] : "0"
-  me = exec.command(os.args[0], ["feed", os.args[4], os.args[5], alx, reqs])
+  dots = os.args.size > 9 ? os.args[9] : "0"
+  me = exec.command(os.args[0], ["feed", os.args[4], os.args[5], alx, reqs, dots])
   cap = me.pipe(exec.command(server, [])).~capture
   rss = cap.states[1].max_rss / 1048576
-  puts "soak: #{n} changes of #{size} bytes, #{reqs} completion + #{reqs} documentSymbol requests: server exit #{cap.states[1].exit_code}, peak RSS #{rss} MB (limit #{max_mb})"
+  puts "soak: #{n} changes of #{size} bytes, #{reqs} completion + #{reqs} documentSymbol + #{dots} member completion requests: server exit #{cap.states[1].exit_code}, peak RSS #{rss} MB (limit #{max_mb})"
   if rss > max_mb || cap.states[1].exit_code != 0 {
     puts "SOAK FAIL"
     os.exit(1)

@@ -65,7 +65,7 @@ Throwaway branch: 1.3's unit selection plus root-level recovery, run on `std/str
 ### 0.5 Timed readability wait and process control (std, runtime)
 
 - `os.File.wait_readable(timeout: Duration) -> ~Bool`: true when a read would not block (data, EOF or error pending), false on timeout. An alx extension (Go has `SetReadDeadline`); documented in the `os` header. On the main thread it is `poll(2)` with a timeout; in a task it parks on the poller. The server's debounce is `if buffered == 0 && !stdin.wait_readable(150ms)`, with bytes already in the `bufio.Reader` checked first. Runtime function in `alx.c` (the JIT links the same C); the oracle and wasm either implement it or refuse it as they do other FFI.
-- `os/exec` gets `Cmd.timeout` (a `Duration`; the stages are SIGKILLed and reaped when it expires and the run fails with `ExecError.Timeout`), documented in the package header (Go: `exec.CommandContext`). The server uses the timeout to survive a hung compiler. `Process.kill` is not built: there is no start/wait split, so no handle to a running process exists; `timeout` is the kill mechanism and `os/signal`'s `kill(pid, sig)` covers a known pid.
+- `os/exec` gets `Cmd.timeout` (a `Duration`; the stages are SIGKILLed and reaped when it expires and the run fails with `ExecError.Timeout`), documented in the package header (Go: `exec.CommandContext`). The server uses the timeout to survive a hung compiler. (Since the merge of main's Go-style `os/exec`, with start/wait and contexts, `Cmd.timeout` is a deadline context fed to its context watcher.)
 - Blocking stdin reads inside tasks (port-issues #166) are fixed only if cheap; the server is single-task and does not depend on it.
 
 Port-issues #166 and #169 are updated with what is found, whatever the outcome.
@@ -212,7 +212,7 @@ Built on branch `lsp-m1` (merge of `lsp-rt`, `lsp-cli`, `lsp-checker`, `lsp-serv
 | 0.2 spike | folded into 1.3/1.4; latencies per unit: net/http 0.8 s, crypto/tls 0.64 s, math/big 0.09 s, small packages 0.02 s |
 | 0.3 `PkgGuard` | done |
 | 0.4 std overlays, real paths | done (overlays reach std files under `ALX_STD_DIR`, not embedded std) |
-| 0.5 `wait_readable`, `Cmd.timeout` | done; `Process.kill` not built (see 0.5) |
+| 0.5 `wait_readable`, `Cmd.timeout` | done (rebuilt on main's Go-style `os/exec` after the merge) |
 | 1.1-1.6 | done (`alx check --json`, `analyze`, collect mode, parser recovery, panic wrapper) |
 | 1.4 exit criterion | met for std packages (`std_packages_report_no_diagnostics`); 14 std `*_test.alx` files still report errors, port-issues rows |
 | 2.x server | done; deviation: overlays go through a temp file (`--overlays FILE`) because `os/exec` pins what a `Cmd` reaches |

@@ -3563,7 +3563,7 @@ int64_t alx_sock_recvfrom(int64_t fd, uint8_t *buf, int64_t n, uint8_t *out) {
  *   [0]      family: 0 none, 1 unix, 4 inet, 6 inet6
  *   [1..2]   port, big-endian (inet, inet6)
  *   [4..7]   inet6 scope id, big-endian; for unix, the path's length
- *   [8..23]  the address (inet: [8..11]); unix: the path (up to 104 bytes,
+ *   [8..23]  the address (inet: [8..11]); unix: the path (up to sun_path: 104 bytes, 108 on Linux;
  *            may hold NULs: Linux's abstract names)
  * Every call returns -errno on failure. */
 
@@ -3636,10 +3636,15 @@ static void sa_to(const struct sockaddr_storage *ss, socklen_t len, uint8_t *out
         size_t n = len > off ? len - off : 0;
         if (n > sizeof u->sun_path) n = sizeof u->sun_path;
         if (n > ALX_SA_SIZE - 8) n = ALX_SA_SIZE - 8;
-        /* A path: up to its NUL. An abstract name (Linux, leading NUL): all
-         * of it. Elsewhere a leading NUL is an unnamed socket. */
+        /* A path: up to its NUL. Elsewhere than Linux a leading NUL is an
+         * unnamed socket. */
 #ifdef __linux__
-        if (n > 0 && u->sun_path[0] != 0) n = strnlen(u->sun_path, n);
+        /* As Go's anyToSockaddr: the length the kernel reports is ignored
+         * (ss is zeroed), and the name runs to its first NUL after any
+         * leading one. So an unnamed socket (an autobind-less dial) is "@". */
+        if (u->sun_path[0] == 0) n = 1 + strnlen(u->sun_path + 1, sizeof u->sun_path - 1);
+        else n = strnlen(u->sun_path, sizeof u->sun_path);
+        if (n > ALX_SA_SIZE - 8) n = ALX_SA_SIZE - 8;
 #else
         n = n > 0 ? strnlen(u->sun_path, n) : 0;
 #endif
@@ -3732,6 +3737,23 @@ int64_t alx_net_sendto(int64_t fd, const uint8_t *buf, int64_t n, const uint8_t 
     return r < 0 ? -errno : (int64_t)r;
 }
 
+/* Whether a sendmsg/recvmsg with control data but no data bytes must carry
+ * one dummy data byte, as Go's syscall.SendmsgN/Recvmsg do: a stream socket
+ * drops control messages sent with no data (Linux), so they ride on one byte.
+ * Linux does this for any socket but SOCK_DGRAM, the BSDs for every socket.
+ * 1 or 0, or -errno. */
+static int msg_dummy_byte(int fd) {
+#ifdef __linux__
+    int ty = 0;
+    socklen_t tl = sizeof ty;
+    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &ty, &tl) < 0) return -errno;
+    return ty != SOCK_DGRAM;
+#else
+    (void)fd;
+    return 1;
+#endif
+}
+
 /* recvmsg(2) with ancillary data: the data into buf, the control messages
  * into oob, and into info (two native int64s) their length and the flags
  * (1 MSG_TRUNC, 2 MSG_CTRUNC); the sender into out. The data length. */
@@ -3739,6 +3761,12 @@ int64_t alx_net_recvmsg(int64_t fd, uint8_t *buf, int64_t n, uint8_t *oob, int64
     struct sockaddr_storage ss;
     memset(&ss, 0, sizeof ss);
     struct iovec iov = { buf, (size_t)n };
+    uint8_t dummy = 0;
+    if (n == 0 && oobn > 0) {
+        int d = msg_dummy_byte((int)fd);
+        if (d < 0) return d;
+        if (d) { iov.iov_base = &dummy; iov.iov_len = 1; }
+    }
     struct msghdr m;
     memset(&m, 0, sizeof m);
     m.msg_name = &ss; m.msg_namelen = sizeof ss;
@@ -3774,14 +3802,23 @@ int64_t alx_net_sendmsg(int64_t fd, const uint8_t *buf, int64_t n, const uint8_t
     }
     uint8_t dummy = 0;
     struct iovec iov = { (void *)buf, (size_t)n };
-    if (n == 0) { iov.iov_base = &dummy; iov.iov_len = 0; }
+    int sent_dummy = 0;
+    if (n == 0) {
+        iov.iov_base = &dummy; iov.iov_len = 0;
+        if (oobn > 0) {
+            sent_dummy = msg_dummy_byte((int)fd);
+            if (sent_dummy < 0) return sent_dummy;
+            if (sent_dummy) iov.iov_len = 1;
+        }
+    }
     struct msghdr m;
     memset(&m, 0, sizeof m);
     if (len) { m.msg_name = &ss; m.msg_namelen = len; }
     m.msg_iov = &iov; m.msg_iovlen = 1;
     if (oobn > 0) { m.msg_control = (void *)oob; m.msg_controllen = (socklen_t)oobn; }
     ssize_t r = sendmsg((int)fd, &m, 0);
-    return r < 0 ? -errno : (int64_t)r;
+    if (r < 0) return -errno;
+    return sent_dummy ? 0 : (int64_t)r;
 }
 
 /* Builds the SCM_RIGHTS control message for fds (n native int64s) into out

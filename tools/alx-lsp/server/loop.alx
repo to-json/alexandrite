@@ -9,11 +9,15 @@
 # computed for are always still current when it is published; an edit that
 # arrives meanwhile is handled next and marks its documents dirty again.
 #
-# Memory (the soak in acceptance, `-k LSP`): the document map `docs` is local to `serve` and gets its own compacting region (regions.rs `owners`) only while NO function receives it and NO named local holds a key, a text or a slice of a message that reaches it (`alx explain mem`: "frame: piles up"). So: `uris` lists the open URIs (no loop names `docs.keys`); texts are copied with `fresh` when stored; per-message values that outlive an iteration (`id`, `fp`, entries of `dirty`) are `fresh` copies, because a slice of the message would keep the whole message (100 KB) alive; contentChanges is read by `jsonrpc.last_text` without a named local.
-#
-# The store (texts, versions, last results) is local to `serve`: texts are
-# stored by the loop function itself, never through a method of a passed-in
-# value, so they live in its region and are freed when replaced.
+# Memory (the soak in acceptance, `-k LSP`): the maps local to `serve`
+# (`docs`, `index`, `results`...) are compacted every iteration by the region
+# analysis (regions.rs `owners`, `alx explain mem`). Values that outlive the
+# iteration they were read in must be copies (`fresh`): the entries of
+# `dirty` and the held `shutdown` id, because a slice of the message would
+# keep the whole message (100 KB) alive. Navigation requests hand `answer`
+# the texts it needs; `answer` copies them before building anything from
+# them (port-issues #272). Before the compiler fix for #177 this loop had to
+# avoid naming any key or text of `docs`; it no longer does.
 
 import "alx.dev/lsp/compiler"
 import "alx.dev/lsp/jsonrpc"
@@ -82,7 +86,6 @@ def handshake(r: bufio.Reader, w: bufio.Writer, self_path: Str, real: Bool) -> ~
 # code (0 after a `shutdown`, 1 otherwise). `fake` replaces the compiler (tests).
 pub def serve[C: compiler.Client](r: bufio.Reader, w: bufio.Writer, client0: C, self_path: Str, tmp_dir: Str, real: Bool, poll: Bool) -> ~Int {
   docs: Map[Str, Str] = {}
-  uris: [Str] = [] # the open documents' URIs, so no loop names docs.keys (see the note above)
   vers: Map[Str, Int] = {}
   results: Map[Str, Entry] = {}
   sent: Map[Str, Str] = {} # uri -> the diagnostics JSON last published
@@ -97,11 +100,7 @@ pub def serve[C: compiler.Client](r: bufio.Reader, w: bufio.Writer, client0: C, 
   state = 1 # 1 initialized, 2 shut down
   loop {
     if dirty.size > 0 && (ctx.has_key?("shutdown") || !input_ready(r, DEBOUNCE_MS, poll)) {
-      opened: [Str] = []
-      for u in uris {
-        opened << fresh(u)
-      }
-      todo = plan(opened, results, dirty)
+      todo = plan(docs.keys, results, dirty)
       dirty = []
       for focus in todo {
         fpath = protocol.uri_to_path(focus)
@@ -109,9 +108,9 @@ pub def serve[C: compiler.Client](r: bufio.Reader, w: bufio.Writer, client0: C, 
           next
         }
         parts: [Str] = []
-        for u in uris {
+        for u, t in docs {
           op = protocol.uri_to_path(u)
-          parts << jsonrpc.quote(op) + ":" + jsonrpc.quote(docs[fresh(u)] || "") if op != ""
+          parts << jsonrpc.quote(op) + ":" + jsonrpc.quote(t) if op != ""
         }
         req = compiler.Request.new(alx: sess.alx, file: fpath, overlay_file: tmp_dir + "/overlays.json", unit: opts.unit, std_dir: std_dir_for(opts.std_dir, ws_std, fpath))
         wr = os.write_file(tmp_dir + "/overlays.json", ("{" + parts.join(",") + "}").bytes.to_a, 0o600)
@@ -142,7 +141,7 @@ pub def serve[C: compiler.Client](r: bufio.Reader, w: bufio.Writer, client0: C, 
           }
         }
         for f in affected {
-          ~publish(w, f, docs.has_key?(protocol.path_to_uri(f)), fresh(docs[protocol.path_to_uri(f)] || ""), vers, results, sent, enc)
+          ~publish(w, f, docs.has_key?(protocol.path_to_uri(f)), docs[protocol.path_to_uri(f)] || "", vers, results, sent, enc)
         }
       }
     }
@@ -167,7 +166,7 @@ pub def serve[C: compiler.Client](r: bufio.Reader, w: bufio.Writer, client0: C, 
       return state == 2 ? 0 : 1
     }
     if msg.request? {
-      id = fresh(msg.id.unwrap)
+      id = msg.id.unwrap
       if method == "shutdown" && state == 1 {
         ctx["shutdown"] = fresh(id)
       } else if state == 2 {
@@ -175,16 +174,16 @@ pub def serve[C: compiler.Client](r: bufio.Reader, w: bufio.Writer, client0: C, 
       } else if method == "initialize" {
         ~send(w, jsonrpc.error_response(id, jsonrpc.INVALID_REQUEST, "already initialized"))
       } else if nav_method?(method) {
-        # the other open buffers of its directory; `answer` copies what it
-        # is given before using it (see the note above)
+        uri = uri_of(msg.params)
+        # the other open buffers of its directory
         ous: [Str] = []
         ots: [Str] = []
-        for u in uris {
-          next if u == uri_of(msg.params) || path.dir(protocol.uri_to_path(u)) != path.dir(protocol.uri_to_path(uri_of(msg.params)))
-          ous << fresh(u)
-          ots << fresh(docs[fresh(u)] || "")
+        for u, t in docs {
+          next if u == uri || path.dir(protocol.uri_to_path(u)) != path.dir(protocol.uri_to_path(uri))
+          ous << u
+          ots << t
         }
-        ~send(w, jsonrpc.response(id, answer(method, uri_of(msg.params), fresh(docs[uri_of(msg.params)] || ""), index[uri_of(msg.params)] || [], ous, ots, docs.has_key?(uri_of(msg.params)), msg.params, enc, nav_std(opts.std_dir, ws_std, protocol.uri_to_path(uri_of(msg.params))))))
+        ~send(w, jsonrpc.response(id, answer(method, uri, docs[uri] || "", index[uri] || [], ous, ots, docs.has_key?(uri), msg.params, enc, nav_std(opts.std_dir, ws_std, protocol.uri_to_path(uri)))))
       } else {
         ~send(w, jsonrpc.error_response(id, jsonrpc.METHOD_NOT_FOUND, "method not found: #{method}"))
       }
@@ -197,49 +196,50 @@ pub def serve[C: compiler.Client](r: bufio.Reader, w: bufio.Writer, client0: C, 
         ~log(w, protocol.MSG_INFO, "#{NAME} #{VERSION}; compiler: #{v}; positions: #{encoding_name(enc)}")
       }
       "textDocument/didOpen" => {
-        # no named locals tie the document map's keys or texts to the loop:
-        # then its storage is compacted each iteration (see regions.rs `owners`)
-        if uri_of(msg.params) != "" && jsonrpc.string_at(msg.params, ["textDocument", "text"]) != none {
-          uris << fresh(uri_of(msg.params)) unless docs.has_key?(uri_of(msg.params))
-          docs[uri_of(msg.params)] = fresh(jsonrpc.string_at(msg.params, ["textDocument", "text"]) || "")
-          index[uri_of(msg.params)] = outline.outline(docs[uri_of(msg.params)] || "")
-          vers[uri_of(msg.params)] = jsonrpc.int_at(msg.params, ["textDocument", "version"]) || 0
-          dirty << fresh(uri_of(msg.params)) unless has(dirty, uri_of(msg.params))
+        uri = uri_of(msg.params)
+        if text = jsonrpc.string_at(msg.params, ["textDocument", "text"]) {
+          if uri != "" {
+            docs[uri] = text
+            index[uri] = outline.outline(text)
+            vers[uri] = jsonrpc.int_at(msg.params, ["textDocument", "version"]) || 0
+            dirty << fresh(uri) unless has(dirty, uri) # outlives the iteration
+          }
         }
       }
       "textDocument/didChange" => {
-        if jsonrpc.last_text(msg.params, ["contentChanges"]) != none && docs.has_key?(uri_of(msg.params)) {
-          e = position.diff(docs[uri_of(msg.params)] || "", jsonrpc.last_text(msg.params, ["contentChanges"]) || "")
-          fp = fresh(protocol.uri_to_path(uri_of(msg.params)))
-          for k in results.keys {
-            en = results[k] || next
-            results[k] = Entry.new(root: en.root, files: en.files, diags: shift_diags(en.diags, fp, e))
-          }
-          docs[uri_of(msg.params)] = fresh(jsonrpc.last_text(msg.params, ["contentChanges"]) || "")
-          index[uri_of(msg.params)] = outline.outline(docs[uri_of(msg.params)] || "")
-          vers[uri_of(msg.params)] = jsonrpc.int_at(msg.params, ["textDocument", "version"]) || 0
-          dirty << fresh(uri_of(msg.params)) unless has(dirty, uri_of(msg.params))
+        uri = uri_of(msg.params)
+        text = jsonrpc.last_text(msg.params, ["contentChanges"]) || next
+        old = docs[uri] || next
+        e = position.diff(old, text)
+        fp = protocol.uri_to_path(uri)
+        for k in results.keys {
+          en = results[k] || next
+          results[k] = Entry.new(root: en.root, files: en.files, diags: shift_diags(en.diags, fp, e))
         }
+        docs[uri] = text
+        index[uri] = outline.outline(text)
+        vers[uri] = jsonrpc.int_at(msg.params, ["textDocument", "version"]) || 0
+        dirty << fresh(uri) unless has(dirty, uri)
       }
       "textDocument/didSave" => {
         dirty << fresh(uri_of(msg.params)) unless uri_of(msg.params) == "" || has(dirty, uri_of(msg.params))
       }
       "textDocument/didClose" => {
-        if uri_of(msg.params) != "" {
-          uris = uris.select { it != uri_of(msg.params) }
-          docs.delete(uri_of(msg.params))
-          index.delete(uri_of(msg.params))
-          vers.delete(uri_of(msg.params))
-          gone = results[uri_of(msg.params)]
-          results.delete(uri_of(msg.params))
-          dirty = dirty.select { it != uri_of(msg.params) }
+        uri = uri_of(msg.params)
+        if uri != "" {
+          docs.delete(uri)
+          index.delete(uri)
+          vers.delete(uri)
+          gone = results[uri]
+          results.delete(uri)
+          dirty = dirty.select { it != uri }
           if g = gone {
             for f in g.files {
-              ~publish(w, f, docs.has_key?(protocol.path_to_uri(f)), fresh(docs[protocol.path_to_uri(f)] || ""), vers, results, sent, enc)
+              ~publish(w, f, docs.has_key?(protocol.path_to_uri(f)), docs[protocol.path_to_uri(f)] || "", vers, results, sent, enc)
             }
           }
           # the buffer's text no longer shadows disk: recheck its dependents
-          dirty << fresh(uri_of(msg.params))
+          dirty << fresh(uri)
         }
       }
       _ => {}
@@ -250,8 +250,7 @@ pub def serve[C: compiler.Client](r: bufio.Reader, w: bufio.Writer, client0: C, 
 
 # Publishes the union over all results of the diagnostics in file `f`
 # (a path); skips it when the list did not change. `text` is the open
-# buffer's text, a copy (handing the document map itself to a function would
-# stop its region from being compacted: see serve).
+# buffer's text.
 def publish(w: bufio.Writer, f: Str, open: Bool, text: Str, vers: Map[Str, Int], results: Map[Str, Entry], sent: Map[Str, Str], enc: Int) -> ~Unit {
   u = protocol.path_to_uri(f)
   all: [compiler.Diag] = []

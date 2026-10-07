@@ -120,7 +120,7 @@ pub fn check_only(file: &str) -> ExitCode {
 
 /// `alx check --json`: one JSON object on stdout (check_json.rs). Exit 0 when
 /// complete, 3 after an internal error, 2 for bad arguments.
-pub fn check_json(file: &str, overlays: Option<&str>, unit: alx::analyze::Force) -> ExitCode {
+pub fn check_json(file: &str, overlays: Option<&str>, unit: alx::analyze::Force, types: bool) -> ExitCode {
     use std::io::{Read, Write};
     let map = match overlays {
         None => Default::default(),
@@ -140,7 +140,7 @@ pub fn check_json(file: &str, overlays: Option<&str>, unit: alx::analyze::Force)
             }
         }
     };
-    let (json, code) = alx::check_json::check_json(Path::new(file), &map, unit);
+    let (json, code) = alx::check_json::check_json(Path::new(file), &map, unit, types);
     let mut out = std::io::stdout().lock();
     let _ = writeln!(out, "{json}");
     let _ = out.flush();

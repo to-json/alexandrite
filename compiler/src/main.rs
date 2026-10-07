@@ -8,7 +8,7 @@ use std::process::ExitCode;
 const USAGE: &str = "usage: alx run [--release] [--sanitize] [--expect VALUE] [--emit-c FILE] [--emit-rust FILE] [-v] file.alx [--] [program args...]
        alx build [--release] [--sanitize] [-o OUT] file.alx
        alx check file.alx
-       alx check --json [--overlays FILE|-] [--unit auto|script|package] file.alx
+       alx check --json [--types] [--overlays FILE|-] [--unit auto|script|package] file.alx
        alx explain mem file.alx
        alx fmt [--check] [files|dirs...]
        alx test [--release] [-v] [-short] [-run NAME[/SUB]] [-bench NAME] [-benchtime DUR] [dir | file_test.alx]";
@@ -33,7 +33,7 @@ fn main() -> ExitCode {
     }
     let mut o = driver::Options::default();
     let mut file = None;
-    let (mut json, mut overlays, mut unit) = (false, None::<String>, alx::analyze::Force::Auto);
+    let (mut json, mut types, mut overlays, mut unit) = (false, false, None::<String>, alx::analyze::Force::Auto);
     let mut t = alx::front::TestOpts { run: None, bench: None, bench_ns: 500_000_000, short: false };
     if let Some(v) = std::env::var("ALX_BENCHTIME").ok().and_then(|v| driver::parse_duration_ns(&v)) {
         t.bench_ns = v;
@@ -51,6 +51,7 @@ fn main() -> ExitCode {
             "-v" | "--verbose" => o.verbose = true,
             "--strict" => o.strict = true,
             "--json" if cmd == "check" => json = true,
+            "--types" if cmd == "check" => types = true,
             "--overlays" if cmd == "check" => overlays = val(),
             "--unit" if cmd == "check" => {
                 unit = match val().as_deref() {
@@ -105,7 +106,7 @@ fn main() -> ExitCode {
     match cmd.as_str() {
         "run" => driver::run(&file, &o),
         "build" => driver::build_only(&file, &o),
-        "check" if json => driver::check_json(&file, overlays.as_deref(), unit),
+        "check" if json => driver::check_json(&file, overlays.as_deref(), unit, types),
         "check" => driver::check_only(&file),
         _ => {
             eprintln!("{USAGE}");

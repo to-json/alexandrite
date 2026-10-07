@@ -161,12 +161,14 @@ fn path_str(p: &Path) -> String {
 }
 
 /// The report as the plan's JSON object (no trailing newline). `focused` is the checked file.
-pub fn render(r: &Report, focused: &Path) -> String {
+/// `types` adds the M2.5 `types`/`members` keys (opt-in: they can be hundreds of KB).
+pub fn render(r: &Report, focused: &Path, types: bool) -> String {
     let mut diags: Vec<String> = vec![];
     for it in &r.items {
         diags.push(item_json(r, it, focused));
     }
-    format!("{{\"unit\":{},\"root\":{},\"diagnostics\":[{}],{}}}", quote(r.unit), quote(&path_str(&norm(&r.root))), diags.join(","), types_json(&r.types))
+    let extra = if types { format!(",{}", types_json(&r.types)) } else { String::new() };
+    format!("{{\"unit\":{},\"root\":{},\"diagnostics\":[{}]{}}}", quote(r.unit), quote(&path_str(&norm(&r.root))), diags.join(","), extra)
 }
 
 /// `"types":[{lo,hi,name,type,kind}],"members":{"T":[{name,kind,sig|type}]}` (M2.5).
@@ -253,7 +255,7 @@ pub fn guarded(focused: &Path, body: impl FnOnce() -> String) -> (String, i32) {
 }
 
 /// Check `file` with `overlays` shadowing disk files; the JSON and the exit code.
-pub fn check_json(file: &Path, overlays: &HashMap<PathBuf, String>, force: Force) -> (String, i32) {
+pub fn check_json(file: &Path, overlays: &HashMap<PathBuf, String>, force: Force, types: bool) -> (String, i32) {
     let file = norm(file);
     guarded(&file, || {
         // An overlay shadows a file that exists on disk; it never adds one,
@@ -272,7 +274,7 @@ pub fn check_json(file: &Path, overlays: &HashMap<PathBuf, String>, force: Force
             Ok(v)
         };
         let r = analyze::analyze(&file, force, &read, &list);
-        render(&r, &file)
+        render(&r, &file, types)
     })
 }
 

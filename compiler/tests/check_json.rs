@@ -17,7 +17,7 @@ fn quote(s: &str) -> String {
 /// Run `alx check --json file` with overlays on stdin; (stdout, exit code).
 fn run(file: &Path, overlays: &[(&Path, &str)], env: &[(&str, &Path)]) -> (String, i32) {
     let mut c = Command::new(env!("CARGO_BIN_EXE_alx"));
-    c.args(["check", "--json", "--overlays", "-"]).arg(file).stdin(Stdio::piped()).stdout(Stdio::piped());
+    c.args(["check", "--json", "--types", "--overlays", "-"]).arg(file).stdin(Stdio::piped()).stdout(Stdio::piped());
     for (k, v) in env {
         c.env(k, v);
     }
@@ -273,4 +273,14 @@ fn types_empty_on_parse_error_and_keys_present() {
     std::fs::write(&f, "def f( {\n").unwrap();
     let (j, _) = run(&f, &[], &[]);
     assert!(j.contains("\"types\":[],\"members\":{}"), "{j}");
+}
+
+#[test]
+fn types_only_with_the_flag() {
+    let d = tmp("types-flag");
+    let f = d.join("a.alx");
+    std::fs::write(&f, "x = 1\nputs x\n").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_alx")).args(["check", "--json"]).arg(&f).output().unwrap();
+    let j = String::from_utf8(out.stdout).unwrap();
+    assert!(j.contains("\"diagnostics\":[]") && !j.contains("\"types\""), "{j}");
 }

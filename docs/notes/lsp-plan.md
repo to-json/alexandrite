@@ -87,7 +87,7 @@ One JSON object on stdout; exit 0 whenever the JSON is complete (errors are data
    "message": "...", "notes": ["..."]}]}
 ```
 
-**M2.5 (type data, compiler/src/typemap.rs):** two more keys after `diagnostics`, for member completion. Old clients ignore them.
+**M2.5 (type data, compiler/src/typemap.rs):** with `--types`, two more keys after `diagnostics`, for member completion (opt-in: on a 140 KB file they add 327 KB, and the server decodes its compiler output with derived JSON, port-issues #176).
 
 ```json
 "types": [{"lo": 412, "hi": 413, "name": "r", "type": "bufio.Reader", "kind": "local"}],

@@ -1,5 +1,5 @@
 # Package server: the LSP message loop, document store, scheduler and
-# publishing logic (M1: diagnostics).
+# publishing logic (M1: diagnostics), and the requests of M2 (nav.alx).
 #
 # One task, no Chan, no spawn (docs/notes/lsp-plan.md 0.1): `serve` reads a
 # message, handles it, and when nothing more is queued (`input_ready`) and a
@@ -17,10 +17,10 @@
 
 import "alx.dev/lsp/compiler"
 import "alx.dev/lsp/jsonrpc"
+import "alx.dev/lsp/outline"
 import "alx.dev/lsp/position"
 import "alx.dev/lsp/protocol"
 import "bufio"
-import "encoding/json"
 import "os"
 import "path"
 
@@ -70,7 +70,7 @@ def handshake(r: bufio.Reader, w: bufio.Writer, self_path: Str, real: Bool) -> ~
     opts = parse_opts(params.initializationOptions)
     alx = compiler.find_alx(opts.path, self_path)
     res = protocol.InitializeResult.new(
-      capabilities: protocol.ServerCaps.new(positionEncoding: encoding_name(enc), textDocumentSync: protocol.SyncOptions.new(openClose: true, change: 1, save: false)),
+      capabilities: protocol.ServerCaps.new(positionEncoding: encoding_name(enc), textDocumentSync: protocol.SyncOptions.new(openClose: true, change: 1, save: false), documentSymbolProvider: true, definitionProvider: true, completionProvider: protocol.CompletionOptions.new(triggerCharacters: [".", "\"", "/"])),
       serverInfo: protocol.ServerInfo.new(name: NAME, version: VERSION))
     ~send(w, jsonrpc.response(id, res.~to_json))
     return Session.new(enc: enc, opts: opts, workspace: protocol.uri_to_path(params.rootUri || ""), alx: alx, version: real ? compiler.version(alx) : "fake compiler")
@@ -87,7 +87,8 @@ pub def serve[C: compiler.Client](r: bufio.Reader, w: bufio.Writer, client0: C, 
   results: Map[Str, Entry] = {}
   sent: Map[Str, Str] = {} # uri -> the diagnostics JSON last published
   dirty: [Str] = []
-  ctx: Map[Str, Str] = {} # per-session scalars kept in a container: see handshake
+  index: Map[Str, [outline.Sym]] = {} # uri -> the outline of its text (M2: symbols, definition, completion)
+  ctx: Map[Str, Str] = {}             # per-session scalars kept in a container: see handshake
   sess = ~handshake(r, w, self_path, real) || return 1
   enc = sess.enc
   opts = sess.opts
@@ -173,6 +174,17 @@ pub def serve[C: compiler.Client](r: bufio.Reader, w: bufio.Writer, client0: C, 
         ~send(w, jsonrpc.error_response(id, jsonrpc.INVALID_REQUEST, "server is shutting down"))
       } else if method == "initialize" {
         ~send(w, jsonrpc.error_response(id, jsonrpc.INVALID_REQUEST, "already initialized"))
+      } else if nav_method?(method) {
+        # the other open buffers of its directory; `answer` copies what it
+        # is given before using it (see the note above)
+        ous: [Str] = []
+        ots: [Str] = []
+        for u in uris {
+          next if u == uri_of(msg.params) || path.dir(protocol.uri_to_path(u)) != path.dir(protocol.uri_to_path(uri_of(msg.params)))
+          ous << fresh(u)
+          ots << fresh(docs[fresh(u)] || "")
+        }
+        ~send(w, jsonrpc.response(id, answer(method, uri_of(msg.params), fresh(docs[uri_of(msg.params)] || ""), index[uri_of(msg.params)] || [], ous, ots, docs.has_key?(uri_of(msg.params)), msg.params, enc, nav_std(opts.std_dir, ws_std, protocol.uri_to_path(uri_of(msg.params))))))
       } else {
         ~send(w, jsonrpc.error_response(id, jsonrpc.METHOD_NOT_FOUND, "method not found: #{method}"))
       }
@@ -190,6 +202,7 @@ pub def serve[C: compiler.Client](r: bufio.Reader, w: bufio.Writer, client0: C, 
         if uri_of(msg.params) != "" && jsonrpc.string_at(msg.params, ["textDocument", "text"]) != none {
           uris << fresh(uri_of(msg.params)) unless docs.has_key?(uri_of(msg.params))
           docs[uri_of(msg.params)] = fresh(jsonrpc.string_at(msg.params, ["textDocument", "text"]) || "")
+          index[uri_of(msg.params)] = outline.outline(docs[uri_of(msg.params)] || "")
           vers[uri_of(msg.params)] = jsonrpc.int_at(msg.params, ["textDocument", "version"]) || 0
           dirty << fresh(uri_of(msg.params)) unless has(dirty, uri_of(msg.params))
         }
@@ -203,6 +216,7 @@ pub def serve[C: compiler.Client](r: bufio.Reader, w: bufio.Writer, client0: C, 
             results[k] = Entry.new(root: en.root, files: en.files, diags: shift_diags(en.diags, fp, e))
           }
           docs[uri_of(msg.params)] = fresh(jsonrpc.last_text(msg.params, ["contentChanges"]) || "")
+          index[uri_of(msg.params)] = outline.outline(docs[uri_of(msg.params)] || "")
           vers[uri_of(msg.params)] = jsonrpc.int_at(msg.params, ["textDocument", "version"]) || 0
           dirty << fresh(uri_of(msg.params)) unless has(dirty, uri_of(msg.params))
         }
@@ -214,6 +228,7 @@ pub def serve[C: compiler.Client](r: bufio.Reader, w: bufio.Writer, client0: C, 
         if uri_of(msg.params) != "" {
           uris = uris.select { it != uri_of(msg.params) }
           docs.delete(uri_of(msg.params))
+          index.delete(uri_of(msg.params))
           vers.delete(uri_of(msg.params))
           gone = results[uri_of(msg.params)]
           results.delete(uri_of(msg.params))

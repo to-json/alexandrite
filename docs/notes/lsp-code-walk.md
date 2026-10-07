@@ -85,7 +85,7 @@ Small and safe places to begin:
 - **A new notification.** A new arm in the `case method` block. Write it so it doesn't name locals that hold `docs` keys or texts, then run the soak.
 - **A new request**, like `textDocument/formatting`. You'll need a new `Session` capability, an arm in the request branch, and some thought about the memory shape, because the answer comes from a subprocess like `alx fmt`.
 
-Harder, and worth a conversation first: anything that wants an in-process syntax tree (document symbols, folding). The plan deliberately left that out. The compiler is the only parser the server talks to.
+Harder, and worth a conversation first: anything that needs to know types (hover, member completion after `x.`). The server has no syntax tree and no types; see M2 below for what it does instead.
 
 ## The other packages
 
@@ -106,4 +106,45 @@ A check that can't produce a report comes back as an `Outcome` with a `failure` 
 - A check that takes longer than 20 seconds is killed and shows up as a "cannot run alx" diagnostic.
 - The server checks one file at a time, in order. Two buffers changed together get two sequential runs.
 - A unit with an uncalled function reports errors in it. That's deliberate (the plan's "check all"), and it's why the compiler's own std had to be cleaned up first.
-- There are no hover, completion or go-to-definition. Diagnostics only.
+- There is no hover, no references, no rename, and no completion of members after `x.` on a value.
+
+## M2: symbols, definition, completion
+
+Milestone 2 added three requests: `textDocument/documentSymbol`, `textDocument/definition` and `textDocument/completion`. All three answer from one thing, the outline of a file. Nothing in them type-checks.
+
+### outline
+
+`outline/outline.alx` is a byte scanner. It walks the text once, counts braces, and at each statement start at brace depth 0 asks "is this a declaration?": `def`, `struct`, `enum`, `error`, `interface`, `refine`, `extern def`, `import`, `test`/`bench`/`example`, or a capitalized name followed by `=` or `:` (a constant). Inside the body of a type it asks only about `def`, and those come out as kind `method` with `owner` set to the type. That's the whole list the parser's `top_decl` knows, so it's the whole list here.
+
+The tricky part is not finding declarations, it's not finding fake ones. A `}` inside a string, a comment, a command literal, a `#{}` with a string inside it, a heredoc body, or an attribute like `#[json("a]b")]` must not count. The scanner skips each of those the way the lexer does (the functions even have the lexer's names: `interp_end`, `quoted_end`). If you change how the lexer reads a literal, change it here too, and the acceptance check below will tell you if you forgot.
+
+It never fails. On a broken file it does what the parser's `resync` does: a declaration keyword at column 0 inside a brace that never closed is taken to end that brace. So one unfinished function doesn't hide the rest of the file from the symbol list, which is exactly when you want the list.
+
+Why not ask the compiler? Because the owner wanted the feature logic in alx, and because a scanner is fast enough not to need a cache: an 840 KB package directory reads and scans in a few milliseconds.
+
+### The oracle
+
+How do we know the scanner agrees with the parser? `alx parse --decls FILE...` (driver.rs `parse_decls`) prints what the real parser found: kind, name, owner, line and byte offset of every declaration. `testdata/outline_dump.alx` prints the same from the scanner. The `LSP` acceptance group runs both over every tracked `.alx` file and requires identical output for every file that parses. Today that's all of them, with an empty allowlist. If you make the scanner smarter, that check is your safety net; if it fails, the message names the file and the first lines that differ.
+
+### In the server
+
+`serve` keeps one more map, `index`: URI to the outline of that buffer, rebuilt on every `didOpen` and `didChange`. It follows the same rules as `docs` (read the header of loop.alx again): it's never handed to a function, and nothing named holds one of its entries.
+
+A request is answered by `answer` in `server/nav.alx`. The loop gives it copies: the buffer's text, its outline, and the texts of the other open buffers in the same directory. `answer` copies them again before doing anything. That looks paranoid. It isn't, see below.
+
+- **documentSymbol** turns the outline into `DocumentSymbol`s. A method becomes a child of the type before it. Ranges go through `position`, so they're in the client's encoding.
+- **definition** finds the word under the cursor and the word before a `.` if there is one. `pkg.name` where the buffer imports `pkg`: look in that package's directory, under the std dir or under the module root from `alx.mod`, for a `pub` top-level name. `Type.name`: methods of `Type`. Anything else: a top-level name in the buffer, then the other open buffers of the directory, then the directory's files on disk. If that finds nothing, it's probably a method on a value whose type we don't know, so it returns every method of that name.
+- **completion** offers keywords, names from the same places, imported package names, `pub` names after `pkg.`, methods after `Type.`, and package paths inside `import "`. Those last ones come with a `textEdit`, because an editor that thinks `/` ends a word would otherwise paste `net/http` over just `ht`.
+
+Files on disk are read for each request and dropped. No cache means no cache to keep bounded or invalidate.
+
+### The memory story, again
+
+The first version of this leaked 2 GB in the soak. Twice, for two different reasons, and neither was visible in the code.
+
+The scanner made a small struct (`Head`) for each declaration it looked at, and one of its fields was a string taken from a list literal (`for w in ["struct", "enum", ...]`). That alone made the compiler put every `Head` in the program region, and with it a lot of the scan. 2 MB per 100 KB scanned, forever. `Head` now holds only numbers. port-issues #271.
+
+Then each request leaked about a megabyte, because a helper combined its arguments (`[cur] + others`). The region analysis then treats everything the caller passed as stored in more than one place and gives up on freeing it. The helpers now loop over their arguments instead of joining them, and copy the strings they keep in a map. port-issues #272.
+
+The way to find these is `alx explain mem main.alx` (from tools/alx-lsp) and looking for "program region" or "grows without bound" in `serve` and the `nav` functions. The soak in the `LSP` group now also sends 10,000 completion and 10,000 documentSymbol requests on the 100 KB document; it peaks at about 22 MB. Run it after any change to `nav.alx` or `outline.alx`.
+

@@ -543,3 +543,99 @@ pub fn run(file: &str, o: &Options) -> ExitCode {
         }
     }
 }
+
+/// `alx parse --decls FILE...`: the declarations the parser sees, one line
+/// each, `kind<TAB>name<TAB>owner<TAB>line<TAB>offset`, after a `== FILE`
+/// header (`== FILE error` when the file has syntax errors; its partial
+/// module is listed anyway). The test oracle for the language server's
+/// outline scanner (tools/alx-lsp/outline): kinds and fields as there.
+pub fn parse_decls(files: &[String]) -> ExitCode {
+    use std::io::Write;
+    let mut out = String::new();
+    let mut code = 0;
+    for f in files {
+        let text = match std::fs::read_to_string(f) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("alx: cannot read `{f}`: {e}");
+                code = 1;
+                continue;
+            }
+        };
+        let mut sm = alx::diag::SourceMap::default();
+        let (m, errs) = front::parse_file_recovering(&mut sm, f.clone(), None, text.clone(), &mut 0);
+        out.push_str(&format!("== {f}{}\n", if errs.is_empty() { "" } else { " error" }));
+        let Some(m) = m else { continue };
+        for (lo, kind, name, owner) in decls(&m, &text) {
+            let line = sm.files[0].line_col(lo).0;
+            out.push_str(&format!("{kind}\t{name}\t{owner}\t{line}\t{lo}\n"));
+        }
+    }
+    let _ = std::io::stdout().write_all(out.as_bytes());
+    ExitCode::from(code)
+}
+
+/// A module's declarations in source order: (name offset, kind, name, owner).
+fn decls(m: &alx::ast::Module, src: &str) -> Vec<(u32, &'static str, String, String)> {
+    // The offset of the name after a declaration keyword at `lo`.
+    let after_kw = |lo: u32| -> u32 {
+        let r = &src[lo as usize..];
+        let k = r.find(|c: char| !c.is_ascii_alphabetic()).unwrap_or(r.len());
+        let w = r[k..].find(|c: char| c != ' ' && c != '\t').unwrap_or(0);
+        lo + (k + w) as u32
+    };
+    let named = |lo: u32, name: &str| src.get(lo as usize..).is_some_and(|r| r.starts_with(name));
+    let mut v = vec![];
+    for i in m.imports.iter().filter(|i| named(i.span.lo, "import")) {
+        let q = src[i.span.lo as usize..].find('"').unwrap_or(0) as u32;
+        v.push((i.span.lo + q, "import", i.path.clone(), i.alias.clone().unwrap_or_default()));
+    }
+    for c in &m.consts {
+        if named(c.span.lo, &c.name) {
+            v.push((c.span.lo, "const", c.name.clone(), String::new()));
+        }
+    }
+    for s in &m.structs {
+        v.push((after_kw(s.span.lo), "struct", s.name.clone(), String::new()));
+    }
+    for e in &m.enums {
+        v.push((after_kw(e.span.lo), if e.error { "error" } else { "enum" }, e.name.clone(), String::new()));
+    }
+    for i in &m.ifaces {
+        v.push((after_kw(i.span.lo), "interface", i.name.clone(), String::new()));
+        for (name, _, _, _, sp) in &i.methods {
+            v.push((sp.lo, "method", name.clone(), i.name.clone()));
+        }
+    }
+    for r in &m.refines {
+        v.push((after_kw(r.span.lo), "refine", r.name.clone(), String::new()));
+    }
+    for d in &m.defs {
+        if d.name.contains("__init_") {
+            continue;
+        }
+        let (kind, name, owner) = if let Some((r, rest)) = d.name.split_once('@') {
+            ("method", rest.rsplit_once('#').map_or(rest, |x| x.1).to_string(), r.to_string())
+        } else if let Some((o, n)) = d.name.split_once('.') {
+            ("method", n.to_string(), o.to_string())
+        } else if d.ffi.is_some() {
+            ("extern", d.name.clone(), String::new())
+        } else {
+            ("def", d.name.clone(), String::new())
+        };
+        if named(d.name_span.lo, &name) {
+            v.push((d.name_span.lo, kind, name, owner));
+        }
+    }
+    for t in &m.tests {
+        let kind = match t.kind {
+            alx::ast::TestKind::Test => "test",
+            alx::ast::TestKind::Bench => "bench",
+            alx::ast::TestKind::Example => "example",
+        };
+        v.push((t.def.name_span.lo, kind, t.name.clone(), String::new()));
+    }
+    v.sort();
+    v.dedup_by(|a, b| a.0 == b.0 && a.2 == b.2 && a.3 == b.3);
+    v
+}

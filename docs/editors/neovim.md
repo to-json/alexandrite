@@ -1,7 +1,8 @@
 # alexandrite in Neovim (0.11+)
 
 Three pieces: filetype detection, the language server (`alx-lsp`: the compiler's
-errors and warnings on unsaved buffers), and tree-sitter (highlighting and
+errors and warnings on unsaved buffers, document symbols, go to definition,
+completion), and tree-sitter (highlighting and
 instant syntax-error squiggles).
 
 ## 1. Build and install the server
@@ -39,12 +40,36 @@ vim.lsp.enable('alx')
 Neovim offers `utf-8` positions; the server uses them. Clients that do not
 get UTF-16 columns.
 
-What it does (milestone 1): full-text sync, diagnostics only. It checks 150 ms
-after the last edit; while a buffer has a syntax error, the last type errors
-stay (moved along with your edits) until the next successful check.
+What it does:
+
+- **Diagnostics** (full-text sync). It checks 150 ms after the last edit;
+  while a buffer has a syntax error, the last type errors stay (moved along
+  with your edits) until the next successful check.
+- **Document symbols** (`gO`, or a picker's symbol list): every top-level
+  declaration, with methods nested under their struct, enum, error,
+  interface or refinement. Works on files that don't parse.
+- **Go to definition** (`gd` with `vim.lsp.buf.definition`, or `<C-]>`):
+  top-level names and `Type.method` in the buffer, the other open buffers of
+  its directory and the directory's files on disk; `pkg.name` for an
+  `import "x/y"` in the buffer, when the package is in the std dir (found
+  automatically inside the alexandrite repo; else set `alx.stdDir` or
+  `ALX_STD_DIR`) or under your module (the nearest `alx.mod`'s `module`
+  path). A method called on a value (`x.area`) lists every method of that
+  name, since the server doesn't know `x`'s type. Required modules (the
+  module cache) are not searched.
+- **Completion** (`<C-x><C-o>`, or a completion plugin): keywords, the
+  names of the buffer and its package directory, imported package names;
+  after `pkg.` the package's `pub` names; after `Type.` its methods; inside
+  `import "` the std and module package paths. No member completion on
+  values yet (`x.` offers nothing).
+
+None of this type-checks: names come from a scan of the declarations (the
+compiler's own check only drives diagnostics). Hover, references and rename
+are not there yet.
 
 Memory: the server's peak RSS stays bounded however long the session (the
-soak test: 10,000 edits of a 100 KB document peak at about 22 MB).
+soak test: 10,000 edits of a 100 KB document, then 10,000 completion and
+10,000 document-symbol requests, peak at about 22 MB).
 
 ## 3. Tree-sitter: parser and syntax errors
 

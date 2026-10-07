@@ -1,0 +1,147 @@
+import "alx.dev/lsp/outline"
+import "alx.dev/lsp/position"
+import "alx.dev/lsp/protocol"
+import "os"
+import "strings"
+
+def src(p: Str, text: Str) -> Src {
+  Src.new(uri: protocol.path_to_uri(p), text: text, syms: outline.outline(text))
+}
+
+# A temporary tree: <d>/m/{alx.mod, a.alx, b.alx, b_test.alx, sub/s.alx},
+# <d>/std/text/tab/tab.alx. Returns d.
+def tree -> ~Str {
+  d = ~os.mkdir_temp("", "alx-lsp-nav")
+  ~os.mkdir_all(d + "/m/sub", 0o755)
+  ~os.mkdir_all(d + "/std/text/tab", 0o755)
+  ~os.mkdir_all(d + "/std/text/internal/x", 0o755)
+  ~os.write_file(d + "/m/alx.mod", "module ex.com/m\n".bytes.to_a, 0o644)
+  ~os.write_file(d + "/m/b.alx", "pub def helper -> Int { 1 }\nstruct Box {\n  def area -> Int { 2 }\n}\n".bytes.to_a, 0o644)
+  ~os.write_file(d + "/m/b_test.alx", "def only_in_tests { }\n".bytes.to_a, 0o644)
+  ~os.write_file(d + "/m/sub/s.alx", "pub def sub_fn { }\ndef hidden { }\n".bytes.to_a, 0o644)
+  ~os.write_file(d + "/std/text/tab/tab.alx", "pub def pad(s: Str) -> Str { s }\ndef private_one { }\npub struct Writer {\n  def flush { }\n}\n".bytes.to_a, 0o644)
+  ~os.write_file(d + "/std/text/internal/x/x.alx", "pub def no { }\n".bytes.to_a, 0o644)
+  d
+}
+
+A = <<~'EOS'
+  import "text/tab"
+  import s2 "ex.com/m/sub"
+  def main_fn {
+    x = helper() + Box.new().area
+    y = tab.pad("é") + s2.sub_fn
+    Point.origin
+    local_fn
+  }
+  def local_fn { }
+  struct Point {
+    def self.origin -> Point { Point.new() }
+  }
+EOS
+
+# The offset of the n-th (from 0) occurrence of `needle` in A, plus `k`.
+def at(needle: Str, k: Int) -> Int {
+  strings.index(A, needle) + k
+}
+
+test "word_at" {
+  w = word_at("x = tab.pad(1)", 9, false)
+  assert_eq (w.qual, w.word), ("tab", "pad")
+  w2 = word_at("x = tab.pad(1)", 9, true)
+  assert_eq (w2.qual, w2.word), ("tab", "p")
+  w3 = word_at("ok? + y", 1, false)
+  assert_eq w3.word, "ok?"
+  assert_eq word_at("", 0, false).word, ""
+}
+
+test "documentSymbol: methods under their type, utf-16 ranges" {
+  text = "# é\nstruct P {\n  def m { }\n}\nx = \"é\"; def h { }\ndef g { }\n"
+  js = symbols_json(outline.outline(text), text, position.UTF16)
+  assert strings.contains(js, "{\"name\":\"P\",\"detail\":\"struct\",\"kind\":23,\"range\":{\"start\":{\"line\":1,\"character\":0},\"end\":{\"line\":3,\"character\":1}},\"selectionRange\":{\"start\":{\"line\":1,\"character\":7},\"end\":{\"line\":1,\"character\":8}},\"children\":[{\"name\":\"m\",\"detail\":\"method\",\"kind\":6"), js
+  assert strings.contains(js, "{\"name\":\"g\",\"detail\":\"def\",\"kind\":12,\"range\":{\"start\":{\"line\":5,\"character\":0}"), js
+  # "é" is 2 bytes, 1 utf-16 unit: `h` is at byte 14, column 13
+  assert strings.contains(js, "\"name\":\"h\",\"detail\":\"def\",\"kind\":12,\"range\":{\"start\":{\"line\":4,\"character\":0},\"end\":{\"line\":4,\"character\":18}},\"selectionRange\":{\"start\":{\"line\":4,\"character\":13},"), js
+  assert_eq strings.count(js, "\"name\":"), 4
+}
+
+test "definition: buffer, Owner.method, sibling file, std and module packages" {
+  d = ~tree
+  cur = src(d + "/m/a.alx", A)
+  std = d + "/std"
+  def_at = ->(off: Int) -> Str { definition_json(cur, [], off, position.UTF8, std) }
+  # a top-level def in the buffer
+  assert strings.contains(def_at.call(at("local_fn\n}", 2)), "\"range\":{\"start\":{\"line\":8,\"character\":4}"), def_at.call(at("local_fn\n}", 2))
+  # Type.static_method in the buffer
+  assert strings.contains(def_at.call(at("Point.origin", 8)), "\"start\":{\"line\":10,\"character\":11}")
+  # a sibling file on disk (not test files: a.alx isn't one)
+  r = def_at.call(at("helper()", 1))
+  assert strings.contains(r, "/m/b.alx\""), r
+  assert strings.contains(r, "\"start\":{\"line\":0,\"character\":8}")
+  # a method of an unknown receiver: every method so named
+  assert strings.contains(def_at.call(at(".area", 2)), "/m/b.alx\"")
+  # pkg.name through the std dir; only pub names
+  r2 = def_at.call(at("tab.pad", 5))
+  assert strings.contains(r2, "/std/text/tab/tab.alx\""), r2
+  # pkg.name through alx.mod's module path (an alias)
+  assert strings.contains(def_at.call(at("s2.sub_fn", 4)), "/m/sub/s.alx\"")
+  # the package name itself: its import
+  assert strings.contains(def_at.call(at("tab.pad", 1)), "\"start\":{\"line\":0,\"character\":7}")
+  # nothing
+  assert_eq def_at.call(at("x = ", 0)), "null"
+  assert_eq definition_json(cur, [], at("tab.pad", 5), position.UTF8, ""), "null" # no std dir: the package can't be found
+  # another open buffer wins over the file on disk
+  other = src(d + "/m/b.alx", "\n\ndef helper -> Int { 3 }\n")
+  assert strings.contains(definition_json(cur, [other], at("helper()", 1), position.UTF8, std), "\"start\":{\"line\":2,")
+  os.remove_all(d)
+}
+
+def labels(js: Str) -> [Str] {
+  out: [Str] = []
+  for part in js.split("\"label\":\"")[1...] {
+    out << part[0...strings.index_byte(part, 34)]
+  }
+  out
+}
+
+test "completion: keywords, names, pkg. members, Type. methods, import paths" {
+  d = ~tree
+  std = d + "/std"
+  cur = src(d + "/m/a.alx", A)
+  all = labels(completion_json(cur, [], at("local_fn\n}", 0), position.UTF8, std))
+  for want in ["def", "struct", "loop", "main_fn", "local_fn", "Point", "helper", "Box", "tab", "s2"] {
+    assert all.include?(want), "#{want} in #{all}"
+  }
+  assert !all.include?("only_in_tests")
+  pk = labels(completion_json(cur, [], at("tab.pad", 4), position.UTF8, std))
+  assert_eq pk, ["pad", "Writer"]
+  assert_eq labels(completion_json(cur, [], at("Point.origin", 6), position.UTF8, std)), ["origin"]
+  assert_eq labels(completion_json(cur, [], at("x = helper", 4), position.UTF8, std)).size, all.size
+  # import paths: std packages and the module's, with a text edit from the quote
+  text = "import \"te\nimport \"ex"
+  c = src(d + "/m/c.alx", text)
+  js = completion_json(c, [], 10, position.UTF8, std)
+  assert_eq labels(js), ["text/tab"]
+  assert strings.contains(js, "\"textEdit\":{\"range\":{\"start\":{\"line\":0,\"character\":8},\"end\":{\"line\":0,\"character\":10}},\"newText\":\"text/tab\"}"), js
+  assert_eq labels(completion_json(c, [], text.size, position.UTF8, std)), ["ex.com/m", "ex.com/m/sub"]
+  os.remove_all(d)
+}
+
+test "session: documentSymbol, definition and completion requests" {
+  u = "file:///w/n.alx"
+  text = "def f { }\nstruct S {\n  def m { }\n}\nf\n"
+  req = ->(id: Int, method: Str, extra: Str) -> Str { "{\"jsonrpc\":\"2.0\",\"id\":#{id},\"method\":\"#{method}\",\"params\":{\"textDocument\":{\"uri\":\"#{u}\"}#{extra}}}" }
+  pos = ",\"position\":{\"line\":4,\"character\":0}"
+  _c, bodies, _n = ~session([init_msg("\"utf-8\""), open_msg(u, 1, text), req.call(10, "textDocument/documentSymbol", ""), req.call(11, "textDocument/definition", pos), req.call(12, "textDocument/completion", pos), change_msg(u, 2, "def g { }\n"), req.call(13, "textDocument/documentSymbol", ""), SHUTDOWN, EXIT], false)
+  assert strings.contains(bodies[0], "\"documentSymbolProvider\":true")
+  assert strings.contains(bodies[0], "\"definitionProvider\":true")
+  assert strings.contains(bodies[0], "\"completionProvider\":{\"triggerCharacters\":[")
+  r10 = bodies.select { strings.contains(it, "\"id\":10") }[0]
+  assert strings.contains(r10, "\"name\":\"S\""), r10
+  assert strings.contains(r10, "\"children\":[{\"name\":\"m\"")
+  r11 = bodies.select { strings.contains(it, "\"id\":11") }[0]
+  assert strings.contains(r11, "{\"uri\":\"file:///w/n.alx\",\"range\":{\"start\":{\"line\":0,\"character\":4},\"end\":{\"line\":0,\"character\":5}}}"), r11
+  r12 = bodies.select { strings.contains(it, "\"id\":12") }[0]
+  assert strings.contains(r12, "{\"label\":\"S\",\"kind\":22"), r12
+  r13 = bodies.select { strings.contains(it, "\"id\":13") }[0]
+  assert strings.contains(r13, "\"name\":\"g\"") && !strings.contains(r13, "\"name\":\"S\""), r13
+}

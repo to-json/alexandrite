@@ -557,25 +557,77 @@ def lsp(h: H) -> ~H {
   server = "#{h.work}/alx-lsp"
   replay = "#{h.work}/lsp-replay"
   soak = "#{h.work}/lsp-soak"
-  for t in [[server, "main.alx"], [replay, "testdata/replay.alx"], [soak, "testdata/soak.alx"]] {
+  dump = "#{h.work}/lsp-outline"
+  for t in [[server, "main.alx"], [replay, "testdata/replay.alx"], [soak, "testdata/soak.alx"], [dump, "testdata/outline_dump.alx"]] {
     r = ~run_in([h.alx, "build", "--release", "-o", t[0], t[1]], d, [])
     h2.check!("LSP", "build #{t[1]}", r.code == 0, first_n(trim(r.stderr), 300))
     return h2 if r.code != 0
   }
-  for pkg in ["jsonrpc", "protocol", "position", "compiler", "server"] {
+  for pkg in ["jsonrpc", "protocol", "position", "compiler", "outline", "server"] {
     r = ~run_in([h.alx, "test", pkg], d, [])
     h2.check!("LSP", "alx test #{pkg}", r.code == 0, last_n(trim(r.stdout + r.stderr), 300))
   }
-  for name in ["session_fix", "session_utf16"] {
+  for name in ["session_fix", "session_utf16", "session_nav"] {
     r = ~run_in([replay, server, "testdata/#{name}.in", "testdata/fake.json"], d, [])
     want = trim(~sh.read("#{d}/testdata/#{name}.expected"))
     h2.check!("LSP", "scripted session #{name}", r.code == 0 && trim(r.stdout) == want, "got #{fmt.sprintf("%q", first_n(trim(r.stdout), 300))}")
   }
-  r = ~run_in([soak, "run", server, "testdata/fake.json", "10000", "100000", "150", "#{d}/testdata/fakealx.sh"], d, [])
-  h2.check!("LSP", "soak: 10000 edits of 100 KB, real exec client, peak RSS under 150 MB", r.code == 0 && strings.contains(r.stdout, "SOAK OK"), first_n(trim(r.stdout + r.stderr), 300))
+  h2 = ~lsp_outline(h2, dump)
+  r = ~run_in([soak, "run", server, "testdata/fake.json", "10000", "100000", "150", "#{d}/testdata/fakealx.sh", "10000"], d, [])
+  h2.check!("LSP", "soak: 10000 edits of 100 KB, then 10000 completion and 10000 documentSymbol requests, real exec client, peak RSS under 150 MB", r.code == 0 && strings.contains(r.stdout, "SOAK OK"), first_n(trim(r.stdout + r.stderr), 300))
   r = ~run_in([soak, "run", server, "testdata/fake.json", "200", "4000", "150", h.alx], d, [])
   h2.check!("LSP", "soak: 200 edits, real exec client and real compiler", r.code == 0 && strings.contains(r.stdout, "SOAK OK"), first_n(trim(r.stdout + r.stderr), 300))
   h2
+}
+
+# The outline scanner (tools/alx-lsp/outline) against its oracle, `alx parse
+# --decls`, on every tracked .alx file that parses: kind, name, owner, line
+# and offset of every declaration must agree.
+def lsp_outline(h: H, dump: Str) -> ~H {
+  h2 = h
+  allow: Map[Str, Str] = {} # file => why its outline may differ (none today)
+  ls = ~run_in(["git", "ls-files", "*.alx"], h.root, [])
+  files = trim(ls.stdout).split("\n")
+  want = ~run_in([h.alx, "parse", "--decls"] + files, h.root, [])
+  got = ~run_in([dump] + files, h.root, [])
+  ob = outline_blocks(want.stdout)
+  gb = outline_blocks(got.stdout)
+  n = 0
+  bad: [Str] = []
+  for f in files {
+    o = ob[f] || next
+    next if o.size > 0 && o[0] == "error"
+    n += 1
+    next if allow.has_key?(f)
+    g = gb[f] || []
+    bad << "#{f}: want #{first_n(o.join(" | "), 120)} got #{first_n(g.join(" | "), 120)}" unless slices.equal(o, g)
+  }
+  ok = want.code == 0 && got.code == 0 && n > 1000 && bad.size == 0
+  h2.check!("LSP", "outline equals `alx parse --decls` on #{n} tracked files that parse", ok, "#{bad.size} differ; #{first_n(bad.join("; "), 400)} #{first_n(trim(want.stderr + got.stderr), 200)}")
+  h2
+}
+
+# `== FILE` blocks: FILE -> its lines (a first line "error" when the file has
+# syntax errors).
+def outline_blocks(out: Str) -> Map[Str, [Str]] {
+  m: Map[Str, [Str]] = {}
+  cur = ""
+  lines: [Str] = []
+  for l in out.split("\n") {
+    if l.start_with?("== ") {
+      m[cur] = lines if cur != ""
+      cur = l[3...l.size]
+      lines = []
+      if cur.end_with?(" error") {
+        cur = cur[0...cur.size - 6]
+        lines << "error"
+      }
+    } else if l != "" {
+      lines << l
+    }
+  }
+  m[cur] = lines if cur != ""
+  m
 }
 
 # Negative cases the compiler rejects while parsing (lexer.rs / parser.rs),

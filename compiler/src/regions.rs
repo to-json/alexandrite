@@ -191,7 +191,19 @@ impl<'a> Graph<'a> {
     /// stored through either must live as long as both.
     fn alias(&mut self, from: &[Node], to: &[Node]) {
         self.flow(from, to);
-        self.flow(to, from);
+        // Back from the value to what it was made of, except into a string
+        // a container merely holds (port-issues #178): a Str's bytes hold
+        // no references, so nothing stored through the container can end
+        // up in them. (Between two strings it is one and the same storage.)
+        for t in to {
+            let t_str = self.strish(*t);
+            let back: Vec<Node> = from.iter().copied().filter(|a| t_str || !self.strish(*a)).collect();
+            self.flow(&[*t], &back);
+        }
+    }
+    /// Is this node an immutable string (a Str local or allocation)?
+    fn strish(&self, n: Node) -> bool {
+        strish(self.f, &self.site_exprs, n)
     }
     fn flow(&mut self, from: &[Node], to: &[Node]) {
         if to.contains(&Node::Global) {
@@ -295,6 +307,9 @@ impl<'a> Graph<'a> {
             TK::M(m, recv, args, blk) => {
                 let rv = recv.as_ref().map(|r| self.expr(r)).unwrap_or_default();
                 let per_arg: Vec<Vec<Node>> = args.iter().map(|a| self.expr(a)).collect();
+                // Which of the receiver (0) and the arguments the result may
+                // refer to, when known better than "all of them".
+                let mut ret_mask: Option<Vec<bool>> = None;
                 let avs: Vec<Node> = per_arg.iter().flatten().copied().collect();
                 match m {
                     // Stored where it outlives the call.
@@ -327,6 +342,19 @@ impl<'a> Graph<'a> {
                         if impls.is_empty() {
                             self.flow(&rv, &[Node::Global]);
                             self.flow(&avs, &[Node::Global]);
+                        }
+                        // Its result refers to what any implementor's result may
+                        // (port-issues #178): the receiver or an argument only
+                        // when some implementor returns (part of) it.
+                        if !impls.is_empty() {
+                            let mut mask = vec![false; per_arg.len() + 1];
+                            for fid in &impls {
+                                let sum = self.sums.get(*fid).cloned().unwrap_or_default();
+                                for (i, m) in mask.iter_mut().enumerate() {
+                                    *m |= sum.to_ret.get(i).copied().unwrap_or(true);
+                                }
+                            }
+                            ret_mask = Some(mask);
                         }
                         for fid in impls {
                             let sum = self.sums.get(fid).cloned().unwrap_or_default();
@@ -434,7 +462,9 @@ impl<'a> Graph<'a> {
                 // with f capturing a Mutex freed with f's frame). The
                 // sharing check still sees fresh storage: the lock is the
                 // synchronization.
-                let flat_copy = *m == M::Dup
+                // `Str.from_bytes` copies the bytes (every backend).
+                let flat_copy = *m == M::FromBytes
+                    || *m == M::Dup
                     && !(placing() && holds_lock(&e.ty))
                     && match &e.ty {
                         Ty::Array(t) => !has_storage(t),
@@ -448,7 +478,16 @@ impl<'a> Graph<'a> {
                 // helper `def get(m, k) { m[k] }` ties the map to the key's
                 // storage, and the caller's map goes to the program region).
                 let key_arg = matches!(m, M::MapGet | M::MapGetOr | M::MapDel | M::MapHas);
-                if !matches!(m, M::Spawn | M::Lock) && !flat_copy {
+                if let Some(mask) = &ret_mask {
+                    if mask[0] {
+                        v.extend(rv);
+                    }
+                    for (i, av) in per_arg.iter().enumerate() {
+                        if mask[i + 1] {
+                            v.extend(av.iter().copied());
+                        }
+                    }
+                } else if !matches!(m, M::Spawn | M::Lock) && !flat_copy {
                     v.extend(rv);
                     v.extend(per_arg.iter().skip(key_arg as usize).flatten().copied());
                 }
@@ -456,6 +495,20 @@ impl<'a> Graph<'a> {
             TK::Seq(ss) => {
                 for s in ss {
                     v.extend(self.stmt(s));
+                }
+            }
+            // An interpolation builds a new string in the current region
+            // (alx_str_cat copies, or extends its first part in place only
+            // when that part ends at the current region's bump pointer). Only
+            // C's two-part concatenation hands back one part when the other
+            // is empty, so `"#{a}#{b}"` may be `b` (port-issues #178).
+            TK::Format(pieces, args) => {
+                let fresh = pieces.len() != 2 || pieces.iter().any(|p| matches!(p, FmtPiece::Lit(s) if !s.is_empty()));
+                for a in args {
+                    let av = self.expr(a);
+                    if !fresh {
+                        v.extend(av);
+                    }
                 }
             }
             TK::Select(arms, d) => {
@@ -1099,6 +1152,14 @@ impl DefAssign {
     }
 }
 
+fn strish(f: &TFunc, site_exprs: &HashMap<usize, &TExpr>, n: Node) -> bool {
+    match n {
+        Node::Local(l) => f.locals[l].ty == Ty::Str,
+        Node::Site(s) => site_exprs.get(&s).is_some_and(|e| e.ty == Ty::Str),
+        _ => false,
+    }
+}
+
 /// R3: which Map/Pool locals own their contents' region. A container
 /// qualifies when it's made here (`c = {}` / `Pool[T].new`, once), stays in
 /// this call's frame, is mutated inside a loop, and nothing that refers to
@@ -1106,12 +1167,18 @@ impl DefAssign {
 /// at the end of each iteration, its live contents can be copied to a fresh
 /// region and the old one freed without anything noticing.
 fn owners(f: &TFunc, g: &Graph, fresh: &HashMap<usize, std::collections::HashSet<LocalId>>, out: &mut FnPlacement) {
-    // Undirected neighbours (aliasing in either direction).
+    // Undirected neighbours (aliasing in either direction), except back
+    // into a string something holds (port-issues #178): its bytes are
+    // immutable and hold nothing, so sharing it with something outside the
+    // loop shares nothing compaction could change (the copy is equal), and
+    // where it lives is decided by what holds it.
     let mut adj: HashMap<Node, Vec<Node>> = HashMap::new();
     for (a, bs) in &g.edges {
         for b in bs {
             adj.entry(*a).or_default().push(*b);
-            adj.entry(*b).or_default().push(*a);
+            if !strish(f, &g.site_exprs, *a) || strish(f, &g.site_exprs, *b) {
+                adj.entry(*b).or_default().push(*a);
+            }
         }
     }
     for (c, def_site) in &g.defs {
@@ -1195,6 +1262,20 @@ fn owners(f: &TFunc, g: &Graph, fresh: &HashMap<usize, std::collections::HashSet
                     out.sites.insert(*s, Place::Into(*c));
                     out.into = true;
                 }
+            }
+        }
+        // A string stored into it that the walk above didn't enter (it
+        // doesn't step back into strings): in its region when everything
+        // that holds the string is part of what was checked.
+        for s in &g.sites {
+            let n = Node::Site(*s);
+            if s == def_site || comp.contains(&n) || !strish(f, &g.site_exprs, n) {
+                continue;
+            }
+            let reach = reaches_from(g, n);
+            if reach.contains(&Node::Local(*c)) && reach.iter().all(|m| *m == n || comp.contains(m)) {
+                out.sites.insert(*s, Place::Into(*c));
+                out.into = true;
             }
         }
     }

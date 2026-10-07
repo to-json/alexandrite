@@ -14,14 +14,24 @@ use crate::tast::*;
 use std::collections::HashMap;
 
 thread_local! {
-    /// Per interface: whether any implementor carries shared storage. An
-    /// interface not listed (before `check` runs) is assumed to.
+    /// Per interface: whether its values carry shared storage. Learned for
+    /// the whole program (`learn_ifaces`); before that, an interface is
+    /// assumed to.
     static IFACE_SHARES: std::cell::RefCell<HashMap<String, bool>> = std::cell::RefCell::new(HashMap::new());
+    /// `learn_ifaces` has run: an interface it didn't list has no
+    /// implementors, so no value of it exists.
+    static LEARNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Which interfaces' values carry shared storage: those with an implementor
-/// that does (a fixpoint, since implementors may hold interface values).
+/// Which interfaces' values carry shared storage: a `#[shareable]` one never
+/// does (its contract, checked at each conversion by `check_shareable`);
+/// any other does when some implementor does (a fixpoint, since
+/// implementors may hold interface values), and one without implementors
+/// doesn't (port-issues #270: os/exec's context watcher failed to compile in
+/// programs that never made a Context, where Context had no implementors and
+/// counted as unknown, so as sharing).
 fn learn_ifaces(p: &TProgram) {
+    LEARNED.with(|l| l.set(true));
     IFACE_SHARES.with(|m| {
         let mut m = m.borrow_mut();
         m.clear();
@@ -32,7 +42,7 @@ fn learn_ifaces(p: &TProgram) {
     loop {
         let mut changed = false;
         for (k, imps) in &p.ifaces {
-            if IFACE_SHARES.with(|m| m.borrow()[k]) {
+            if p.shareable.contains_key(k) || IFACE_SHARES.with(|m| m.borrow()[k]) {
                 continue;
             }
             if imps.iter().any(|(t, _)| shares(t)) {
@@ -49,7 +59,7 @@ fn learn_ifaces(p: &TProgram) {
 /// Does a value of this type carry storage another task could mutate?
 pub fn shares(t: &Ty) -> bool {
     match t {
-        Ty::Iface(n) => IFACE_SHARES.with(|m| m.borrow().get(n).copied().unwrap_or(true)),
+        Ty::Iface(n) => IFACE_SHARES.with(|m| m.borrow().get(n).copied()).unwrap_or(!LEARNED.with(|l| l.get())),
         Ty::Array(_) | Ty::Map(..) | Ty::Pool(_) | Ty::Fn(..) => true,
         Ty::Fixed(t, _) | Ty::Opt(t) | Ty::Result(t) => shares(t),
         Ty::Tuple(ts) => ts.iter().any(shares),
@@ -59,8 +69,41 @@ pub fn shares(t: &Ty) -> bool {
     }
 }
 
+/// Where a value of this type carries shared storage: the first field path
+/// (`.buf`, `.Variant.items`) and the type there, for messages.
+fn shared_part(t: &Ty) -> Option<(String, Ty)> {
+    match t {
+        Ty::Iface(_) | Ty::Array(_) | Ty::Map(..) | Ty::Pool(_) | Ty::Fn(..) => shares(t).then(|| (String::new(), t.clone())),
+        Ty::Fixed(e, _) | Ty::Opt(e) | Ty::Result(e) => shared_part(e),
+        Ty::Tuple(ts) => ts.iter().enumerate().find_map(|(i, t)| shared_part(t).map(|(p, x)| (format!(".{i}{p}"), x))),
+        Ty::Struct(_, fs) => fs.iter().find_map(|(n, t)| shared_part(t).map(|(p, x)| (format!(".{n}{p}"), x))),
+        Ty::Enum(_, vs) => vs.iter().find_map(|(v, fs)| fs.iter().find_map(|(n, t)| shared_part(t).map(|(p, x)| (format!(".{v}.{n}{p}"), x)))),
+        _ => None,
+    }
+}
+
+/// A `#[shareable]` interface's contract: no implementor holds storage
+/// outside a Mutex, an Atomic or a channel. Its values may then be handed to
+/// tasks wherever they are, whatever else the program converts to it.
+fn check_shareable(p: &TProgram) -> Result<(), Diag> {
+    let mut names: Vec<&String> = p.shareable.keys().collect();
+    names.sort();
+    for n in names {
+        for (t, sp) in &p.shareable[n] {
+            if let Some((path, x)) = shared_part(t) {
+                let what = if path.is_empty() { String::new() } else { format!(" in `{path}`") };
+                let mut d = Diag::new(*sp, format!("{} can't be a {n}: {n} is `#[shareable]` (its values may be handed to tasks), and {} holds a {}{what}, storage another task could change", t.show(), t.show(), x.show()));
+                d.notes.push("keep that state under a Mutex or an Atomic, or behind a channel".into());
+                return Err(d);
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn check(p: &TProgram, sm: &SourceMap) -> Result<(), Diag> {
     learn_ifaces(p);
+    check_shareable(p)?;
     let al = crate::regions::aliases(p);
     for (f, al) in p.funcs.iter().zip(&al) {
         if f.external {

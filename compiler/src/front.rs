@@ -555,6 +555,7 @@ pub fn check_program(l: &Loaded, externs: Vec<DefInfo>) -> Result<TProgram, Diag
     w.iface_stringers()?;
     let iface_eqs = w.iface_eq_instances()?;
     let ifaces = std::mem::take(&mut w.impls);
+    let shareable = std::mem::take(&mut w.shareable);
     let stringers = std::mem::take(&mut w.stringers);
     let errors = std::mem::take(&mut w.errors);
     let mut warnings = std::mem::take(&mut w.warnings);
@@ -592,7 +593,7 @@ pub fn check_program(l: &Loaded, externs: Vec<DefInfo>) -> Result<TProgram, Diag
     for f in &funcs {
         prove::prove(f, &l.sm)?;
     }
-    let mut p = TProgram { funcs, main, ifaces, stringers, errors, messages, warnings, globals, vars, iface_eqs };
+    let mut p = TProgram { funcs, main, ifaces, shareable, stringers, errors, messages, warnings, globals, vars, iface_eqs };
     // R5: lambdas see the variables they capture, not copies.
     crate::capture::convert(&mut p);
     // R6: what goes to another task isn't used here afterwards.
@@ -725,7 +726,7 @@ pub fn check_library(l: &Loaded, idx: usize, prefix: &str) -> Result<(TProgram, 
     for f in &funcs {
         prove::prove(f, &l.sm)?;
     }
-    Ok((TProgram { funcs, main: usize::MAX, ifaces, stringers, errors, messages, warnings: vec![], globals: vec![], vars: vec![], iface_eqs }, exports))
+    Ok((TProgram { funcs, main: usize::MAX, ifaces, shareable: HashMap::new(), stringers, errors, messages, warnings: vec![], globals: vec![], vars: vec![], iface_eqs }, exports))
 }
 
 /// The generated header: one line per export.

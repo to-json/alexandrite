@@ -593,7 +593,12 @@ int64_t alx_net_dup(int64_t fd, int64_t nonblock);
 
 /* Light frames (see alx_region_mark_slow). */
 static inline AlxRegion *alx_region_mark(void) {
-    if (!alx_tl_cur) return alx_region_mark_slow();
+    /* The program region is current both as NULL (a task's start) and as
+     * itself (after a switch back to it): either way, not a bump mark, which
+     * another task of this thread could allocate above while this call is
+     * parked, and the rollback would hand its memory out again (port-issues
+     * #202, #237: a Mutex made by one task overwritten under another). */
+    if (!alx_tl_cur || alx_tl_cur == &alx_tl_prog) return alx_region_mark_slow();
     return (AlxRegion *)alx_bump_cur;
 }
 static inline void *alx_region_mark_larges(void) {

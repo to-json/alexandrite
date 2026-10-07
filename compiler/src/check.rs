@@ -179,6 +179,9 @@ pub struct World<'a> {
     pub iface_order: Vec<String>,
     /// Each interface's implementors so far, with their method instances.
     pub impls: HashMap<String, Vec<(Ty, Vec<FuncId>)>>,
+    /// `#[shareable]` interfaces: each implementor and where it was first
+    /// converted (sharing.rs checks the contract).
+    pub shareable: HashMap<String, Vec<(Ty, Span)>>,
     pub stringers: HashMap<String, FuncId>,
     /// Error types (enums), in tag order: builtins first, then `error` decls.
     pub errors: Vec<Ty>,
@@ -342,7 +345,7 @@ impl<'a> World<'a> {
         GENERICS.with(|g| g.borrow_mut().clear());
         RECS.with(|r| r.borrow_mut().clear());
         INSTS.with(|g| g.borrow_mut().clear());
-        Ok(World { sm, defs, by_name, instances: HashMap::new(), declared_errs: HashMap::new(), funcs: vec![], sigs: HashMap::new(), fatal: None, structs: HashMap::new(), consts: HashMap::new(), ifaces: HashMap::new(), iface_order: vec![], impls: HashMap::new(), stringers: HashMap::new(), errors: vec![], refines: HashMap::new(), grefines: HashMap::new(), warnings: vec![], globals: vec![], pending_consts: vec![], vars: vec![], eq_ifaces: vec![], show_ifaces: vec![] })
+        Ok(World { sm, defs, by_name, instances: HashMap::new(), declared_errs: HashMap::new(), funcs: vec![], sigs: HashMap::new(), fatal: None, structs: HashMap::new(), consts: HashMap::new(), ifaces: HashMap::new(), iface_order: vec![], impls: HashMap::new(), shareable: HashMap::new(), stringers: HashMap::new(), errors: vec![], refines: HashMap::new(), grefines: HashMap::new(), warnings: vec![], globals: vec![], pending_consts: vec![], vars: vec![], eq_ifaces: vec![], show_ifaces: vec![] })
     }
 
     /// Evaluate top-level constants, in order (each may use earlier ones).
@@ -892,6 +895,9 @@ impl<'a> World<'a> {
             if self.ifaces.insert(d.name.clone(), ms).is_none() {
                 self.iface_order.push(d.name.clone());
             }
+            if d.shareable {
+                self.shareable.entry(d.name.clone()).or_default();
+            }
         }
         Ok(())
     }
@@ -917,6 +923,11 @@ impl<'a> World<'a> {
         // An implementor may hold the interface itself (a wrapper, a list of
         // handlers): then the interface's values are boxed (R13, lowering).
         let methods = self.ifaces[iface].clone();
+        if let Some(v) = self.shareable.get_mut(iface) {
+            if !v.iter().any(|(x, _)| x == t) {
+                v.push((t.clone(), sp));
+            }
+        }
         let impls = self.impls.entry(iface.to_string()).or_default();
         impls.push((t.clone(), vec![]));
         let k = impls.len() - 1;

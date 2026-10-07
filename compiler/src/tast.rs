@@ -747,6 +747,9 @@ pub struct TProgram {
     /// Each interface's implementors, in tag order, with the instance of
     /// each of its methods (in declaration order).
     pub ifaces: HashMap<String, Vec<(Ty, Vec<FuncId>)>>,
+    /// `#[shareable]` interfaces: each implementor and where it was first
+    /// converted to it (port-issues #270).
+    pub shareable: HashMap<String, Vec<(Ty, crate::diag::Span)>>,
     /// `to_s` instances of types that are printed (by `Ty::show`), so
     /// printing a slice of them uses each element's `to_s` (Go's Stringer).
     pub stringers: HashMap<String, FuncId>,

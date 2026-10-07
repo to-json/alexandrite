@@ -1,0 +1,150 @@
+#![test(external)]
+# Go's scanner_test.go (go1.27), translated.
+
+import "encoding/json"
+import "math"
+import "math/rand"
+import "strings"
+import "unicode/utf8"
+
+def strip_whitespace(s: Str) -> Str {
+  b: [Byte] = []
+  for c in s.bytes {
+    b << c if c != 32 && c != 10 && c != 13 && c != 9
+  }
+  Str.from_bytes(b)
+}
+
+test "TestValid" {
+  tests = [("foo", false), ("}{", false), ("{]", false), ("{}", true), ("{\"foo\":\"bar\"}", true), ("{\"foo\":\"bar\",\"bar\":{\"baz\":[\"qux\"]}}", true)]
+  for t in tests {
+    assert json.valid(t[0]) == t[1], t[0]
+  }
+}
+
+test "TestCompactAndIndent" {
+  tests = [
+    ("1", "1"),
+    ("{}", "{}"),
+    ("[]", "[]"),
+    ("{\"\":2}", "{\n\t\"\": 2\n}"),
+    ("[3]", "[\n\t3\n]"),
+    ("[1,2,3]", "[\n\t1,\n\t2,\n\t3\n]"),
+    ("{\"x\":1}", "{\n\t\"x\": 1\n}"),
+    ("[true,false,null,\"x\",1,1.5,0,-5e+2]", "[\n\ttrue,\n\tfalse,\n\tnull,\n\t\"x\",\n\t1,\n\t1.5,\n\t0,\n\t-5e+2\n]"),
+    # golang.org/issue/34070
+    ("{\"\":\"<>&  \"}", "{\n\t\"\": \"<>&  \"\n}"),
+    # golang.org/issue/13520 and golang.org/issue/74806
+    ("null", "null \n\r\t"),
+  ]
+  for t in tests {
+    compact, ind = t
+    assert_eq json.~compact(compact), compact
+    assert_eq json.~compact(ind), compact
+    assert_eq json.~indent(ind, "", "\t"), ind
+    assert_eq json.~indent(compact, "", "\t"), strings.trim_right(ind, " \n\r\t")
+  }
+}
+
+test "TestCompactSeparators" {
+  # U+2028 and U+2029 should be escaped inside strings.
+  # They should not appear outside strings.
+  assert_eq json.~compact("{\" \": 1}"), "{\" \":1}"
+  assert_eq json.~compact("{\" \" :2}"), "{\" \":2}"
+}
+
+# ---- a large random document (Go's initBig / genValue, on alx's math/rand)
+
+def gen_string(r: rand.Rand, stddev: Float) -> Str {
+  rr = r
+  n = math.abs(rr.norm_float64! * stddev + stddev / 2.0).to_i
+  b: [Byte] = []
+  i = 0
+  while i < n {
+    f = math.abs(rr.norm_float64! * 64.0 + 32.0)
+    f = 1114111.0 if f > 1114111.0
+    c = f.to_i
+    # Go's string(runes) writes a surrogate as U+FFFD
+    c = 0xFFFD if c >= 0xD800 && c < 0xE000
+    b = utf8.append_rune(b, c.to_i32)
+    i += 1
+  }
+  Str.from_bytes(b)
+}
+
+# The JSON (Go's Marshal) of a random value of about n nodes.
+def gen_value(r: rand.Rand, n: Int) -> Str {
+  rr = r
+  if n > 1 {
+    return rr.intn!(2) == 0 ? gen_array(rr, n) : gen_map(rr, n)
+  }
+  case rr.intn!(3) {
+    0 => rr.intn!(2) == 0 ? "true" : "false"
+    1 => json.marshal(rr.norm_float64!).unwrap
+    _ => json.marshal(gen_string(rr, 30.0)).unwrap
+  }
+}
+
+def gen_array(r: rand.Rand, n: Int) -> Str {
+  rr = r
+  f = (math.abs(rr.norm_float64!) * math.min(10.0, (n / 2).to_f)).to_i
+  f = n if f > n
+  f = 1 if f < 1
+  parts: [Str] = []
+  i = 0
+  while i < f {
+    parts << gen_value(rr, ((i + 1) * n) / f - (i * n) / f)
+    i += 1
+  }
+  "[" + parts.join(",") + "]"
+}
+
+def gen_map(r: rand.Rand, n: Int) -> Str {
+  rr = r
+  f = (math.abs(rr.norm_float64!) * math.min(10.0, (n / 2).to_f)).to_i
+  f = n if f > n
+  f = 1 if n > 0 && f == 0
+  m: Map[Str, Str] = {}
+  i = 0
+  while i < f {
+    k = gen_string(rr, 10.0)
+    m[k] = gen_value(rr, ((i + 1) * n) / f - (i * n) / f)
+    i += 1
+  }
+  parts: [Str] = []
+  for k in m.keys.sort {
+    parts << json.marshal(k).unwrap + ":" + (m[k] || "")
+  }
+  "{" + parts.join(",") + "}"
+}
+
+pub def json_big -> Str {
+  r = rand.new(rand.new_source(1))
+  gen_value(r, 10000)
+}
+
+test "TestCompactBig" {
+  big = json_big()
+  assert json.valid(big)
+  assert_eq json.~compact(big), big
+}
+
+test "TestIndentBig" {
+  big = json_big()
+  b = json.~indent(big, "", "\t")
+  # jsonBig is compact (no unnecessary spaces); indenting should make it bigger
+  assert b.size != big.size, "Indent did not expand the input"
+  # should be idempotent
+  assert_eq json.~indent(b, "", "\t"), b
+  # should get back to original
+  assert_eq json.~compact(b), big
+}
+
+test "TestIndentErrors" {
+  e = json.indent("{\"X\": \"foo\", \"Y\"}", "", "").err.unwrap
+  assert_eq e.message, "invalid character '}' after object key"
+  assert_eq e.offset, "{\"X\": \"foo\", \"Y\"}".size
+  e = json.indent("{\"X\": \"foo\" \"Y\": \"bar\"}", "", "").err.unwrap
+  assert_eq e.message, "invalid character '\"' after object key:value pair"
+  assert_eq e.offset, "{\"X\": \"foo\" \"".size
+}

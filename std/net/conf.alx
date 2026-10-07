@@ -1,0 +1,220 @@
+# Which resolver to use and in what order (Go's conf.go). The "cgo"
+# resolver is the system's getaddrinfo / getnameinfo, which alx always has;
+# the "go" resolver is this package's DNS client with the hosts file.
+
+import "errors"
+import "os"
+
+# Go's hostLookupOrder.
+HOST_LOOKUP_CGO = 0
+# Files first.
+HOST_LOOKUP_FILES_DNS = 1
+# DNS first.
+HOST_LOOKUP_DNS_FILES = 2
+# Only files.
+HOST_LOOKUP_FILES = 3
+# Only DNS.
+HOST_LOOKUP_DNS = 4
+
+# Go's hostLookupOrder.String.
+def lookup_order_name(o: Int) -> Str {
+  return "cgo" if o == HOST_LOOKUP_CGO
+  return "files,dns" if o == HOST_LOOKUP_FILES_DNS
+  return "dns,files" if o == HOST_LOOKUP_DNS_FILES
+  return "files" if o == HOST_LOOKUP_FILES
+  return "dns" if o == HOST_LOOKUP_DNS
+  "hostLookupOrder=#{o}??"
+}
+
+# Go's mdnsTest.
+MDNS_FROM_SYSTEM = 0
+MDNS_ASSUME_EXISTS = 1
+MDNS_ASSUME_DOES_NOT_EXIST = 2
+
+# The operating system, as Go's runtime.GOOS names it ("linux", "darwin"
+# or "unix" for another).
+def system_goos -> Str {
+  f = c("AF_INET6")
+  return "linux" if f == 10
+  return "darwin" if f == 30
+  "unix"
+}
+
+# Go's conf.
+struct Conf {
+  # Prefer the go resolver (GODEBUG netdns=go).
+  net_go: Bool
+  # Prefer the cgo resolver (GODEBUG netdns=cgo).
+  net_cgo: Bool
+  # With no explicit preference, use cgo.
+  prefer_cgo: Bool
+  goos: Str
+  mdns_test: Int
+
+  # Go's mustUseGoResolver.
+  def must_use_go_resolver?(r: Resolver?) -> Bool {
+    if x = r {
+      return true if x.prefer_go
+    }
+    net_go
+  }
+
+  # Go's addrLookupOrder.
+  def addr_lookup_order(r: Resolver?, addr: Str) -> Int { lookup_order(r, "") }
+
+  # Go's hostLookupOrder.
+  def host_lookup_order(r: Resolver?, hostname: Str) -> Int { lookup_order(r, hostname) }
+
+  # Go's lookupOrder.
+  def lookup_order(r: Resolver?, hostname0: Str) -> Int {
+    fallback = HOST_LOOKUP_CGO
+    can_use_cgo = false
+    if must_use_go_resolver?(r) {
+      fallback = HOST_LOOKUP_FILES_DNS
+    } elsif net_cgo || prefer_cgo {
+      return HOST_LOOKUP_CGO
+    } else {
+      return HOST_LOOKUP_CGO if index_byte(hostname0, 92) != -1 || index_byte(hostname0, 37) != -1
+      can_use_cgo = true
+    }
+    dns_conf = get_system_dns_config
+    if can_use_cgo {
+      if e = dns_conf.err {
+        return HOST_LOOKUP_CGO unless os.is_not_exist(e) || os.is_permission(e)
+      }
+      return HOST_LOOKUP_CGO if dns_conf.unknown_opt
+    }
+    if goos == "openbsd" {
+      if e = dns_conf.err {
+        return HOST_LOOKUP_FILES if os.is_not_exist(e)
+      }
+      lookup = dns_conf.lookup
+      return HOST_LOOKUP_DNS_FILES if lookup.size == 0
+      return fallback if lookup.size > 2
+      if lookup[0] == "bind" {
+        if lookup.size == 2 {
+          return HOST_LOOKUP_DNS_FILES if lookup[1] == "file"
+          return fallback
+        }
+        return HOST_LOOKUP_DNS
+      }
+      if lookup[0] == "file" {
+        if lookup.size == 2 {
+          return HOST_LOOKUP_FILES_DNS if lookup[1] == "bind"
+          return fallback
+        }
+        return HOST_LOOKUP_FILES
+      }
+      return fallback
+    }
+    hostname = hostname0
+    hostname = hostname[0...hostname.size - 1] if hostname.size > 0 && hostname[hostname.size - 1] == 46
+    nss = get_system_nss
+    srcs: [NssSource] = nss.sources["hosts"] || []
+    if nss.not_exist? || (!nss.err.present? && srcs.size == 0) {
+      return HOST_LOOKUP_CGO if can_use_cgo && goos == "solaris"
+      return HOST_LOOKUP_FILES_DNS
+    }
+    return fallback if nss.err.present?
+
+    has_dns_source = false
+    has_dns_source_checked = false
+    files_source = false
+    dns_source = false
+    first = ""
+    for i in 0...srcs.size {
+      src = srcs[i]
+      if src.source == "files" || src.source == "dns" {
+        return HOST_LOOKUP_CGO if can_use_cgo && !src.standard_criteria?
+        if src.source == "files" {
+          files_source = true
+        } else {
+          has_dns_source = true
+          has_dns_source_checked = true
+          dns_source = true
+        }
+        first = src.source if first == ""
+        next
+      }
+      if can_use_cgo {
+        if hostname != "" && src.source == "myhostname" {
+          return HOST_LOOKUP_CGO if localhost?(hostname) || gateway?(hostname) || outbound?(hostname)
+          hn = get_hostname
+          return HOST_LOOKUP_CGO if hn.err? || strings_equal_fold?(hostname, hn.unwrap)
+          next
+        }
+        if hostname != "" && src.source.start_with?("mdns") {
+          return HOST_LOOKUP_CGO if strings_has_suffix_fold?(hostname, ".local")
+          have_mdns_allow = false
+          if mdns_test == MDNS_FROM_SYSTEM {
+            st = os.stat("/etc/mdns.allow")
+            if e = st.err {
+              return HOST_LOOKUP_CGO unless os.is_not_exist(e)
+            }
+            have_mdns_allow = st.ok?
+          } elsif mdns_test == MDNS_ASSUME_EXISTS {
+            have_mdns_allow = true
+          }
+          return HOST_LOOKUP_CGO if have_mdns_allow
+          next
+        }
+        return HOST_LOOKUP_CGO
+      }
+      if !has_dns_source_checked {
+        has_dns_source_checked = true
+        for j in i + 1...srcs.size {
+          if srcs[j].source == "dns" {
+            has_dns_source = true
+            break
+          }
+        }
+      }
+      if !has_dns_source {
+        dns_source = true
+        first = "dns" if first == ""
+      }
+    }
+    if files_source && dns_source {
+      return first == "files" ? HOST_LOOKUP_FILES_DNS : HOST_LOOKUP_DNS_FILES
+    }
+    return HOST_LOOKUP_FILES if files_source
+    return HOST_LOOKUP_DNS if dns_source
+    fallback
+  }
+}
+
+# Forces a resolver for tests ("go", "cgo"; "": ALX_NETDNS's choice). Go's
+# forceGoDNS / forceCgoDNS.
+NETDNS_MODE = Atomic.new("")
+
+# Go's systemConf: the machine's configuration. alx has no GODEBUG or
+# build tags; ALX_NETDNS=go / ALX_NETDNS=cgo (Go's GODEBUG=netdns=...)
+# forces a resolver. As Go, darwin prefers the system resolver, and so does
+# any system when LOCALDOMAIN, RES_OPTIONS or HOSTALIASES is set.
+def system_conf -> Conf {
+  mode = NETDNS_MODE.load
+  if mode == "" {
+    mode = os.getenv("ALX_NETDNS") || ""
+  }
+  g = system_goos
+  prefer = g == "darwin"
+  prefer = true if os.getenv("LOCALDOMAIN").present? || (os.getenv("RES_OPTIONS") || "") != "" || (os.getenv("HOSTALIASES") || "") != ""
+  Conf.new(net_go: mode == "go", net_cgo: mode == "cgo", prefer_cgo: prefer, goos: g, mdns_test: MDNS_FROM_SYSTEM)
+}
+
+# Go's getHostname (HOSTNAME_OVERRIDE / HOSTNAME_FAIL for tests).
+def get_hostname -> ~Str {
+  fail errors.new("errored") if HOSTNAME_FAIL.load
+  hn = HOSTNAME_OVERRIDE.load
+  return hn if hn != ""
+  ~os.hostname
+}
+
+# Go's isLocalhost: a "localhost" name for the myhostname NSS module.
+def localhost?(h: Str) -> Bool {
+  strings_equal_fold?(h, "localhost") || strings_equal_fold?(h, "localhost.localdomain") || strings_has_suffix_fold?(h, ".localhost") || strings_has_suffix_fold?(h, ".localhost.localdomain")
+}
+
+def gateway?(h: Str) -> Bool { strings_equal_fold?(h, "_gateway") }
+
+def outbound?(h: Str) -> Bool { strings_equal_fold?(h, "_outbound") }

@@ -1,0 +1,673 @@
+# Special functions: Go's portable implementations (cbrt.go, erf.go,
+# erfinv.go, gamma.go, lgamma.go, from FreeBSD's msun and Cephes), line for
+# line, so results are bit-identical with Go's pure-Go math on every backend.
+
+# ---- cube root ----
+
+# The cube root of x: cbrt(±0) = ±0, cbrt(±Inf) = ±Inf, cbrt(NaN) = NaN.
+pub def cbrt(x: Float) -> Float {
+  b1: U64 = 715094163                           # (682-0.03306235651)*2**20
+  b2: U64 = 696219795                           # (664-0.03306235651)*2**20
+  c = 5.42857142857142815906e-01                # 19/35
+  d = -7.05306122448979611050e-01               # -864/1225
+  e = 1.41428571428571436819e+00                # 99/70
+  f = 1.60714285714285720630e+00                # 45/28
+  g = 3.57142857142857150787e-01                # 5/14
+  smallest_normal = 2.22507385850720138309e-308 # 2**-1022
+  return x if x == 0.0 || is_nan(x) || is_inf(x, 0)
+  sign = false
+  if x < 0.0 {
+    x = -x
+    sign = true
+  }
+  # rough cbrt to 5 bits
+  t = float64frombits(float64bits(x) / 3 + (b1 << 32))
+  if x < smallest_normal {
+    # subnormal: scale up by 2**54 first
+    t = 18014398509481984.0 # 1 << 54
+    t *= x
+    t = float64frombits(float64bits(t) / 3 + (b2 << 32))
+  }
+  # new cbrt to 23 bits
+  r = t * t / x
+  s = c + r * t
+  t *= g + f / (s + e + d / s)
+  # chop to 22 bits, make larger than cbrt(x)
+  t = float64frombits((float64bits(t) & (0xFFFFFFFFC << 28)) + (1 << 30))
+  # one step newton iteration to 53 bits with error less than 0.667ulps
+  s = t * t # t*t is exact
+  r = x / s
+  w = t + t
+  r = (r - t) / (w + r) # r-s is exact
+  t = t + t * r
+  t = -t if sign
+  t
+}
+
+# ---- error function ----
+
+ERF_ERX = 8.45062911510467529297e-01
+# Coefficients for approximation to erf in |x| <= 0.84375.
+ERF_EFX = 1.28379167095512586316e-01
+ERF_EFX8 = 1.02703333676410069053e+00
+ERF_PP0 = 1.28379167095512558561e-01
+ERF_PP1 = -3.25042107247001499370e-01
+ERF_PP2 = -2.84817495755985104766e-02
+ERF_PP3 = -5.77027029648944159157e-03
+ERF_PP4 = -2.37630166566501626084e-05
+ERF_QQ1 = 3.97917223959155352819e-01
+ERF_QQ2 = 6.50222499887672944485e-02
+ERF_QQ3 = 5.08130628187576562776e-03
+ERF_QQ4 = 1.32494738004321644526e-04
+ERF_QQ5 = -3.96022827877536812320e-06
+# Coefficients for approximation to erf in 0.84375 <= |x| <= 1.25.
+ERF_PA0 = -2.36211856075265944077e-03
+ERF_PA1 = 4.14856118683748331666e-01
+ERF_PA2 = -3.72207876035701323847e-01
+ERF_PA3 = 3.18346619901161753674e-01
+ERF_PA4 = -1.10894694282396677476e-01
+ERF_PA5 = 3.54783043256182359371e-02
+ERF_PA6 = -2.16637559486879084300e-03
+ERF_QA1 = 1.06420880400844228286e-01
+ERF_QA2 = 5.40397917702171048937e-01
+ERF_QA3 = 7.18286544141962662868e-02
+ERF_QA4 = 1.26171219808761642112e-01
+ERF_QA5 = 1.36370839120290507362e-02
+ERF_QA6 = 1.19844998467991074170e-02
+# Coefficients for approximation to erfc in 1.25 <= |x| <= 1/0.35.
+ERF_RA0 = -9.86494403484714822705e-03
+ERF_RA1 = -6.93858572707181764372e-01
+ERF_RA2 = -1.05586262253232909814e+01
+ERF_RA3 = -6.23753324503260060396e+01
+ERF_RA4 = -1.62396669462573470355e+02
+ERF_RA5 = -1.84605092906711035994e+02
+ERF_RA6 = -8.12874355063065934246e+01
+ERF_RA7 = -9.81432934416914548592e+00
+ERF_SA1 = 1.96512716674392571292e+01
+ERF_SA2 = 1.37657754143519042600e+02
+ERF_SA3 = 4.34565877475229228821e+02
+ERF_SA4 = 6.45387271733267880336e+02
+ERF_SA5 = 4.29008140027567833386e+02
+ERF_SA6 = 1.08635005541779435134e+02
+ERF_SA7 = 6.57024977031928170135e+00
+ERF_SA8 = -6.04244152148580987438e-02
+# Coefficients for approximation to erfc in 1/0.35 <= |x| <= 28.
+ERF_RB0 = -9.86494292470009928597e-03
+ERF_RB1 = -7.99283237680523006574e-01
+ERF_RB2 = -1.77579549177547519889e+01
+ERF_RB3 = -1.60636384855821916062e+02
+ERF_RB4 = -6.37566443368389627722e+02
+ERF_RB5 = -1.02509513161107724954e+03
+ERF_RB6 = -4.83519191608651397019e+02
+ERF_SB1 = 3.03380607434824582924e+01
+ERF_SB2 = 3.25792512996573918826e+02
+ERF_SB3 = 1.53672958608443695994e+03
+ERF_SB4 = 3.19985821950859553908e+03
+ERF_SB5 = 2.55305040643316442583e+03
+ERF_SB6 = 4.74528541206955367215e+02
+ERF_SB7 = -2.24409524465858183362e+01
+ERF_INV035 = 2.857142857142857 # 1/0.35, rounded once as Go's constant is
+
+# The error function of x: erf(±Inf) = ±1, erf(NaN) = NaN.
+pub def erf(x: Float) -> Float {
+  very_tiny = 2.848094538889218e-306 # 0x0080000000000000
+  small = 3.725290298461914e-09      # 2**-28
+  return nan if is_nan(x)
+  return 1.0 if is_inf(x, 1)
+  return -1.0 if is_inf(x, -1)
+  sign = false
+  if x < 0.0 {
+    x = -x
+    sign = true
+  }
+  if x < 0.84375 { # |x| < 0.84375
+    temp = 0.0
+    if x < small { # |x| < 2**-28
+      if x < very_tiny {
+        temp = 0.125 * (8.0 * x + ERF_EFX8 * x) # avoid underflow
+      } else {
+        temp = x + ERF_EFX * x
+      }
+    } else {
+      z = x * x
+      r = ERF_PP0 + z * (ERF_PP1 + z * (ERF_PP2 + z * (ERF_PP3 + z * ERF_PP4)))
+      s = 1.0 + z * (ERF_QQ1 + z * (ERF_QQ2 + z * (ERF_QQ3 + z * (ERF_QQ4 + z * ERF_QQ5))))
+      y = r / s
+      temp = x + x * y
+    }
+    return -temp if sign
+    return temp
+  }
+  if x < 1.25 { # 0.84375 <= |x| < 1.25
+    s = x - 1.0
+    p = ERF_PA0 + s * (ERF_PA1 + s * (ERF_PA2 + s * (ERF_PA3 + s * (ERF_PA4 + s * (ERF_PA5 + s * ERF_PA6)))))
+    q = 1.0 + s * (ERF_QA1 + s * (ERF_QA2 + s * (ERF_QA3 + s * (ERF_QA4 + s * (ERF_QA5 + s * ERF_QA6)))))
+    return -ERF_ERX - p / q if sign
+    return ERF_ERX + p / q
+  }
+  if x >= 6.0 { # inf > |x| >= 6
+    return -1.0 if sign
+    return 1.0
+  }
+  r, s = erf_tail(x)
+  z = float64frombits(float64bits(x) & 0xffffffff00000000) # pseudo-single (20-bit) precision x
+  r = exp(-z * z - 0.5625) * exp((z - x) * (z + x) + r / s)
+  return r / x - 1.0 if sign
+  1.0 - r / x
+}
+
+# R and S of erf's and erfc's rational approximation for 1.25 <= x < 28.
+def erf_tail(x: Float) -> (Float, Float) {
+  s = 1.0 / (x * x)
+  if x < ERF_INV035 { # |x| < 1 / 0.35  ~ 2.857143
+    r = ERF_RA0 + s * (ERF_RA1 + s * (ERF_RA2 + s * (ERF_RA3 + s * (ERF_RA4 + s * (ERF_RA5 + s * (ERF_RA6 + s * ERF_RA7))))))
+    q = 1.0 + s * (ERF_SA1 + s * (ERF_SA2 + s * (ERF_SA3 + s * (ERF_SA4 + s * (ERF_SA5 + s * (ERF_SA6 + s * (ERF_SA7 + s * ERF_SA8)))))))
+    return (r, q)
+  }
+  # |x| >= 1 / 0.35  ~ 2.857143
+  r = ERF_RB0 + s * (ERF_RB1 + s * (ERF_RB2 + s * (ERF_RB3 + s * (ERF_RB4 + s * (ERF_RB5 + s * ERF_RB6)))))
+  q = 1.0 + s * (ERF_SB1 + s * (ERF_SB2 + s * (ERF_SB3 + s * (ERF_SB4 + s * (ERF_SB5 + s * (ERF_SB6 + s * ERF_SB7))))))
+  (r, q)
+}
+
+# The complementary error function 1 - erf(x): erfc(+Inf) = 0, erfc(-Inf) = 2, erfc(NaN) = NaN.
+pub def erfc(x: Float) -> Float {
+  tiny = 1.3877787807814457e-17 # 2**-56
+  return nan if is_nan(x)
+  return 0.0 if is_inf(x, 1)
+  return 2.0 if is_inf(x, -1)
+  sign = false
+  if x < 0.0 {
+    x = -x
+    sign = true
+  }
+  if x < 0.84375 { # |x| < 0.84375
+    temp = 0.0
+    if x < tiny { # |x| < 2**-56
+      temp = x
+    } else {
+      z = x * x
+      r = ERF_PP0 + z * (ERF_PP1 + z * (ERF_PP2 + z * (ERF_PP3 + z * ERF_PP4)))
+      s = 1.0 + z * (ERF_QQ1 + z * (ERF_QQ2 + z * (ERF_QQ3 + z * (ERF_QQ4 + z * ERF_QQ5))))
+      y = r / s
+      if x < 0.25 { # |x| < 1/4
+        temp = x + x * y
+      } else {
+        temp = 0.5 + (x * y + (x - 0.5))
+      }
+    }
+    return 1.0 + temp if sign
+    return 1.0 - temp
+  }
+  if x < 1.25 { # 0.84375 <= |x| < 1.25
+    s = x - 1.0
+    p = ERF_PA0 + s * (ERF_PA1 + s * (ERF_PA2 + s * (ERF_PA3 + s * (ERF_PA4 + s * (ERF_PA5 + s * ERF_PA6)))))
+    q = 1.0 + s * (ERF_QA1 + s * (ERF_QA2 + s * (ERF_QA3 + s * (ERF_QA4 + s * (ERF_QA5 + s * ERF_QA6)))))
+    return 1.0 + ERF_ERX + p / q if sign
+    return 1.0 - ERF_ERX - p / q
+  }
+  if x < 28.0 {                   # |x| < 28
+    return 2.0 if sign && x > 6.0 # x < -6
+    r, s = erf_tail(x)
+    z = float64frombits(float64bits(x) & 0xffffffff00000000) # pseudo-single (20-bit) precision x
+    r = exp(-z * z - 0.5625) * exp((z - x) * (z + x) + r / s)
+    return 2.0 - r / x if sign
+    return r / x
+  }
+  return 2.0 if sign
+  0.0
+}
+
+# ---- inverse error function ----
+
+# The inverse of erf: erfinv(1) = +Inf, erfinv(-1) = -Inf, NaN outside [-1, 1].
+pub def erfinv(x: Float) -> Float {
+  # Coefficients for approximation to erf in |x| <= 0.85
+  a0 = 1.1975323115670912564578e0
+  a1 = 4.7072688112383978012285e1
+  a2 = 6.9706266534389598238465e2
+  a3 = 4.8548868893843886794648e3
+  a4 = 1.6235862515167575384252e4
+  a5 = 2.3782041382114385731252e4
+  a6 = 1.1819493347062294404278e4
+  a7 = 8.8709406962545514830200e2
+  b0 = 1.0000000000000000000e0
+  b1 = 4.2313330701600911252e1
+  b2 = 6.8718700749205790830e2
+  b3 = 5.3941960214247511077e3
+  b4 = 2.1213794301586595867e4
+  b5 = 3.9307895800092710610e4
+  b6 = 2.8729085735721942674e4
+  b7 = 5.2264952788528545610e3
+  # Coefficients for approximation to erf in 0.85 < |x| <= 1-2*exp(-25)
+  c0 = 1.42343711074968357734e0
+  c1 = 4.63033784615654529590e0
+  c2 = 5.76949722146069140550e0
+  c3 = 3.64784832476320460504e0
+  c4 = 1.27045825245236838258e0
+  c5 = 2.41780725177450611770e-1
+  c6 = 2.27238449892691845833e-2
+  c7 = 7.74545014278341407640e-4
+  d0 = 1.4142135623730950488016887e0
+  d1 = 2.9036514445419946173133295e0
+  d2 = 2.3707661626024532365971225e0
+  d3 = 9.7547832001787427186894837e-1
+  d4 = 2.0945065210512749128288442e-1
+  d5 = 2.1494160384252876777097297e-2
+  d6 = 7.7441459065157709165577218e-4
+  d7 = 1.4859850019840355905497876e-9
+  # Coefficients for approximation to erf in 1-2*exp(-25) < |x| < 1
+  e0 = 6.65790464350110377720e0
+  e1 = 5.46378491116411436990e0
+  e2 = 1.78482653991729133580e0
+  e3 = 2.96560571828504891230e-1
+  e4 = 2.65321895265761230930e-2
+  e5 = 1.24266094738807843860e-3
+  e6 = 2.71155556874348757815e-5
+  e7 = 2.01033439929228813265e-7
+  f0 = 1.414213562373095048801689e0
+  f1 = 8.482908416595164588112026e-1
+  f2 = 1.936480946950659106176712e-1
+  f3 = 2.103693768272068968719679e-2
+  f4 = 1.112800997078859844711555e-3
+  f5 = 2.611088405080593625138020e-5
+  f6 = 2.010321207683943062279931e-7
+  f7 = 2.891024605872965461538222e-15
+  if is_nan(x) || x <= -1.0 || x >= 1.0 {
+    return inf(x.to_i) if x == -1.0 || x == 1.0
+    return nan
+  }
+  sign = false
+  if x < 0.0 {
+    x = -x
+    sign = true
+  }
+  ans = 0.0
+  if x <= 0.85 { # |x| <= 0.85
+    r = 0.180625 - 0.25 * x * x
+    z1 = ((((((a7 * r + a6) * r + a5) * r + a4) * r + a3) * r + a2) * r + a1) * r + a0
+    z2 = ((((((b7 * r + b6) * r + b5) * r + b4) * r + b3) * r + b2) * r + b1) * r + b0
+    ans = (x * z1) / z2
+  } else {
+    z1 = 0.0
+    z2 = 0.0
+    r = (LN2 - log(1.0 - x)).sqrt
+    if r <= 5.0 {
+      r -= 1.6
+      z1 = ((((((c7 * r + c6) * r + c5) * r + c4) * r + c3) * r + c2) * r + c1) * r + c0
+      z2 = ((((((d7 * r + d6) * r + d5) * r + d4) * r + d3) * r + d2) * r + d1) * r + d0
+    } else {
+      r -= 5.0
+      z1 = ((((((e7 * r + e6) * r + e5) * r + e4) * r + e3) * r + e2) * r + e1) * r + e0
+      z2 = ((((((f7 * r + f6) * r + f5) * r + f4) * r + f3) * r + f2) * r + f1) * r + f0
+    }
+    ans = z1 / z2
+  }
+  return -ans if sign
+  ans
+}
+
+# The inverse of erfc: erfcinv(0) = +Inf, erfcinv(2) = -Inf, NaN outside [0, 2].
+pub def erfcinv(x: Float) -> Float { erfinv(1.0 - x) }
+
+# ---- gamma ----
+
+GAM_P: [Float] = [
+  1.60119522476751861407e-04,
+  1.19135147006586384913e-03,
+  1.04213797561761569935e-02,
+  4.76367800457137231464e-02,
+  2.07448227648435975150e-01,
+  4.94214826801497100753e-01,
+  9.99999999999999996796e-01,
+]
+
+GAM_Q: [Float] = [
+  -2.31581873324120129819e-05,
+  5.39605580493303397842e-04,
+  -4.45641913851797240494e-03,
+  1.18139785222060435552e-02,
+  3.58236398605498653373e-02,
+  -2.34591795718243348568e-01,
+  7.14304917030273074085e-02,
+  1.00000000000000000320e+00,
+]
+
+GAM_S: [Float] = [
+  7.87311395793093628397e-04,
+  -2.29549961613378126380e-04,
+  -2.68132617805781232825e-03,
+  3.47222221605458667310e-03,
+  8.33333333333482257126e-02,
+]
+
+# Gamma(x) by Stirling's formula, as two factors whose product is the result
+# (so the caller can avoid overflow). Valid for 33 <= x <= 172.
+def stirling(x: Float) -> (Float, Float) {
+  return (inf(1), 1.0) if x > 200.0
+  sqrt_two_pi = 2.506628274631000502417
+  max_stirling = 143.01608
+  w = 1.0 / x
+  w = 1.0 + w * ((((GAM_S[0] * w + GAM_S[1]) * w + GAM_S[2]) * w + GAM_S[3]) * w + GAM_S[4])
+  y1 = exp(x)
+  y2 = 1.0
+  if x > max_stirling { # avoid pow() overflow
+    v = pow(x, 0.5 * x - 0.25)
+    y2 = v / y1
+    y1 = v
+  } else {
+    y1 = pow(x, x - 0.5) / y1
+  }
+  (y1, sqrt_two_pi * w * y2)
+}
+
+# The Gamma function: gamma(+Inf) = +Inf, gamma(±0) = ±Inf, NaN at negative
+# integers, -Inf and NaN.
+pub def gamma(x: Float) -> Float {
+  euler = 0.57721566490153286060651209008240243104215933593992 # A001620
+  return nan if neg_int?(x) || is_inf(x, -1) || is_nan(x)
+  return inf(1) if is_inf(x, 1)
+  if x == 0.0 {
+    return inf(-1) if signbit(x)
+    return inf(1)
+  }
+  q = x.abs
+  p = floor(q)
+  if q > 33.0 {
+    if x >= 0.0 {
+      y1, y2 = stirling(x)
+      return y1 * y2
+    }
+    # Note: x is negative but (checked above) not a negative integer,
+    # so x must be small enough to be in range for conversion to Int.
+    signgam = 1
+    signgam = -1 if p.to_i & 1 == 0
+    z = q - p
+    if z > 0.5 {
+      p = p + 1.0
+      z = q - p
+    }
+    z = q * sin(PI * z)
+    return inf(signgam) if z == 0.0
+    sq1, sq2 = stirling(q)
+    absz = z.abs
+    d = absz * sq1 * sq2
+    if is_inf(d, 0) {
+      z = PI / absz / sq1 / sq2
+    } else {
+      z = PI / d
+    }
+    return signgam.to_f * z
+  }
+  # Reduce argument
+  z = 1.0
+  while x >= 3.0 {
+    x = x - 1.0
+    z = z * x
+  }
+  while x < 0.0 {
+    return gamma_small(x, z, euler) if x > -1e-09
+    z = z / x
+    x = x + 1.0
+  }
+  while x < 2.0 {
+    return gamma_small(x, z, euler) if x < 1e-09
+    z = z / x
+    x = x + 1.0
+  }
+  return z if x == 2.0
+  x = x - 2.0
+  p = (((((x * GAM_P[0] + GAM_P[1]) * x + GAM_P[2]) * x + GAM_P[3]) * x + GAM_P[4]) * x + GAM_P[5]) * x + GAM_P[6]
+  q = ((((((x * GAM_Q[0] + GAM_Q[1]) * x + GAM_Q[2]) * x + GAM_Q[3]) * x + GAM_Q[4]) * x + GAM_Q[5]) * x + GAM_Q[6]) * x + GAM_Q[7]
+  z * p / q
+}
+
+# Go's `small:` label in Gamma.
+def gamma_small(x: Float, z: Float, euler: Float) -> Float {
+  return inf(1) if x == 0.0
+  z / ((1.0 + euler * x) * x)
+}
+
+def neg_int?(x: Float) -> Bool {
+  if x < 0.0 {
+    _, xf = modf(x)
+    return xf == 0.0
+  }
+  false
+}
+
+# ---- log gamma ----
+
+LGAM_A: [Float] = [
+  7.72156649015328655494e-02,
+  3.22467033424113591611e-01,
+  6.73523010531292681824e-02,
+  2.05808084325167332806e-02,
+  7.38555086081402883957e-03,
+  2.89051383673415629091e-03,
+  1.19270763183362067845e-03,
+  5.10069792153511336608e-04,
+  2.20862790713908385557e-04,
+  1.08011567247583939954e-04,
+  2.52144565451257326939e-05,
+  4.48640949618915160150e-05,
+]
+
+LGAM_R: [Float] = [
+  1.0, # placeholder
+  1.39200533467621045958e+00,
+  7.21935547567138069525e-01,
+  1.71933865632803078993e-01,
+  1.86459191715652901344e-02,
+  7.77942496381893596434e-04,
+  7.32668430744625636189e-06,
+]
+
+LGAM_S: [Float] = [
+  -7.72156649015328655494e-02,
+  2.14982415960608852501e-01,
+  3.25778796408930981787e-01,
+  1.46350472652464452805e-01,
+  2.66422703033638609560e-02,
+  1.84028451407337715652e-03,
+  3.19475326584100867617e-05,
+]
+
+LGAM_T: [Float] = [
+  4.83836122723810047042e-01,
+  -1.47587722994593911752e-01,
+  6.46249402391333854778e-02,
+  -3.27885410759859649565e-02,
+  1.79706750811820387126e-02,
+  -1.03142241298341437450e-02,
+  6.10053870246291332635e-03,
+  -3.68452016781138256760e-03,
+  2.25964780900612472250e-03,
+  -1.40346469989232843813e-03,
+  8.81081882437654011382e-04,
+  -5.38595305356740546715e-04,
+  3.15632070903625950361e-04,
+  -3.12754168375120860518e-04,
+  3.35529192635519073543e-04,
+]
+
+LGAM_U: [Float] = [
+  -7.72156649015328655494e-02,
+  6.32827064025093366517e-01,
+  1.45492250137234768737e+00,
+  9.77717527963372745603e-01,
+  2.28963728064692451092e-01,
+  1.33810918536787660377e-02,
+]
+
+LGAM_V: [Float] = [
+  1.0,
+  2.45597793713041134822e+00,
+  2.12848976379893395361e+00,
+  7.69285150456672783825e-01,
+  1.04222645593369134254e-01,
+  3.21709242282423911810e-03,
+]
+
+LGAM_W: [Float] = [
+  4.18938533204672725052e-01,
+  8.33333333333329678849e-02,
+  -2.77777777728775536470e-03,
+  7.93650558643019558500e-04,
+  -5.95187557450339963135e-04,
+  8.36339918996282139126e-04,
+  -1.63092934096575273989e-03,
+]
+
+# The natural logarithm of |Gamma(x)| and the sign of Gamma(x) (-1 or 1):
+# lgamma(+Inf) = +Inf, lgamma(0) = +Inf, lgamma(-integer) = +Inf,
+# lgamma(-Inf) = -Inf, lgamma(NaN) = NaN.
+pub def lgamma(x: Float) -> (Float, Int) {
+  two52 = 4503599627370496.0   # 1 << 52
+  two58 = 288230376151711744.0 # 1 << 58
+  tiny = 8.470329472543003e-22 # 2**-70
+  tc = 1.46163214496836224576e+00
+  tf = -1.21486290535849611461e-01
+  # tt = -(tail of tf)
+  tt = -3.63867699703950536541e-18
+  # Go's constant expressions on Ymin = 1.461632144968362245 and Tc, rounded once:
+  ymin_m1_p027 = 0.7316321449683623  # Ymin - 1 + 0.27
+  ymin_m1_m027 = 0.19163214496836226 # Ymin - 1 - 0.27
+  ymin_p027 = 1.7316321449683623     # Ymin + 0.27
+  ymin_m027 = 1.1916321449683622     # Ymin - 0.27
+  tc_m1 = 0.46163214496836225        # Tc - 1
+  sign = 1
+  return (x, sign) if is_nan(x)
+  return (x, sign) if is_inf(x, 0)
+  return (inf(1), sign) if x == 0.0
+  neg = false
+  if x < 0.0 {
+    x = -x
+    neg = true
+  }
+  if x < tiny { # if |x| < 2**-70, return -log(|x|)
+    sign = -1 if neg
+    return (-log(x), sign)
+  }
+  nadj = 0.0
+  if neg {
+    return (inf(1), sign) if x >= two52 # |x| >= 2**52, must be -integer
+    t = sin_pi(x)
+    return (inf(1), sign) if t == 0.0 # -integer
+    nadj = log(PI / (t * x).abs)
+    sign = -1 if t < 0.0
+  }
+  lg = 0.0
+  if x == 1.0 || x == 2.0 { # purge off 1 and 2
+    return (0.0, sign)
+  } else if x < 2.0 { # use lgamma(x) = lgamma(x+1) - log(x)
+    y = 0.0
+    i = 0
+    if x <= 0.9 {
+      lg = -log(x)
+      if x >= ymin_m1_p027 { # 0.7316 <= x <=  0.9
+        y = 1.0 - x
+        i = 0
+      } else if x >= ymin_m1_m027 { # 0.2316 <= x < 0.7316
+        y = x - tc_m1
+        i = 1
+      } else { # 0 < x < 0.2316
+        y = x
+        i = 2
+      }
+    } else {
+      lg = 0.0
+      if x >= ymin_p027 { # 1.7316 <= x < 2
+        y = 2.0 - x
+        i = 0
+      } else if x >= ymin_m027 { # 1.2316 <= x < 1.7316
+        y = x - tc
+        i = 1
+      } else { # 0.9 < x < 1.2316
+        y = x - 1.0
+        i = 2
+      }
+    }
+    case i {
+      0 => {
+        z = y * y
+        p1 = LGAM_A[0] + z * (LGAM_A[2] + z * (LGAM_A[4] + z * (LGAM_A[6] + z * (LGAM_A[8] + z * LGAM_A[10]))))
+        p2 = z * (LGAM_A[1] + z * (LGAM_A[3] + z * (LGAM_A[5] + z * (LGAM_A[7] + z * (LGAM_A[9] + z * LGAM_A[11])))))
+        p = y * p1 + p2
+        lg += (p - 0.5 * y)
+      }
+      1 => {
+        z = y * y
+        w = z * y
+        p1 = LGAM_T[0] + w * (LGAM_T[3] + w * (LGAM_T[6] + w * (LGAM_T[9] + w * LGAM_T[12]))) # parallel comp
+        p2 = LGAM_T[1] + w * (LGAM_T[4] + w * (LGAM_T[7] + w * (LGAM_T[10] + w * LGAM_T[13])))
+        p3 = LGAM_T[2] + w * (LGAM_T[5] + w * (LGAM_T[8] + w * (LGAM_T[11] + w * LGAM_T[14])))
+        p = z * p1 - (tt - w * (p2 + y * p3))
+        lg += (tf + p)
+      }
+      _ => {
+        p1 = y * (LGAM_U[0] + y * (LGAM_U[1] + y * (LGAM_U[2] + y * (LGAM_U[3] + y * (LGAM_U[4] + y * LGAM_U[5])))))
+        p2 = 1.0 + y * (LGAM_V[1] + y * (LGAM_V[2] + y * (LGAM_V[3] + y * (LGAM_V[4] + y * LGAM_V[5]))))
+        lg += (-0.5 * y + p1 / p2)
+      }
+    }
+  } else if x < 8.0 { # 2 <= x < 8
+    i = x.to_i
+    y = x - i.to_f
+    p = y * (LGAM_S[0] + y * (LGAM_S[1] + y * (LGAM_S[2] + y * (LGAM_S[3] + y * (LGAM_S[4] + y * (LGAM_S[5] + y * LGAM_S[6]))))))
+    q = 1.0 + y * (LGAM_R[1] + y * (LGAM_R[2] + y * (LGAM_R[3] + y * (LGAM_R[4] + y * (LGAM_R[5] + y * LGAM_R[6])))))
+    lg = 0.5 * y + p / q
+    z = 1.0 # lgamma(1+s) = log(s) + lgamma(s)
+    # Go's switch with fallthrough from case 7 down to case 3.
+    if i >= 3 {
+      z *= (y + 6.0) if i >= 7
+      z *= (y + 5.0) if i >= 6
+      z *= (y + 4.0) if i >= 5
+      z *= (y + 3.0) if i >= 4
+      z *= (y + 2.0)
+      lg += log(z)
+    }
+  } else if x < two58 { # 8 <= x < 2**58
+    t = log(x)
+    z = 1.0 / x
+    y = z * z
+    w = LGAM_W[0] + z * (LGAM_W[1] + y * (LGAM_W[2] + y * (LGAM_W[3] + y * (LGAM_W[4] + y * (LGAM_W[5] + y * LGAM_W[6])))))
+    lg = (x - 0.5) * (t - 1.0) + w
+  } else { # 2**58 <= x <= Inf
+    lg = x * (log(x) - 1.0)
+  }
+  lg = nadj - lg if neg
+  (lg, sign)
+}
+
+# sin(Pi*x) for x > 0, for lgamma; the result is negated (Go's sinPi).
+def sin_pi(x: Float) -> Float {
+  two52 = 4503599627370496.0 # 1 << 52
+  two53 = 9007199254740992.0 # 1 << 53
+  return -sin(PI * x) if x < 0.25
+  # argument reduction
+  z = floor(x)
+  n = 0
+  if z != x { # inexact
+    x = mod(x, 2.0)
+    n = (x * 4.0).to_i
+  } else {
+    if x >= two53 { # x must be even
+      x = 0.0
+      n = 0
+    } else {
+      z = x + two52 if x < two52 # exact
+      n = (1 & float64bits(z)).to_i
+      x = n.to_f
+      n <<= 2
+    }
+  }
+  x = case n {
+    0 => sin(PI * x)
+    1..2 => cos(PI * (0.5 - x))
+    3..4 => sin(PI * (1.0 - x))
+    5..6 => -cos(PI * (x - 1.5))
+    _ => sin(PI * (x - 2.0))
+  }
+  -x
+}

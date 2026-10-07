@@ -1,0 +1,127 @@
+# Go's interface_test.go, translated (with interface_unix_test.go's
+# TestPointToPointInterface etc. left out: they add and remove interfaces,
+# which needs root and ifconfig / ip).
+
+def iface_eq?(a: Interface, b: Interface) -> Bool {
+  a.index == b.index && a.mtu == b.mtu && a.name == b.name && a.hardware_addr.bytes == b.hardware_addr.bytes && a.flags.bits == b.flags.bits
+}
+
+test "Interfaces" {
+  ift = interfaces.unwrap
+  for ifi in ift {
+    ifxi = interface_by_index(ifi.index).unwrap
+    assert iface_eq?(ifxi, ifi), "by index: got #{ifxi.name}; want #{ifi.name}"
+    if ifi.name != "" {
+      ifxn = interface_by_name(ifi.name).unwrap
+      assert iface_eq?(ifxn, ifi), "by name: got #{ifxn.name}; want #{ifi.name}"
+    }
+  }
+  assert_eq interface_by_index(0).err.unwrap.message, "route ip+net: invalid network interface index"
+  assert_eq interface_by_name("").err.unwrap.message, "route ip+net: invalid network interface name"
+  assert_eq interface_by_name("no-such-interface-xyz").err.unwrap.message, "route ip+net: no such network interface"
+}
+
+# (loopback interfaces up, other interfaces up).
+def interface_stats(ift: [Interface]) -> (Int, Int) {
+  lp = 0
+  other = 0
+  for ifi in ift {
+    if ifi.flags.has?(FLAG_UP) {
+      if ifi.flags.has?(FLAG_LOOPBACK) {
+        lp += 1
+      } else {
+        other += 1
+      }
+    }
+  }
+  (lp, other)
+}
+
+# Go's validateInterfaceUnicastAddrs: (ipv4, ipv6) counts, or a problem.
+def validate_unicast(ifat: [Addr]) -> ~(Int, Int) {
+  v4 = 0
+  v6 = 0
+  for ifa in ifat {
+    case ifa {
+      IPNet(n) => {
+        fail "unexpected value: #{n}" if n.ip.size == 0 || n.ip.multicast? || n.mask.size == 0
+        fail "should be the 16-byte form: #{n}" if n.ip.size != IPV6_LEN
+        plen, maxlen = n.mask.size_bits
+        if n.ip.to4.present? {
+          fail "unexpected prefix length: #{plen}/#{maxlen} for #{n}" if 0 >= plen || plen > 32 || maxlen != 32
+          fail "unexpected prefix length: #{plen}/#{maxlen} for #{n}" if n.ip.loopback? && plen < 8
+          v4 += 1
+        } else {
+          fail "unexpected prefix length: #{plen}/#{maxlen} for #{n}" if 0 >= plen || plen > 128 || maxlen != 128
+          fail "unexpected prefix length: #{plen}/#{maxlen} for #{n}" if n.ip.loopback? && plen != 128
+          v6 += 1
+        }
+      }
+      _ => fail "unexpected type: #{ifa}"
+    }
+  }
+  (v4, v6)
+}
+
+def validate_multicast(ifat: [Addr]) -> ~(Int, Int) {
+  v4 = 0
+  v6 = 0
+  for ifa in ifat {
+    case ifa {
+      IPAddr(a) => {
+        fail "unexpected value: #{a}" if a.ip.size == 0 || a.ip.unspecified? || !a.ip.multicast?
+        fail "should be the 16-byte form: #{a}" if a.ip.size != IPV6_LEN
+        if a.ip.to4.present? {
+          v4 += 1
+        } else {
+          v6 += 1
+        }
+      }
+      _ => fail "unexpected type: #{ifa}"
+    }
+  }
+  (v4, v6)
+}
+
+def check_unicast_stats(lp: Int, other: Int, v4: Int, v6: Int) {
+  assert !(supports_ipv4? && lp + other > 0 && v4 == 0), "num IPv4 unicast routes = 0; want >0"
+  assert !(supports_ipv6? && lp > 0 && v6 == 0), "num IPv6 unicast routes = 0; want >0"
+}
+
+test "InterfaceAddrs" {
+  ift = interfaces.unwrap
+  lp, other = interface_stats(ift)
+  v4, v6 = validate_unicast(interface_addrs.unwrap).unwrap
+  check_unicast_stats(lp, other, v4, v6)
+}
+
+test "InterfaceUnicastAddrs" {
+  ift = interfaces.unwrap
+  lp, other = interface_stats(ift)
+  v4 = 0
+  v6 = 0
+  for ifi in ift {
+    a4, a6 = validate_unicast(ifi.addrs.unwrap).unwrap
+    v4 += a4
+    v6 += a6
+  }
+  check_unicast_stats(lp, other, v4, v6)
+}
+
+test "InterfaceMulticastAddrs" {
+  ift = interfaces.unwrap
+  lp, _ = interface_stats(ift)
+  _, u6 = validate_unicast(interface_addrs.unwrap).unwrap
+  m6 = 0
+  for ifi in ift {
+    _, a6 = validate_multicast(ifi.multicast_addrs.unwrap).unwrap
+    m6 += a6
+  }
+  assert !(supports_ipv6? && lp > 0 && u6 > 1 && m6 == 0), "num IPv6 multicast route clones = 0; want >0"
+}
+
+test "Flags" {
+  assert_eq flags(0).to_s, "0"
+  assert_eq flags(FLAG_UP | FLAG_LOOPBACK | FLAG_RUNNING).to_s, "up|loopback|running"
+  assert_eq flags(63).to_s, "up|broadcast|loopback|pointtopoint|multicast|running"
+}

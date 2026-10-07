@@ -1,0 +1,381 @@
+# IP addresses, masks and networks (Go's net/ip.go).
+
+import "net/netip"
+
+pub IPV4_LEN = 4
+pub IPV6_LEN = 16
+
+V4_IN_V6_PREFIX: [Byte] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff]
+
+# An IP address: 4 bytes (IPv4) or 16 (IPv6, or IPv4 in IPv6 form). Go's
+# `type IP []byte`, as a struct around the bytes. The zero IP (no bytes) is
+# Go's nil IP. `ip[i]` and `ip.size` read the bytes; `ip.bytes` is the slice
+# itself (shared, as converting a Go IP to []byte is).
+pub struct IP {
+  b: [Byte]
+
+  pub def bytes -> [Byte] { b }
+  pub def size -> Int { b.size }
+  pub def [](i: Int) -> Byte { b[i] }
+  # Go's len(ip) == 0: the nil IP.
+  pub def nil? -> Bool { b.size == 0 }
+
+  # Whether ip is an unspecified address, 0.0.0.0 or "::".
+  pub def unspecified? -> Bool { equal?(ipv4_zero) || equal?(ipv6_unspecified) }
+
+  # Whether ip is a loopback address.
+  pub def loopback? -> Bool {
+    if ip4 = to4 {
+      return ip4[0] == 127
+    }
+    equal?(ipv6_loopback)
+  }
+
+  # Whether ip is a private address (RFC 1918 for IPv4, RFC 4193 for IPv6).
+  pub def private? -> Bool {
+    if ip4 = to4 {
+      return ip4[0] == 10 || (ip4[0] == 172 && ip4[1] & 0xf0 == 16) || (ip4[0] == 192 && ip4[1] == 168)
+    }
+    b.size == IPV6_LEN && b[0] & 0xfe == 0xfc
+  }
+
+  pub def multicast? -> Bool {
+    if ip4 = to4 {
+      return ip4[0] & 0xf0 == 0xe0
+    }
+    b.size == IPV6_LEN && b[0] == 0xff
+  }
+
+  pub def interface_local_multicast? -> Bool { b.size == IPV6_LEN && b[0] == 0xff && b[1] & 0x0f == 0x01 }
+
+  pub def link_local_multicast? -> Bool {
+    if ip4 = to4 {
+      return ip4[0] == 224 && ip4[1] == 0 && ip4[2] == 0
+    }
+    b.size == IPV6_LEN && b[0] == 0xff && b[1] & 0x0f == 0x02
+  }
+
+  pub def link_local_unicast? -> Bool {
+    if ip4 = to4 {
+      return ip4[0] == 169 && ip4[1] == 254
+    }
+    b.size == IPV6_LEN && b[0] == 0xfe && b[1] & 0xc0 == 0x80
+  }
+
+  # Whether ip is a global unicast address (Go's IsGlobalUnicast: neither
+  # broadcast, unspecified, loopback, multicast nor link-local unicast).
+  pub def global_unicast? -> Bool {
+    (b.size == IPV4_LEN || b.size == IPV6_LEN) && !equal?(ipv4_bcast) && !unspecified? && !loopback? && !multicast? && !link_local_unicast?
+  }
+
+  # The 4-byte form of an IPv4 address; none if ip isn't one.
+  pub def to4 -> IP? {
+    return self if b.size == IPV4_LEN
+    if b.size == IPV6_LEN && zeros?(b[0...10]) && b[10] == 0xff && b[11] == 0xff {
+      return IP.new(b: b[12...16])
+    }
+    none
+  }
+
+  # The 16-byte form; none if ip's length is neither 4 nor 16.
+  pub def to16 -> IP? {
+    return ipv4(b[0], b[1], b[2], b[3]) if b.size == IPV4_LEN
+    return self if b.size == IPV6_LEN
+    none
+  }
+
+  # The default (classful) mask of an IPv4 address; none for IPv6.
+  pub def default_mask -> IPMask? {
+    ip = to4 || return none
+    return class_a_mask if ip[0] < 0x80
+    return class_b_mask if ip[0] < 0xc0
+    class_c_mask
+  }
+
+  # ip with mask applied; none if their lengths don't fit.
+  pub def mask(m: IPMask) -> IP? {
+    mb = m.b
+    ib = b
+    mb = mb[12...16] if mb.size == IPV6_LEN && ib.size == IPV4_LEN && all_ff?(mb[0...12])
+    ib = ib[12...16] if mb.size == IPV4_LEN && ib.size == IPV6_LEN && ib[0...12] == V4_IN_V6_PREFIX
+    n = ib.size
+    return none if n != mb.size
+    out: [Byte] = [0; n]
+    for i in 0...n {
+      out[i] = ib[i] & mb[i]
+    }
+    IP.new(b: out)
+  }
+
+  # "192.0.2.1", "2001:db8::1"; "<nil>" for the nil IP, "?" and hex for any
+  # other length.
+  pub def to_s -> Str {
+    return "<nil>" if b.size == 0
+    return "?" + hex_string(b) if b.size != IPV4_LEN && b.size != IPV6_LEN
+    Str.from_bytes(append_to([]))
+  }
+
+  pub def string -> Str { to_s }
+
+  def append_to(out: [Byte]) -> [Byte] {
+    s = b
+    if p4 = to4 {
+      s = p4.b
+    }
+    a = netip.addr_from_slice(s) || return out
+    a.append_to(out)
+  }
+
+  # Go's AppendText: the nil IP appends nothing; a bad length fails with an
+  # AddrError.
+  pub def append_text(out: [Byte]) -> ~[Byte]<AddrError> {
+    return out if b.size == 0
+    fail addr_error("invalid IP address", hex_string(b)) if b.size != IPV4_LEN && b.size != IPV6_LEN
+    append_to(out)
+  }
+
+  pub def marshal_text -> ~[Byte]<AddrError> { ~append_text([]) }
+
+  # Whether ip and x are the same address (an IPv4 address equals its IPv6
+  # form).
+  pub def equal?(x: IP) -> Bool {
+    return b == x.b if b.size == x.b.size
+    return x.b[0...12] == V4_IN_V6_PREFIX && b == x.b[12...16] if b.size == IPV4_LEN && x.b.size == IPV6_LEN
+    return b[0...12] == V4_IN_V6_PREFIX && b[12...16] == x.b if b.size == IPV6_LEN && x.b.size == IPV4_LEN
+    false
+  }
+
+  def match_addr_family?(x: IP) -> Bool {
+    (to4.present? && x.to4.present?) || (to16.present? && !to4.present? && x.to16.present? && !x.to4.present?)
+  }
+
+  # A copy of ip that shares no storage.
+  pub def dup -> IP { IP.new(b: b.dup) }
+}
+
+# Go's (*IP).UnmarshalText: an empty text is the nil IP.
+pub def unmarshal_ip_text(text: [Byte]) -> ~IP<ParseError> {
+  return IP.new if text.size == 0
+  s = Str.from_bytes(text)
+  parse_ip(s) || fail parse_error("IP address", s)
+}
+
+def zeros?(p: [Byte]) -> Bool {
+  for c in p {
+    return false if c != 0
+  }
+  true
+}
+
+def all_ff?(p: [Byte]) -> Bool {
+  for c in p {
+    return false if c != 0xff
+  }
+  true
+}
+
+# The IP address (16-byte form) of the IPv4 address a.b.c.d.
+pub def ipv4(a: Byte, b: Byte, c: Byte, d: Byte) -> IP {
+  p: [Byte] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, a, b, c, d]
+  IP.new(b: p)
+}
+
+# An IP from its bytes (Go's conversion IP(b)); shares b.
+pub def ip_from(b: [Byte]) -> IP { IP.new(b: b) }
+
+# An IP mask: 4 or 16 bytes. Go's `type IPMask []byte`, as a struct around
+# the bytes; the zero IPMask is Go's nil mask.
+pub struct IPMask {
+  b: [Byte]
+
+  pub def bytes -> [Byte] { b }
+  pub def size -> Int { b.size }
+  pub def [](i: Int) -> Byte { b[i] }
+
+  # The number of leading ones and the total bits; (0, 0) for a mask that
+  # isn't canonical (ones then zeros).
+  pub def size_bits -> (Int, Int) {
+    ones = simple_mask_length(self)
+    return (0, 0) if ones == -1
+    (ones, b.size * 8)
+  }
+
+  # Hex, with no punctuation; "<nil>" for the nil mask.
+  pub def to_s -> Str {
+    return "<nil>" if b.size == 0
+    hex_string(b)
+  }
+
+  pub def string -> Str { to_s }
+}
+
+# An IPMask from its bytes (Go's conversion IPMask(b)); shares b.
+pub def mask_from(b: [Byte]) -> IPMask { IPMask.new(b: b) }
+
+# The IPv4 mask a.b.c.d (4 bytes).
+pub def ipv4_mask(a: Byte, b: Byte, c: Byte, d: Byte) -> IPMask {
+  p: [Byte] = [a, b, c, d]
+  IPMask.new(b: p)
+}
+
+# A mask of `ones` 1 bits followed by 0s up to `bits` (32 or 128); none
+# for other arguments.
+pub def cidr_mask(ones: Int, bits: Int) -> IPMask? {
+  return none if bits != 8 * IPV4_LEN && bits != 8 * IPV6_LEN
+  return none if ones < 0 || ones > bits
+  l = bits / 8
+  m: [Byte] = [0; l]
+  n = ones
+  for i in 0...l {
+    if n >= 8 {
+      m[i] = 0xff
+      n -= 8
+      next
+    }
+    m[i] = 0xff.as_u8 ^ (0xff.as_u8 >> n)
+    n = 0
+  }
+  IPMask.new(b: m)
+}
+
+pub def ipv4_bcast -> IP { ipv4(255, 255, 255, 255) }
+pub def ipv4_allsys -> IP { ipv4(224, 0, 0, 1) }
+pub def ipv4_allrouter -> IP { ipv4(224, 0, 0, 2) }
+pub def ipv4_zero -> IP { ipv4(0, 0, 0, 0) }
+
+pub def ipv6_zero -> IP { IP.new(b: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]) }
+pub def ipv6_unspecified -> IP { IP.new(b: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]) }
+pub def ipv6_loopback -> IP { IP.new(b: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]) }
+pub def ipv6_interface_local_all_nodes -> IP { IP.new(b: [0xff, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01]) }
+pub def ipv6_link_local_all_nodes -> IP { IP.new(b: [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01]) }
+pub def ipv6_link_local_all_routers -> IP { IP.new(b: [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02]) }
+
+def class_a_mask -> IPMask { ipv4_mask(0xff, 0, 0, 0) }
+def class_b_mask -> IPMask { ipv4_mask(0xff, 0xff, 0, 0) }
+def class_c_mask -> IPMask { ipv4_mask(0xff, 0xff, 0xff, 0) }
+
+# The number of leading ones of a canonical mask; -1 if it isn't one.
+def simple_mask_length(mask: IPMask) -> Int {
+  n = 0
+  m = mask.b
+  for i in 0...m.size {
+    v = m[i]
+    if v == 0xff {
+      n += 8
+      next
+    }
+    while v & 0x80 != 0 {
+      n += 1
+      v = v << 1
+    }
+    return -1 if v != 0
+    for j in i + 1...m.size {
+      return -1 if m[j] != 0
+    }
+    break
+  }
+  n
+}
+
+# An IP network: a network number and a mask. Go's IPNet (an Addr, network
+# "ip+net").
+pub struct IPNet {
+  ip: IP
+  mask: IPMask
+
+  # Whether the network includes ip.
+  pub def contains?(ip: IP) -> Bool {
+    nm = network_number_and_mask(self) || return false
+    nn, m = nm
+    x = ip.to4 || ip
+    l = x.b.size
+    return false if l != nn.b.size
+    for i in 0...l {
+      return false if nn.b[i] & m.b[i] != x.b[i] & m.b[i]
+    }
+    true
+  }
+
+  # "ip+net".
+  pub def network -> Str { "ip+net" }
+
+  # CIDR notation ("192.0.2.0/24"), or the address and a hex mask for a
+  # non-canonical mask; "<nil>" if the parts don't fit.
+  pub def to_s -> Str {
+    nm = network_number_and_mask(self) || return "<nil>"
+    nn, m = nm
+    l = simple_mask_length(m)
+    return nn.to_s + "/" + m.to_s if l == -1
+    nn.to_s + "/" + "#{l}"
+  }
+
+  pub def string -> Str { to_s }
+}
+
+# The network number and mask of n with matching lengths; none if they
+# can't be matched.
+def network_number_and_mask(n: IPNet) -> (IP, IPMask)? {
+  ip = n.ip.to4 || n.ip
+  return none if ip.b.size != IPV4_LEN && ip.b.size != IPV6_LEN
+  m = n.mask
+  if m.b.size == IPV4_LEN {
+    return none if ip.b.size != IPV4_LEN
+  } elsif m.b.size == IPV6_LEN {
+    m = IPMask.new(b: m.b[12...16]) if ip.b.size == IPV4_LEN
+  } else {
+    return none
+  }
+  (ip, m)
+}
+
+# Parses an IPv4 dotted decimal ("192.0.2.1"), IPv6 ("2001:db8::68") or
+# IPv4-mapped IPv6 ("::ffff:192.0.2.1") address: its 16-byte form, or none.
+pub def parse_ip(s: Str) -> IP? {
+  a = parse_ip16(s) || return none
+  IP.new(b: a)
+}
+
+def parse_ip16(s: Str) -> [Byte]? {
+  r = netip.parse_addr(s)
+  return none if r.err?
+  ip = r.unwrap
+  return none if ip.zone != ""
+  a = ip.as16
+  out: [Byte] = [0; 16]
+  for i in 0...16 {
+    out[i] = a[i]
+  }
+  out
+}
+
+# Parses CIDR notation ("192.0.2.0/24", "2001:db8::/32"): the address and
+# the network it's in (the address masked).
+pub def parse_cidr(s: Str) -> ~(IP, IPNet)<ParseError> {
+  i = -1
+  for k in 0...s.size {
+    if s[k] == 47 {
+      i = k
+      break
+    }
+  }
+  fail parse_error("CIDR address", s) if i < 0
+  addr = s[0...i]
+  mask = s[i + 1...s.size]
+  r = netip.parse_addr(addr)
+  fail parse_error("CIDR address", s) if r.err?
+  ip = r.unwrap
+  fail parse_error("CIDR address", s) if ip.zone != ""
+  n, j, ok = dtoi(mask)
+  fail parse_error("CIDR address", s) if !ok || j != mask.size || n < 0 || n > ip.bit_len
+  m = cidr_mask(n, ip.bit_len) || IPMask.new
+  a = ip.as16
+  out: [Byte] = [0; 16]
+  for k in 0...16 {
+    out[k] = a[k]
+  }
+  addr16 = IP.new(b: out)
+  net_ip = addr16.mask(m) || IP.new
+  (addr16, IPNet.new(ip: net_ip, mask: m))
+}
+
+def copy_ip(x: IP) -> IP { IP.new(b: x.b.dup) }

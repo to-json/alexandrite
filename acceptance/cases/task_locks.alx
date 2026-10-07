@@ -1,0 +1,124 @@
+# A lock a task reaches must live as long as the task (port-issues #202,
+# #237). Each `start_*` makes a Mutex in its own frame, hands a task a copy
+# of something holding it, and returns; the task uses the lock afterwards.
+import "time"
+
+# A copy shares the locks it holds: the closure's `.dup` keeps `m`.
+def start_dup(go: Chan[Bool], out: Chan[Int]) -> Task[Unit] {
+  m = Mutex.new(40)
+  f = ->() -> Int { m.lock { |v| v += 2; v } }
+  g = f.dup
+  spawn {
+    go.recv
+    out << g()
+  }
+}
+
+struct Holder {
+  name: Str
+  mu: Mutex[Int]
+}
+
+# A lock block's value is a copy: `h.mu` is still the inner Mutex.
+def start_lock_copy(go: Chan[Bool], out: Chan[Int]) -> Task[Unit] {
+  outer = Mutex.new(Holder.new(name: "inner", mu: Mutex.new(10)))
+  h = outer.lock { |x| x }
+  spawn {
+    go.recv
+    out << h.mu.lock { |v| v += h.name.size; v }
+  }
+}
+
+# So is an Atomic's load.
+def start_atomic_load(go: Chan[Bool], out: Chan[Int]) -> Task[Unit] {
+  a = Atomic.new(Holder.new(name: "atomic", mu: Mutex.new(20)))
+  h = a.load
+  spawn {
+    go.recv
+    out << h.mu.lock { |v| v += h.name.size; v }
+  }
+}
+
+interface Counter {
+  def bump -> Int
+}
+
+struct LockedCounter {
+  mu: Mutex[Int]
+
+  def bump -> Int { mu.lock { |v| v += 1; v } }
+}
+
+struct PlainCounter {
+  n: Int
+
+  def bump -> Int { n + 1 }
+}
+
+# An interface value's `.dup`, its implementor holding a Mutex.
+def start_iface_dup(go: Chan[Bool], out: Chan[Int]) -> Task[Unit] {
+  c: Counter = LockedCounter.new(mu: Mutex.new(99))
+  d = c.dup
+  spawn {
+    go.recv
+    out << d.bump
+  }
+}
+
+def run(t: Task[Unit], go: Chan[Bool], out: Chan[Int]) {
+  # Whatever reuses the freed frame's memory.
+  junk: [Str] = []
+  (0...2000).each { junk << "junk #{it} ................................" }
+  go << true
+  puts out.recv.unwrap
+  t.wait
+  puts junk.size
+}
+
+go = Chan[Bool].new(1)
+out = Chan[Int].new(1)
+run(start_dup(go, out), go, out)
+run(start_lock_copy(go, out), go, out)
+run(start_atomic_load(go, out), go, out)
+run(start_iface_dup(go, out), go, out)
+p: Counter = PlainCounter.new(n: 1)
+puts p.bump
+
+# A call with a frame of its own: when it returns, a task's current region
+# is the program region by name.
+def label(i: Int) -> Str {
+  xs = [i, i + 1]
+  t = "#{xs[0]}"
+  "value " + t + " of the task"
+}
+
+# A call that allocates only for itself (a light frame) and parks. Another
+# task of the same thread allocates meanwhile.
+def nap(i: Int) -> Int {
+  s = "nap #{i}"
+  time.sleep(time.millisecond)
+  s.size
+}
+
+kept = Chan[Mutex[Str]].new(1000)
+bad = Atomic.new(0)
+ts = (0...200).map { |i|
+  spawn {
+    want = "value #{i} of the task"
+    name = label(i)
+    m = Mutex.new(label(i))
+    n = nap(i)
+    junk: [Str] = []
+    (0...20).each { junk << "junk #{it} #{n} ................................" }
+    time.sleep(time.millisecond)
+    if name != want {
+      bad.add(1)
+    } else {
+      bad.add(1) if m.lock { |s| s } != want
+    }
+    kept << m
+    junk.size
+  }
+}.to_a
+puts ts.sum { it.wait.unwrap }
+puts bad.load

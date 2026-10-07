@@ -1,0 +1,328 @@
+#![test(external)]
+# Go's io/pipe_test.go, translated (package io_test).
+#
+# Not translated: TestPipeAllocations (testing.AllocsPerRun).
+# TestWriteEmpty / TestWriteNil: a 0-byte write reaches the reader as a
+# 0-byte read, which is the end of input for alx readers; the tests check
+# that nothing blocks.
+
+import "bytes"
+import "io"
+import "time"
+
+test "TestPipe1" {
+  r, w = io.pipe
+  t = spawn {
+    w.write!("hello, world".bytes.to_a).unwrap
+  }
+  buf: [Byte] = [0; 64]
+  rr = r
+  n = rr.read!(buf).unwrap
+  assert_eq Str.from_bytes(buf[0...n]), "hello, world"
+  assert_eq t.wait.unwrap, 12
+  rr.close!.unwrap
+  ww = w
+  ww.close!.unwrap
+}
+
+test "TestPipe2" {
+  r, w = io.pipe
+  c = Chan[Int].new
+  reader = spawn {
+    rr = r
+    buf: [Byte] = [0; 64]
+    loop {
+      n = rr.read!(buf).unwrap
+      c << n
+      break if n == 0
+    }
+  }
+  ww = w
+  buf: [Byte] = [0; 64]
+  i = 0
+  while i < 5 {
+    p = buf[0...(5 + i * 10)]
+    n = ww.write!(p).unwrap
+    assert_eq n, p.size
+    assert_eq c.recv || -1, n
+    i += 1
+  }
+  ww.close!.unwrap
+  assert_eq c.recv || -1, 0
+  reader.wait.unwrap
+}
+
+test "TestPipe3" {
+  r, w = io.pipe
+  wdat: [Byte] = [0; 128]
+  i = 0
+  while i < 128 {
+    wdat[i] = i.as_u8
+    i += 1
+  }
+  writer = spawn {
+    ww = w
+    n = ww.write!(wdat).unwrap
+    ww.close!.unwrap
+    n
+  }
+  rdat: [Byte] = [0; 1024]
+  rr = r
+  tot = 0
+  n = 1
+  while n <= 256 {
+    nn = rr.read!(rdat[tot...(tot + n)]).unwrap
+    expect = n
+    expect = 1 if n == 128
+    expect = 0 if n == 256
+    assert_eq nn, expect
+    tot += nn
+    n *= 2
+  }
+  assert_eq writer.wait.unwrap, 128
+  assert_eq tot, 128
+  i = 0
+  while i < 128 {
+    assert_eq rdat[i], i.as_u8
+    i += 1
+  }
+}
+
+struct PipeCase {
+  async: Bool
+  err: Str # "" for none
+  close_with_error: Bool
+}
+
+def pipe_cases -> [PipeCase] {
+  [
+    PipeCase.new(async: true, err: "", close_with_error: false),
+    PipeCase.new(async: true, err: "", close_with_error: true),
+    PipeCase.new(async: true, err: "short write", close_with_error: true),
+    PipeCase.new(async: false, err: "", close_with_error: false),
+    PipeCase.new(async: false, err: "", close_with_error: true),
+    PipeCase.new(async: false, err: "short write", close_with_error: true),
+  ]
+}
+
+def close_writer(w: io.PipeWriter, tt: PipeCase) {
+  time.sleep(time.millisecond)
+  ww = w
+  if tt.close_with_error && tt.err != "" {
+    ww.close_with_error!(io.StreamError.ShortWrite).unwrap
+  } else {
+    ww.close!.unwrap
+  }
+}
+
+def close_reader(r: io.PipeReader, tt: PipeCase) {
+  time.sleep(time.millisecond)
+  rr = r
+  if tt.close_with_error && tt.err != "" {
+    rr.close_with_error!(io.StreamError.ShortWrite).unwrap
+  } else {
+    rr.close!.unwrap
+  }
+}
+
+test "TestPipeReadClose" {
+  for tt in pipe_cases {
+    r, w = io.pipe
+    t = spawn { 0 }
+    if tt.async {
+      t = spawn {
+        close_writer(w, tt)
+        0
+      }
+    } else {
+      close_writer(w, tt)
+    }
+    buf: [Byte] = [0; 64]
+    rr = r
+    res = rr.read!(buf)
+    t.wait.unwrap
+    if tt.err == "" {
+      assert_eq res.unwrap, 0
+    } else {
+      assert_eq res.err.unwrap.message, tt.err
+    }
+    rr.close!.unwrap
+  }
+}
+
+test "TestPipeReadClose2" {
+  r, _w = io.pipe
+  t = spawn {
+    close_reader(r, PipeCase.new())
+  }
+  buf: [Byte] = [0; 64]
+  rr = r
+  res = rr.read!(buf)
+  t.wait.unwrap
+  assert_eq res.err.unwrap.message, "io: read/write on closed pipe"
+}
+
+test "TestPipeWriteClose" {
+  for tt in pipe_cases {
+    r, w = io.pipe
+    t = spawn { 0 }
+    if tt.async {
+      t = spawn {
+        close_reader(r, tt)
+        0
+      }
+    } else {
+      close_reader(r, tt)
+    }
+    res = io.write_string(w, "hello, world")
+    t.wait.unwrap
+    want = tt.err == "" ? "io: read/write on closed pipe" : tt.err
+    assert_eq res.err.unwrap.message, want
+    ww = w
+    ww.close!.unwrap
+  }
+}
+
+test "TestPipeWriteClose2" {
+  _r, w = io.pipe
+  t = spawn {
+    close_writer(w, PipeCase.new())
+  }
+  buf: [Byte] = [0; 64]
+  ww = w
+  res = ww.write!(buf)
+  t.wait.unwrap
+  assert_eq res.err.unwrap.message, "io: read/write on closed pipe"
+}
+
+test "TestWriteEmpty" {
+  r, w = io.pipe
+  t = spawn {
+    ww = w
+    e: [Byte] = []
+    ww.write!(e).unwrap
+    ww.close!.unwrap
+  }
+  b: [Byte] = [0; 2]
+  io.read_full(r, b).unwrap
+  t.wait.unwrap
+  rr = r
+  rr.close!.unwrap
+}
+
+test "TestWriteAfterWriterClose" {
+  r, w = io.pipe
+  t = spawn {
+    ww = w
+    ww.write!("hello".bytes.to_a).unwrap
+    ww.close!.unwrap
+    ww.write!("world".bytes.to_a).err.unwrap.message
+  }
+  buf: [Byte] = [0; 100]
+  n = io.read_full(r, buf).unwrap
+  assert_eq Str.from_bytes(buf[0...n]), "hello"
+  assert_eq t.wait.unwrap, "io: read/write on closed pipe"
+  rr = r
+  rr.close!.unwrap
+}
+
+test "TestPipeCloseError" {
+  r, w = io.pipe
+  e: [Byte] = []
+  r.close_with_error!(io.StreamError.ShortWrite).unwrap
+  ww = w
+  assert_eq ww.write!(e).err.unwrap.message, "short write"
+  r.close_with_error!(io.StreamError.ShortBuffer).unwrap
+  assert_eq ww.write!(e).err.unwrap.message, "short write"
+
+  r2, w2 = io.pipe
+  w2.close_with_error!(io.StreamError.ShortWrite).unwrap
+  rr = r2
+  assert_eq rr.read!(e).err.unwrap.message, "short write"
+  w2.close_with_error!(io.StreamError.ShortBuffer).unwrap
+  assert_eq rr.read!(e).err.unwrap.message, "short write"
+}
+
+INPUT = "0123456789abcdef"
+COUNT = 8
+READ_SIZE = 2
+
+test "TestPipeConcurrent Write" {
+  r, w = io.pipe
+  ts: [Task[Int]] = []
+  i = 0
+  while i < COUNT {
+    wc = w
+    ts << spawn {
+      time.sleep(time.millisecond)
+      ww = wc
+      ww.write!(INPUT.bytes.to_a).unwrap
+    }
+    i += 1
+  }
+  buf: [Byte] = [0; COUNT * INPUT.size]
+  rr = r
+  i = 0
+  while i < buf.size {
+    assert_eq rr.read!(buf[i...(i + READ_SIZE)]).unwrap, READ_SIZE
+    i += READ_SIZE
+  }
+  for t in ts {
+    assert_eq t.wait.unwrap, INPUT.size
+  }
+  assert_eq Str.from_bytes(buf), INPUT * COUNT
+}
+
+def sort_groups(b: [Byte], n: Int) -> [Str] {
+  gs: [Str] = []
+  i = 0
+  while i < b.size {
+    gs << Str.from_bytes(b[i...(i + n)])
+    i += n
+  }
+  gs.sort
+}
+
+test "TestPipeConcurrent Read" {
+  r, w = io.pipe
+  c = Chan[[Byte]].new(COUNT * INPUT.size / READ_SIZE)
+  ts: [Task[Int]] = []
+  i = 0
+  while i < COUNT * INPUT.size / READ_SIZE {
+    rc = r
+    ts << spawn {
+      time.sleep(time.millisecond)
+      buf: [Byte] = [0; READ_SIZE]
+      rr = rc
+      n = rr.read!(buf).unwrap
+      c << buf
+      n
+    }
+    i += 1
+  }
+  ww = w
+  i = 0
+  while i < COUNT {
+    assert_eq ww.write!(INPUT.bytes.to_a).unwrap, INPUT.size
+    i += 1
+  }
+  got: [Byte] = []
+  for t in ts {
+    assert_eq t.wait.unwrap, READ_SIZE
+    for b in c.recv || [] { got << b }
+  }
+  assert_eq sort_groups(got, READ_SIZE), sort_groups((INPUT * COUNT).bytes.to_a, READ_SIZE)
+}
+
+test "pipe through copy" {
+  r, w = io.pipe
+  t = spawn {
+    ww = w
+    io.write_string(ww, "some io.Reader stream to be read\n").unwrap
+    ww.close!.unwrap
+  }
+  out = bytes.new_buffer_string("")
+  io.copy(out, r).unwrap
+  t.wait.unwrap
+  assert_eq out.to_s, "some io.Reader stream to be read\n"
+}

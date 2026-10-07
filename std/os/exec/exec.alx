@@ -19,106 +19,147 @@
 # that is what the surrounding program is for. Relative redirect paths are
 # relative to `dir`.
 #
-# A Cmd is a plain value describing what to run; running it doesn't change
-# it, so one Cmd can run any number of times.
-#
-#   run              Go's Run. Output goes nowhere (Go) unless `passthrough`
-#                    (a literal sets it: `make`.~run shows make's output).
-#   output           Go's Output: stdout as a Str (Go: []byte)
-#   combined_output  Go's CombinedOutput: stdout and stderr interleaved
-#   capture          (not in Go) stdout, stderr and the ProcessState, without
-#                    failing on a nonzero exit: for harnesses and tools
-#   exec             replaces this process (Go's syscall.Exec); one stage only
-#   pipe(other)      (not in Go) this command's stdout into other's stdin
+#   Go                                      alx
+#   Command(name, args...)                  command(name, args) (looks name up now; a
+#                                             failure is kept in `err`, Go's Cmd.Err)
+#   CommandContext(ctx, name, args...)      command_context(ctx, name, args)
+#   Cmd.Path / Args / Dir / Env             path (lpath) / args / dir / env ([Str]?)
+#   Cmd.Stdin / Stdout / Stderr             stdin_reader (io.Reader?), stdin (a Str: the
+#                                             text to give), stdout / stderr (io.Writer?);
+#                                             an os.File is handed to the child as is
+#   Cmd.ExtraFiles / WaitDelay / Err        extra_files / wait_delay (ns) / err
+#   Cmd.Cancel                              cancel: ((os.Process) -> ~Unit)?, given the process;
+#                                             command_context's default (kill) is
+#                                             `kill_on_cancel` (Go's `Cancel = nil`: set it false)
+#   Cmd.Process / ProcessState              process -> os.Process? / process_state -> os.ProcessState?
+#   Run / Start / Wait                      run -> ~os.ProcessState / start! / wait!
+#   Output / CombinedOutput                 output -> ~Str / combined_output -> ~Str
+#   StdinPipe / StdoutPipe / StderrPipe     stdin_pipe! / stdout_pipe! / stderr_pipe! -> ~os.File
+#   String / Environ                        string (Go's) / environ; to_s is the sh-quoted line
+#   LookPath(file)                          look_path(file) -> ~Str<ExecError>
+#   Error{Name, Err}                        ExecError.NotFound(name) / Lookup(name, errno) /
+#                                             Dot(name, path); e.name
+#   ErrNotFound / ErrDot / ErrWaitDelay     not_found?(e) / dot?(e) / wait_delay?(e)
+#   ExitError{ProcessState, Stderr}         ExecError.Exit(ExitInfo(cmd, state, stderr));
+#                                             exit_info(e) -> ExitInfo?; info.exit_code
+#   (not in Go)                             capture -> ~Captured (stdout, stderr, state,
+#                                             states; no failure on a nonzero exit),
+#                                             pipe(other) (`a | b`), exec (syscall.Exec),
+#                                             passthrough, check
 #
 # A nonzero exit fails with ExecError.Exit (like `set -e`). With the
-# environment variable ALX_EXEC_NOFAIL=1, run/output/combined_output return
-# normally instead and the status is the caller's to check; `c.check = false`
-# does the same for one command. A pipeline fails if any stage does
-# (`pipefail`), except an earlier stage killed by SIGPIPE (`yes | head`).
+# environment variable ALX_EXEC_NOFAIL=1, run/output/combined_output/wait!
+# return normally instead and the status is the caller's to check;
+# `c.check = false` does the same for one command. A pipeline fails if any
+# stage does (`pipefail`), except an earlier stage killed by SIGPIPE
+# (`yes | head`). `run` sends output nowhere (Go) unless `passthrough` (a
+# literal sets it: `make`.~run shows make's output) or stdout/stderr are set.
 #
-# stdin is the null device, or `c.stdin = "text"` (Go: cmd.Stdin = strings.
-# NewReader("text")). Failures are ExecError: NotFound (no such program),
-# Start (spawn failed: errno), Redirect (a redirect's file can't be opened),
-# Exit (ran and exited nonzero or was killed; Go's ExitError, with the
-# ProcessState and the stderr text).
-#
-# A ProcessState has what Go's has, plus measurements taken by the wait:
-# `exit_code` (-1 if killed), `signal` (0 if not killed), `success`,
+# A ProcessState (os's) has what Go's has, plus measurements taken by the
+# wait: `exit_code` (-1 if killed), `signal` (0 if not killed), `success`,
 # `user_ns` / `sys_ns` (CPU time), `max_rss` (peak resident set, bytes) and
 # `wall_ns` (spawn to exit).
 #
-# `look_path(name)` is Go's LookPath: the file `name` names in $PATH.
+# Differences from Go:
+#  - ExitError's message names the command and adds its stderr text:
+#    "`sh -c 'exit 4'`: exit status 4: bad" (Go: "exit status 4", which
+#    `info.go_message` is); scripts print the error and want to know what
+#    failed. (S10: alx's text where alx deliberately differs.)
+#  - The copying between the program and stdin_reader / stdout / stderr
+#    (when they aren't os.Files) happens in wait!, in the waiting task (Go:
+#    goroutines from Start on): the writer is the caller's, and a task can't
+#    share it unsynchronized (R4). A program that writes more than a pipe
+#    holds waits for wait!; read a *_pipe! instead to consume output before
+#    waiting.
+#  - Cancel gets the process (Go's closures reach cmd.Process; an alx
+#    closure made before Start can't), and Cancel = nil is
+#    `kill_on_cancel = false`.
+#  - Wait's errors: as Go's, but "exec: canceling Cmd: ..." is a plain
+#    ExecError.Usage (no %w unwrapping); the context's own error is
+#    returned as is.
+#  - wait_delay is an Int of nanoseconds (Go: time.Duration).
+#  - `c.timeout = time.Duration` (not in Go; CommandContext with a deadline
+#    in one field): a deadline context of its own over `ctx` (or
+#    context.background). When it passes before the command (every stage)
+#    has exited, the stages are killed (SIGKILL; Cancel instead when set),
+#    reaped, and the wait fails with ExecError.Timeout, whatever `check`
+#    says; its info has the stderr captured so far and the ProcessState
+#    (signal 9). Only the stages are killed, not their children (no process
+#    groups; wait_delay bounds the copying after). Zero (the default) means
+#    no limit.
+#  - SysProcAttr doesn't exist (no syscall package).
+#  - Output's ExitError.Stderr keeps Go's 32 KiB prefix and suffix; capture
+#    keeps everything.
 #
-# `c.timeout = time.Duration` (not in Go; its stand-in for CommandContext
-# with a deadline): when it passes before the command (every stage) has
-# finished, the stages are killed (SIGKILL), reaped, and the run fails with
-# ExecError.Timeout (Go: context.DeadlineExceeded), whatever `check` says. Its
-# info has the stderr read so far and the ProcessState (signal 9). The limit
-# starts at spawn. Only the stages themselves are killed, not their children
-# (no process groups); output is no longer read after the limit. Zero (the
-# default) means no limit.
-#
-# Differences from Go: no Start/Wait split, no pipes to a running process,
-# no Context (use `timeout`), no Process.Kill (there is no handle to a running
-# process; `timeout` is the kill, and os/signal's `kill(pid, sig)` signals a
-# known pid). Waiting blocks the calling thread (a task parks instead).
+# Tests: Go's exec_test.go, exec_posix_test.go, lp_unix_test.go,
+# lp_test.go, dot_test.go, env_test.go (dedupEnv), internal_test.go
+# (prefixSuffixSaver) and example_test.go are translated; Go re-runs its test
+# binary as the helper commands (echo, cat, pipetest, stdinClose, exit,
+# stderrfail, yes, hang, pwd), which are sh scripts and standard tools here.
+# Vectors from Go: vec_exec_test.alx (Cmd.String, exec.Error and ExitError
+# texts). Not translated: TestCredentialNoSetGroups (SysProcAttr),
+# TestSIGCHLD (a helper notifying SIGCHLD in a Go child), the SIGQUIT case of
+# TestWaitInterrupt (a Go goroutine dump), TestExtraFiles' listener and TLS
+# parts (a file stands in), lp_windows/exec_windows/exec_linux tests,
+# benchmarks.
 
+import "context"
+import "io"
 import "os"
 import "path"
 import "strconv"
 import "strings"
 import "time"
 
-extern def alx_sys_spawn(argv: [Byte], argc: Int, env: [Byte], envc: Int, dir: Str, fd0: Int, fd1: Int, fd2: Int) -> Int
+extern def alx_sys_spawn2(path: Str, argv: [Byte], argc: Int, env: [Byte], envc: Int, dir: Str, fds: [Byte], nfds: Int) -> Int
 extern def alx_sys_exec(argv: [Byte], argc: Int, env: [Byte], envc: Int, dir: Str, fd0: Int, fd1: Int, fd2: Int) -> Int
 extern def alx_sys_wait(pid: Int, out: [Byte]) -> Int
 extern def alx_sys_pipe(out: [Byte], nonblock: Int) -> Int
-extern def alx_sys_poll2(a: Int, b: Int) -> Int
-extern def alx_sys_poll2_timeout(a: Int, b: Int, timeout_ns: Int) -> Int
-extern def alx_sys_wait_nohang(pid: Int, out: [Byte]) -> Int
-extern def alx_sleep_ns(ns: Int)
-extern def c_kill(pid: I32, sig: I32) -> I32 = "kill"
+extern def alx_sys_polln(blob: [Byte], n: Int) -> Int
 extern def alx_fd_wait(fd: Int, mode: Int) -> Int
+extern def alx_fd_close(fd: Int) -> Int
 extern def alx_sys_open(p: Str, flags: I32, mode: I32) -> I32
 extern def alx_sys_const(name: Str) -> Int
 extern def alx_mono_ns -> Int
 extern def c_read(fd: I32, buf: [Byte], n: Int) -> Int = "read"
 extern def c_write(fd: I32, buf: [Byte], n: Int) -> Int = "write"
-extern def c_close(fd: I32) -> I32 = "close"
+extern def c_access(p: Str, mode: I32) -> I32 = "access"
 
-# How a finished process ended, and what it used.
-pub struct ProcessState {
-  pid: Int
-  exit_code: Int # -1 if a signal killed it
-  signal: Int    # the signal that killed it, 0 if it exited
-  user_ns: Int   # CPU time in user mode
-  sys_ns: Int    # CPU time in the kernel
-  max_rss: Int   # peak resident set size, bytes
-  wall_ns: Int   # from spawn to exit
-
-  pub def success -> Bool { exit_code == 0 }
-  pub def exited -> Bool { signal == 0 }
-
-  # Go's ProcessState.String: "exit status 1", "signal: killed".
-  pub def to_s -> Str {
-    return "exit status #{exit_code}" if signal == 0
-    "signal: #{signal_name(signal)}"
-  }
-}
-
-# A run that exited nonzero or was killed (Go's ExitError).
+# A run that exited nonzero or was killed (Go's ExitError): the command line
+# (`to_s`), the ProcessState and the stderr text (output: what the command
+# wrote to stderr, when stderr wasn't set; Go's ExitError.Stderr).
 pub struct ExitInfo {
   cmd: Str
-  state: ProcessState
+  state: os.ProcessState
   stderr: Str
+
+  # Go's ExitError.Error(): the ProcessState's text, "exit status 1".
+  pub def go_message -> Str { state.to_s }
+  # Go's ExitError.ExitCode().
+  pub def exit_code -> Int { state.exit_code }
 }
 
 pub error ExecError {
+  # Go's exec.Error{Name, ErrNotFound}.
   NotFound(name: Str)
+  # The spawn failed (Go's "fork/exec name: errno").
   Start(name: Str, code: Int)
+  # A redirect's file can't be opened (command literals).
   Redirect(file: Str, code: Int)
+  # Ran and exited nonzero or was killed (Go's ExitError).
   Exit(info: ExitInfo)
+  # Go's exec.Error{Name, Err} for another reason: an errno (EACCES: not
+  # executable, EISDIR, ENOENT for a path).
+  Lookup(name: Str, code: Int)
+  # Go's exec.Error{Name, ErrDot}: found only relative to "." (at `path`).
+  Dot(name: Str, path: Str)
+  # Go's errors.New("exec: ...") misuse and state errors: "exec: already
+  # started", "exec: not started", "exec: Wait was already called",
+  # "exec: Stdout already set", "exec: no command", "exec: environment
+  # variable contains NUL", ErrWaitDelay, "exec: canceling Cmd: ...".
+  Usage(msg: Str)
+  # `timeout` passed before the command exited: it was killed (not in Go;
+  # Go's is the context's DeadlineExceeded).
   Timeout(info: ExitInfo)
 
   def message -> Str {
@@ -127,10 +168,26 @@ pub error ExecError {
       Start(n, code) => "fork/exec #{n}: #{os.errno_message(code)}"
       Redirect(f, code) => "open #{f}: #{os.errno_message(code)}"
       Exit(info) => exit_message(info)
+      Lookup(n, code) => "exec: #{strconv.quote(n)}: #{os.errno_message(code)}"
+      Dot(n, _p) => "exec: #{strconv.quote(n)}: cannot run executable found relative to current directory"
+      Usage(m) => m
       Timeout(info) => "`#{info.cmd}`: timed out after #{info.state.wall_ns / 1000000}ms, killed"
     }
   }
+
+  # Go's exec.Error.Name (none for the other errors).
+  pub def name -> Str? {
+    case self {
+      NotFound(n) => n
+      Lookup(n, _c) => n
+      Dot(n, _p) => n
+      _ => none
+    }
+  }
 }
+
+# Go's ErrWaitDelay text.
+pub ERR_WAIT_DELAY = "exec: WaitDelay expired before I/O complete"
 
 def exit_message(info: ExitInfo) -> Str {
   m = "`#{info.cmd}`: #{info.state.to_s}"
@@ -139,13 +196,44 @@ def exit_message(info: ExitInfo) -> Str {
   "#{m}: #{err}"
 }
 
+# Go's errors.Is(err, exec.ErrNotFound) / ErrDot / ErrWaitDelay, and
+# errors.As(err, &exitErr).
+pub def not_found?(e: Error) -> Bool {
+  case e {
+    ExecError.NotFound => true
+    _ => false
+  }
+}
+
+pub def dot?(e: Error) -> Bool {
+  case e {
+    ExecError.Dot => true
+    _ => false
+  }
+}
+
+pub def wait_delay?(e: Error) -> Bool {
+  case e {
+    ExecError.Usage(m) => m == ERR_WAIT_DELAY
+    _ => false
+  }
+}
+
+# The ExitInfo of an ExecError.Exit (Go's errors.As(err, &*ExitError)).
+pub def exit_info(e: Error) -> ExitInfo? {
+  case e {
+    ExecError.Exit(info) => info
+    _ => none
+  }
+}
+
 # What `capture` returns: the output and how the process ended (for a
 # pipeline, `state` decides the status and `states` has every stage's).
 pub struct Captured {
   stdout: Str
   stderr: Str
-  state: ProcessState
-  states: [ProcessState]
+  state: os.ProcessState
+  states: [os.ProcessState]
 
   pub def success -> Bool { state.success }
 }
@@ -171,52 +259,346 @@ pub struct Stage {
   redirs: [Redir]
 }
 
+# The state of a started Cmd, shared by its copies (D36).
+struct RunState {
+  pids: [Int]
+  t0s: [Int]
+  procs: [os.Process]
+  # Parent ends closed after wait (the *_pipe! pipes).
+  parent: [os.File]
+  # The copying wait! does, one per pipe: kind P_FEED (stdin_reader into
+  # fd), P_POUR_OUT / P_POUR_ERR (fd into stdout / stderr), P_CAP_OUT /
+  # P_CAP_ERR (fd captured). fd is the parent's (non-blocking) end; -1 once
+  # done.
+  pumps: [Pump]
+  # Written (one byte) by the task waiting for the processes when they
+  # have all exited; the states come down `exited`.
+  notify: Int
+  exited: Chan[[os.ProcessState]]
+  # The context watcher: told when the process ended, answers its error.
+  finished: Chan[Bool]
+  watch: Chan[Error?]
+  watching: Bool
+  # The watcher's context is `timeout`'s own; stop releases its timer.
+  timed: Bool
+  stop: [() -> Unit]
+  states: [os.ProcessState]
+  waited: Bool
+  out: [Byte]
+  errb: [Byte]
+
+  # The bytes captured for kind 1 (stdout) or 2 (stderr).
+  def out_bytes(kind: Int) -> [Byte] { kind == 1 ? out : errb }
+}
+
+P_FEED = 0
+P_POUR_OUT = 1
+P_POUR_ERR = 2
+P_CAP_OUT = 3
+P_CAP_ERR = 4
+
+struct Pump {
+  kind: Int
+  fd: Int
+}
+
 # What to run: one or more stages (`a | b`). `args` of the first stage are
-# Go's cmd.Args (args[0] is the program, looked up in $PATH).
+# Go's cmd.Args (args[0] is the program); `path` is Go's cmd.Path.
 pub struct Cmd {
   stages: [Stage]
-  dir: Str          # "" = this process's directory
-  env: [Str]?       # "KEY=value" entries; none = this process's environment
-  stdin: Str?       # none = the null device
-  passthrough: Bool # run: stdout/stderr to ours instead of the null device
-  check: Bool       # fail on a nonzero exit (default: unless ALX_EXEC_NOFAIL=1)
-  timeout: time.Duration # > 0: kill the command(s) after this long, fail with ExecError.Timeout
+  dir: Str                         # "" = this process's directory
+  env: [Str]?                      # "KEY=value" entries; none = this process's environment
+  stdin: Str?                      # the text to give the program (Go: Stdin = strings.NewReader(s))
+  passthrough: Bool                # run: stdout/stderr to ours instead of the null device
+  check: Bool                      # fail on a nonzero exit (default: unless ALX_EXEC_NOFAIL=1)
+  stdin_reader: io.Reader?         # Go's Stdin (an os.File is passed to the child as is)
+  stdout: io.Writer?               # Go's Stdout
+  stderr: io.Writer?               # Go's Stderr
+  extra_files: [os.File]           # Go's ExtraFiles: the child's 3, 4, ...
+  wait_delay: Int                  # Go's WaitDelay (nanoseconds; 0: none)
+  cancel: ((os.Process) -> ~Unit)? # Go's Cancel, given the process
+  kill_on_cancel: Bool             # Go's default Cancel (command_context): kill it
+  ctx: context.Context?            # Go's ctx (command_context)
+  err: ExecError?                  # Go's Err: a lookup failure from command()
+  lpath: Str                       # Go's Path when it differs from args[0]
+  child_files: [os.File]           # the child's ends of the *_pipe! pipes
+  parent_files: [os.File]          # their parent ends (closed by wait!)
+  st: [RunState]                   # once started
+  started: Bool                    # start was called (even if it failed)
+  timeout: time.Duration           # > 0: kill it after this long, fail with ExecError.Timeout (not in Go)
 
-  # Go's cmd.Path: the first program's name.
-  pub def path -> Str { stages[0].args[0] }
-  # Go's cmd.Args, of the first stage.
-  pub def args -> [Str] { stages[0].args }
+  # Go's cmd.Path: the program's path (looked up in $PATH by command()).
+  pub def path -> Str { lpath.size > 0 || stages.size == 0 || stages[0].args.size == 0 ? lpath : stages[0].args[0] }
+  # Go's cmd.Args, of the first stage ([path] if none, as Go's argv()).
+  pub def args -> [Str] { stages.size == 0 || stages[0].args.size == 0 ? [path] : stages[0].args }
 
-  # Runs to completion (Go's Run). Output is discarded unless `passthrough`.
-  pub def run -> ~ProcessState {
-    c = ~go(passthrough ? 2 : 0)
-    ~checked(c, "")
-    c.state
+  # Go's cmd.Process: the (last stage's) process once started.
+  pub def process -> os.Process? {
+    return none if st.size == 0 || st[0].procs.size == 0
+    st[0].procs[st[0].procs.size - 1]
+  }
+
+  # Go's cmd.ProcessState: how it ended, once waited for.
+  pub def process_state -> os.ProcessState? {
+    return none if st.size == 0 || st[0].states.size == 0
+    deciding(st[0].states)
+  }
+
+  # Runs to completion (Go's Run). Output is discarded unless `passthrough`
+  # or stdout/stderr are set.
+  pub def run -> ~os.ProcessState {
+    c = self
+    ~c.start_with!(0)
+    ~c.wait!
+    ps = c.process_state
+    ps.unwrap
   }
 
   # Its standard output (Go's Output). A nonzero exit is ExecError.Exit with
-  # the stderr text.
+  # the stderr text (when stderr isn't set).
   pub def output -> ~Str {
-    c = ~go(1)
-    ~checked(c, c.stderr)
-    c.stdout
+    fail ExecError.Usage("exec: Stdout already set") if stdout != none
+    c = self
+    ~c.start_with!(1)
+    ~c.wait!
+    Str.from_bytes(c.st[0].out_bytes(1))
   }
 
   # Standard output and error, interleaved as written (Go's CombinedOutput).
   pub def combined_output -> ~Str {
-    c = ~go(3)
-    ~checked(c, c.stdout)
-    c.stdout
+    fail ExecError.Usage("exec: Stdout already set") if stdout != none
+    fail ExecError.Usage("exec: Stderr already set") if stderr != none
+    c = self
+    ~c.start_with!(3)
+    ~c.wait!
+    Str.from_bytes(c.st[0].out_bytes(1))
   }
 
   # Runs it and returns both outputs and the ProcessState; fails only if it
-  # can't be started (a nonzero exit is in `state`).
+  # can't be started (a nonzero exit is in `state`). Not in Go.
   pub def capture -> ~Captured {
-    self.~go(1)
+    c = self
+    c.check = false
+    ~c.start_with!(1)
+    ~c.wait!
+    s = c.st[0]
+    Captured.new(stdout: Str.from_bytes(s.out_bytes(1)), stderr: Str.from_bytes(s.out_bytes(2)), state: deciding(s.states), states: s.states)
+  }
+
+  # Starts it (Go's Start); wait! waits for it.
+  pub def start! -> ~Unit {
+    self.~start_with!(0)
+  }
+
+  # Waits for it to exit and its I/O copying to finish (Go's Wait). The
+  # copying between the program and stdin_reader / stdout / stderr happens
+  # here, in the waiting task: a program writing more than a pipe holds
+  # waits for wait! (Go copies from Start on, in goroutines; an alx task
+  # can't share the writer with the caller unsynchronized).
+  pub def wait! -> ~Unit {
+    fail ExecError.Usage("exec: not started") if st.size == 0
+    s = st[0]
+    fail ExecError.Usage("exec: Wait was already called") if s.waited
+    self.st[0].waited = true
+    copy_err = self.~pump!
+    states = st[0].states
+    for p in s.procs {
+      q = p
+      q.release!.unwrap
+    }
+    state = deciding(states)
+    failure: Error? = none
+    if check && !state.success {
+      failure = ExecError.Exit(ExitInfo.new(cmd: to_s, state: state, stderr: Str.from_bytes(prefix_suffix(st[0].errb, 32 << 10))))
+    }
+    if s.watching {
+      s.finished.close
+      w = s.watch.recv
+      for f in s.stop { f.call }
+      werr: Error? = none
+      if e = w {
+        werr = e
+      }
+      if e = werr {
+        parent_live = true
+        if c = ctx {
+          parent_live = c.err == none
+        }
+        if s.timed && parent_live {
+          failure = ExecError.Timeout(ExitInfo.new(cmd: to_s, state: state, stderr: Str.from_bytes(st[0].errb)))
+        } elsif failure == none {
+          failure = e
+        }
+      }
+    }
+    if failure == none {
+      if ce = copy_err {
+        failure = ce
+      }
+    }
+    close_files(s.parent)
+    if e = failure {
+      fail e
+    }
+  }
+
+  # Copies between the pipes and the readers / writers until every pipe is
+  # done and the processes have exited (WaitDelay bounds the copying once
+  # they have). The first copy error.
+  def pump! -> ~ExecError? {
+    s = st[0]
+    pumps = s.pumps
+    first: ExecError? = none
+    exited = false
+    timer = -1 # read end of the WaitDelay timer's pipe
+    pending: [Byte] = []
+    feed_eof = false
+    buf: [Byte] = [0; 65536]
+    eagain = alx_sys_const("EAGAIN")
+    loop {
+      open = pumps.any? { |p| p.fd >= 0 }
+      break if exited && !open
+      blob: [Byte] = []
+      n = 0
+      for p in pumps {
+        next if p.fd < 0
+        blob = put_pair(blob, p.fd, p.kind == P_FEED ? 2 : 1)
+        n += 1
+      }
+      if !exited {
+        blob = put_pair(blob, s.notify, 1)
+        n += 1
+      }
+      if timer >= 0 {
+        blob = put_pair(blob, timer, 1)
+        n += 1
+      }
+      # A feed with bytes waiting to be read from its reader doesn't wait.
+      feeding = pumps.any? { |p| p.kind == P_FEED && p.fd >= 0 } && pending.size == 0 && !feed_eof
+      alx_sys_polln(blob, n) if !feeding
+      # The processes.
+      if !exited && ready_now(s.notify) {
+        exited = true
+        self.st[0].states = s.exited.recv.unwrap
+        alx_fd_close(s.notify)
+        if wait_delay > 0 && pumps.any? { |p| p.fd >= 0 } {
+          timer = delay_pipe(wait_delay)
+        }
+      }
+      # WaitDelay expired: Go closes the pipes and returns ErrWaitDelay.
+      if timer >= 0 && ready_now(timer) {
+        for i in 0...pumps.size {
+          if pumps[i].fd >= 0 {
+            alx_fd_close(pumps[i].fd)
+            pumps[i].fd = -1
+          }
+        }
+        alx_fd_close(timer)
+        timer = -1
+        first = ExecError.Usage(ERR_WAIT_DELAY) if first == none
+        next
+      }
+      for i in 0...pumps.size {
+        p = pumps[i]
+        next if p.fd < 0
+        if p.kind == P_FEED {
+          if pending.size == 0 && !feed_eof {
+            if r = stdin_reader {
+              rd = r
+              got = rd.read!(buf)
+              if e = got.err {
+                first = ExecError.Usage(e.message) if first == none
+                feed_eof = true
+              } elsif got.unwrap == 0 {
+                feed_eof = true
+              } else {
+                pending = buf[0...got.unwrap].dup
+              }
+            }
+          }
+          if pending.size > 0 {
+            w = c_write(p.fd.to_i32, pending, pending.size)
+            if w > 0 {
+              pending = pending[w...pending.size]
+            } elsif w < 0 && C.errno != eagain {
+              # The program stopped reading (EPIPE): no error, as in Go.
+              alx_fd_close(p.fd)
+              pumps[i].fd = -1
+              pending = []
+            }
+          } elsif feed_eof {
+            alx_fd_close(p.fd)
+            pumps[i].fd = -1
+          }
+          next
+        }
+        r = c_read(p.fd.to_i32, buf, buf.size)
+        if r > 0 {
+          chunk = buf[0...r]
+          if p.kind == P_CAP_OUT {
+            for x in chunk { self.st[0].out << x }
+          } elsif p.kind == P_CAP_ERR {
+            for x in chunk { self.st[0].errb << x }
+          } else {
+            wr = p.kind == P_POUR_OUT ? stdout : stderr
+            if w = wr {
+              dst = w
+              res = dst.write!(chunk.dup)
+              if e = res.err {
+                # Go's copier stops, closing its end (the writer gets EPIPE).
+                first = ExecError.Usage(e.message) if first == none
+                alx_fd_close(p.fd)
+                pumps[i].fd = -1
+              }
+            }
+          }
+        } elsif r == 0 || C.errno != eagain {
+          alx_fd_close(p.fd)
+          pumps[i].fd = -1
+        }
+      }
+    }
+    alx_fd_close(timer) if timer >= 0
+    first
+  }
+
+  # Go's StdinPipe: the write end of a pipe that will be the program's
+  # stdin; close it to send end of file.
+  pub def stdin_pipe! -> ~os.File {
+    fail ExecError.Usage("exec: Stdin already set") if stdin_reader != none || stdin != none
+    fail ExecError.Usage("exec: StdinPipe after process started") if st.size > 0
+    r, w = ~os.pipe
+    self.stdin_reader = r
+    self.child_files << r
+    self.parent_files << w
+    w
+  }
+
+  # Go's StdoutPipe: the read end of a pipe the program's stdout writes to.
+  # Read it to the end before wait! (wait! closes it).
+  pub def stdout_pipe! -> ~os.File {
+    fail ExecError.Usage("exec: Stdout already set") if stdout != none
+    fail ExecError.Usage("exec: StdoutPipe after process started") if st.size > 0
+    r, w = ~os.pipe
+    self.stdout = w
+    self.child_files << w
+    self.parent_files << r
+    r
+  }
+
+  # Go's StderrPipe.
+  pub def stderr_pipe! -> ~os.File {
+    fail ExecError.Usage("exec: Stderr already set") if stderr != none
+    fail ExecError.Usage("exec: StderrPipe after process started") if st.size > 0
+    r, w = ~os.pipe
+    self.stderr = w
+    self.child_files << w
+    self.parent_files << r
+    r
   }
 
   # This command's stdout feeding `to`'s stdin (`a | b`). The result keeps
-  # this command's dir, env, stdin and flags.
+  # this command's dir, env, stdin and flags. Not in Go.
   pub def pipe(to: Cmd) -> Cmd {
     r = self
     r.stages = stages + to.stages
@@ -227,57 +609,154 @@ pub struct Cmd {
   # env and redirects). Returns only if that fails.
   pub def exec -> ~Unit {
     fail ExecError.Start("exec", alx_sys_const("EINVAL")) if stages.size != 1
-    st = stages[0]
+    st0 = stages[0]
     fd0 = ~stdin_fd
-    fds = ~apply_redirs(st.redirs, [fd0, -1, -1])
-    r = alx_sys_exec(argv_blob(prog_args(st.args)), st.args.size, env_blob, env_count, dir, fds[0], fds[1], fds[2])
-    fail ExecError.NotFound(st.args[0]) if r == -alx_sys_const("ENOENT")
-    fail ExecError.Start(st.args[0], -r)
+    fds = ~apply_redirs(st0.redirs, [fd0, -1, -1])
+    env_v = ~environ_checked
+    r = alx_sys_exec(argv_blob(prog_args(st0.args)), st0.args.size, env_blob(env_v), env_count(env_v), dir, fds[0], fds[1], fds[2])
+    fail ExecError.NotFound(st0.args[0]) if r == -alx_sys_const("ENOENT")
+    fail ExecError.Start(st0.args[0], -r)
   }
 
-  # The command line, for messages: `go build -o app .` (Go's Cmd.String).
+  # The command line, for messages: `go build -o app .`, quoted for sh.
   pub def to_s -> Str {
     parts: [Str] = []
-    for st in stages {
+    for st0 in stages {
       words: [Str] = []
-      for a in st.args { words << show_word(a) }
-      for r in st.redirs { words << show_redir(r) }
+      for a in st0.args { words << show_word(a) }
+      for r in st0.redirs { words << show_redir(r) }
       parts << words.join(" ")
     }
     parts.join(" | ")
   }
 
-  def checked(c: Captured, err: Str) -> ~Unit {
-    fail ExecError.Exit(ExitInfo.new(cmd: to_s, state: c.state, stderr: err)) if check && !c.state.success
+  # Go's Cmd.String: the path (resolved) and the arguments, space-separated
+  # (args as given when the lookup failed).
+  pub def string -> Str {
+    a = args
+    return a.join(" ") if err != none
+    ([path] + a[1...a.size]).join(" ")
   }
 
-  # Runs every stage. mode: 0 stdout/stderr discarded, 1 both captured,
-  # 2 both ours, 3 captured together.
-  def go(mode: Int) -> ~Captured {
-    n = stages.size
-    # The capture pipes (read ends non-blocking, for the drain loop).
-    cap_out = (-1, -1)
-    cap_err = (-1, -1)
-    if mode == 1 || mode == 3 {
-      cap_out = ~os_pipe(true)
-      cap_err = mode == 1 ? ~os_pipe(true) : cap_out
+  # Go's Cmd.Environ: the environment the command would run with (env, or
+  # ours plus PWD=dir; duplicates dropped, the last one kept).
+  pub def environ -> [Str] {
+    r = environ_of
+    r[0]
+  }
+
+  def environ_checked -> ~[Str]? {
+    if e = env {
+      r = dedup_env(e)
+      fail ExecError.Usage(r[1]) if r[1] != ""
+      return r[0]
     }
-    sink = mode == 0 ? ~open_null(1) : -1
-    out_fd = mode == 0 ? sink : (mode == 2 ? -1 : cap_out[1])
-    err_fd = mode == 0 ? sink : (mode == 2 ? -1 : cap_err[1])
-    pids: [Int] = []
-    t0s: [Int] = []
-    first_in = ~stdin_fd
-    prev_read = first_in
-    to_close: [Int] = [first_in]
-    to_close << sink if sink >= 0
+    return none if dir == ""
+    r = environ_of
+    fail ExecError.Usage(r[1]) if r[1] != ""
+    r[0]
+  }
+
+  def environ_of -> ([Str], Str) {
+    e = env || os.environ
+    if env == none && dir != "" {
+      wd = (os.getwd.ok || "")
+      d = strings.has_prefix(dir, "/") ? dir : path.join([wd, dir])
+      e = e + ["PWD=" + path.clean(d)]
+    }
+    dedup_env(e)
+  }
+
+  # Starts every stage. mode: 0 per the fields (Go's Start), 1 stdout and
+  # stderr captured (stderr only if unset), 3 both captured together.
+  def start_with!(mode: Int) -> ~Unit {
+    fail ExecError.Usage("exec: already started") if st.size > 0 || started
+    self.started = true
+    r0 = self.prepare_check
+    if r0.err? {
+      close_files(child_files)
+      close_files(parent_files)
+      ~r0
+    }
+    env_v = r0.unwrap
+    s = RunState.new(exited: Chan[[os.ProcessState]].new(1), finished: Chan[Bool].new(0), watch: Chan[Error?].new(1))
+    to_close: [Int] = []
+    pumps: [Pump] = []
     failure: Error? = none
+    # stdin of the first stage.
+    in_fd = -1
+    if r = stdin_reader {
+      case r {
+        os.File(f) => in_fd = f.fd
+        _ => {
+          p = os_pipe(2)
+          if p.ok? {
+            pr, pw = p.unwrap
+            in_fd = pr
+            to_close << pr
+            pumps << Pump.new(kind: P_FEED, fd: pw)
+          } else {
+            failure = p.err
+          }
+        }
+      }
+    } elsif text = stdin {
+      fd = feeder_fd(text)
+      if fd.ok? {
+        in_fd = fd.unwrap
+        to_close << in_fd
+      } else {
+        failure = fd.err
+      }
+    } else {
+      fd = open_null(0)
+      if fd.ok? {
+        in_fd = fd.unwrap
+        to_close << in_fd
+      } else {
+        failure = fd.err
+      }
+    }
+    # stdout and stderr of the stages.
+    out_fd = -1
+    err_fd = -1
+    if failure == none {
+      o = writer_fd(stdout, mode == 1 || mode == 3, P_POUR_OUT, P_CAP_OUT)
+      if o.ok? {
+        w = o.unwrap
+        out_fd = w[0]
+        to_close << w[0] if w[1]
+        pumps << w[2] if w[2].fd >= 0
+      } else {
+        failure = o.err
+      }
+    }
+    if failure == none {
+      if mode == 3 || (stderr != none && stdout != none && stderr == stdout) {
+        err_fd = out_fd
+      } else {
+        er = writer_fd(stderr, mode == 1 && stderr == none, P_POUR_ERR, P_CAP_ERR)
+        if er.ok? {
+          w = er.unwrap
+          err_fd = w[0]
+          to_close << w[0] if w[1]
+          pumps << w[2] if w[2].fd >= 0
+        } else {
+          failure = er.err
+        }
+      }
+    }
+    # The stages (a Cmd made with only a path runs [path]).
+    stages_v = stages
+    stages_v = [Stage.new(args: args, redirs: [])] if stages.size == 0 || stages[0].args.size == 0
+    n = stages_v.size
+    prev_read = in_fd
     i = 0
-    while i < n {
-      st = stages[i]
+    while i < n && failure == none {
+      st0 = stages_v[i]
       link = (-1, -1)
       if i + 1 < n {
-        r = os_pipe(false)
+        r = os_pipe(0)
         if !r.ok? {
           failure = r.err
           break
@@ -287,106 +766,225 @@ pub struct Cmd {
         to_close << link[1]
       }
       stage_out = i + 1 < n ? link[1] : out_fd
-      fds_r = apply_redirs(st.redirs, [prev_read, stage_out, err_fd])
+      fds_r = apply_redirs(st0.redirs, [prev_read, stage_out, err_fd])
       if !fds_r.ok? {
         failure = fds_r.err
         break
       }
       fds = fds_r.unwrap
       for k in 3...fds.size { to_close << fds[k] }
+      prog = i == 0 ? path : stages_v[i].args[0]
+      # A Path given without lookup runs relative to dir (Go).
+      if !strings.contains(prog, "/") && !(i == 0 && lpath != "") {
+        lp = look_path(prog)
+        if e = lp.err {
+          failure = e
+          break
+        }
+        prog = lp.unwrap
+      }
+      prog = prog_path(prog, i == 0 && lpath != "")
+      all: [Int] = [fds[0], fds[1], fds[2]]
+      for f in extra_files { all << f.fd }
       t0 = alx_mono_ns
-      pid = alx_sys_spawn(argv_blob(prog_args(st.args)), st.args.size, env_blob, env_count, dir, fds[0], fds[1], fds[2])
+      pid = alx_sys_spawn2(prog, argv_blob(st0.args), st0.args.size, env_blob(env_v), env_count(env_v), dir, fd_blob(all), all.size)
       if pid < 0 {
-        failure = pid == -alx_sys_const("ENOENT") ? ExecError.NotFound(st.args[0]) : ExecError.Start(st.args[0], -pid)
+        failure = ExecError.Start(i == 0 ? path : prog, -pid)
         break
       }
-      pids << pid
-      t0s << t0
+      s.pids << pid
+      s.t0s << t0
+      s.procs << os.new_process(pid)
       prev_read = link[0]
       i += 1
     }
-    # The parent keeps only the capture read ends.
-    for fd in to_close { close_fd(fd) if fd >= 0 }
-    close_fd(cap_out[1]) if cap_out[1] >= 0
-    close_fd(cap_err[1]) if mode == 1 && cap_err[1] >= 0
-    deadline = timeout.ns > 0 ? alx_mono_ns + timeout.ns : -1
-    got = drain(cap_out[0], mode == 1 ? cap_err[0] : -1, deadline)
-    timed_out = got[2]
-    kill_all(pids, 0) if timed_out
-    states: [ProcessState] = []
-    j = 0
-    while j < pids.size {
-      if deadline < 0 || timed_out {
-        s = ~wait(pids[j], t0s[j])
-        states << s
-      } else {
-        w = ~wait_until(pids[j], t0s[j], deadline, pids, j)
-        states << w[0]
-        timed_out = true if w[1]
-      }
-      j += 1
-    }
+    # The parent keeps only its ends.
+    for fd in to_close { alx_fd_close(fd) if fd >= 0 }
+    close_files(child_files)
     if f = failure {
+      close_files(parent_files)
+      for p in pumps { alx_fd_close(p.fd) }
+      # Stages already started are waited for.
+      for pid in s.pids {
+        b: [Byte] = [0; 40]
+        alx_sys_wait(pid, b)
+      }
       fail f
     }
-    if timed_out {
-      fail ExecError.Timeout(ExitInfo.new(cmd: to_s, state: deciding(states), stderr: Str.from_bytes(got[1])))
+    s.parent = parent_files
+    s.pumps = pumps
+    # A task waits for the processes and says so on a pipe wait! polls.
+    note = ~os_pipe(1)
+    s.notify = note[0]
+    nw = note[1]
+    pids = s.pids.dup
+    t0s = s.t0s.dup
+    ex = s.exited
+    spawn {
+      states: [os.ProcessState] = []
+      j = 0
+      while j < pids.size {
+        b: [Byte] = [0; 40]
+        alx_sys_wait(pids[j], b)
+        states << state_of(pids[j], b, alx_mono_ns - t0s[j])
+        j += 1
+      }
+      ex << states
+      one: [Byte] = [1]
+      c_write(nw.to_i32, one, 1)
+      alx_fd_close(nw)
     }
-    Captured.new(stdout: Str.from_bytes(got[0]), stderr: Str.from_bytes(got[1]), state: deciding(states), states: states)
+    # `timeout`: a deadline context of its own over ctx; its end kills.
+    wctx = ctx
+    if timeout.ns > 0 {
+      tc, stop = context.with_timeout(ctx || context.background, timeout)
+      wctx = tc
+      s.timed = true
+      s.stop = [stop]
+    }
+    # Go's watchCtx: on cancellation, call Cancel (and kill after WaitDelay).
+    if c = wctx {
+      if c.cancelable? && (cancel != none || kill_on_cancel || wait_delay != 0 || s.timed) {
+        s.watching = true
+        cx = c # a Context is #[shareable]: tasks may hold it
+        cf: ((os.Process) -> ~Unit)? = none
+        if f0 = cancel {
+          cf = f0.dup
+        }
+        kill = kill_on_cancel || s.timed
+        wpids = s.pids.dup
+        fin = s.finished
+        res = s.watch
+        delay = wait_delay
+        spawn {
+          canceled = false
+          select {
+            when _ = fin.recv => canceled = false
+            when _ = cx.done.recv => canceled = true
+          }
+          e: Error? = none
+          if canceled {
+            last = os.new_process(wpids[wpids.size - 1])
+            r: ~Unit = ok_unit
+            interrupted = false
+            if f = cf {
+              r = f.call(last)
+              interrupted = true
+            } elsif kill {
+              r = kill_all(wpids)
+              interrupted = true
+            }
+            if interrupted {
+              if er = r.err {
+                e = ExecError.Usage("exec: canceling Cmd: #{er.message}") if !os.is_process_done(er)
+              } else {
+                e = cx.err.unwrap
+              }
+            }
+            if delay > 0 {
+              killed = false
+              select {
+                when _ = fin.recv => killed = false
+                when _ = time.after(time.nanosecond * delay).recv => killed = true
+              }
+              if killed {
+                _ = kill_all(wpids)
+              }
+            }
+          }
+          res << e
+        }
+      }
+    }
+    self.st = [s]
   }
 
-  # The child's stdin: the null device, or a pipe already holding the text
-  # (written by a task while the child reads, so any size works).
+  # Checks before a start (Go's Start): the lookup error, no command, a
+  # Cancel without a context, a cancelled context, a NUL in the
+  # environment. The environment to run with (none: ours).
+  def prepare_check -> ~[Str]? {
+    if e = err {
+      fail e
+    }
+    fail ExecError.Usage("exec: no command") if path == ""
+    fail ExecError.Usage("exec: command with a non-nil Cancel was not created with CommandContext") if (cancel != none || kill_on_cancel) && ctx == none
+    if c = ctx {
+      if e = c.err {
+        fail e
+      }
+    }
+    ~environ_checked
+  }
+
+  # The child's stdout or stderr descriptor for writer w: (fd, whether the
+  # parent closes it after the start, the pump wait! runs (fd -1: none)).
+  # An os.File is passed as is; another writer gets a pipe poured into it;
+  # `cap` captures; else the null device, or ours with passthrough.
+  def writer_fd(w: io.Writer?, cap: Bool, pour: Int, capk: Int) -> ~(Int, Bool, Pump) {
+    nop = Pump.new(kind: 0, fd: -1)
+    if cap {
+      pr, pw = ~os_pipe(1)
+      return (pw, true, Pump.new(kind: capk, fd: pr))
+    }
+    if wr = w {
+      case wr {
+        os.File(f) => return (f.fd, false, nop)
+        _ => {
+          pr, pw = ~os_pipe(1)
+          return (pw, true, Pump.new(kind: pour, fd: pr))
+        }
+      }
+    }
+    return (-1, false, nop) if passthrough
+    fd = ~open_null(1)
+    (fd, true, nop)
+  }
+
+  # The child's stdin for a `stdin` text: a pipe already holding it,
+  # written by a task while the child reads, so any size works.
+  def feeder_fd(s: Str) -> ~Int {
+    # The write end is non-blocking: see alx_fd_wait below.
+    b: [Byte] = [0; 16]
+    r = alx_sys_pipe(b, 2)
+    fail ExecError.Start("pipe", -r) if r < 0
+    p = (get64(b, 0), get64(b, 1))
+    w = p[1]
+    data = s.bytes.to_a
+    spawn {
+      eagain = alx_sys_const("EAGAIN")
+      off = 0
+      while off < data.size {
+        n = c_write(w.to_i32, data[off...data.size], data.size - off)
+        if n < 0 {
+          break if C.errno != eagain
+          break if alx_fd_wait(w, 2) < 0
+          next
+        }
+        off += n
+      }
+      alx_fd_close(w)
+    }
+    p[0]
+  }
+
   def stdin_fd -> ~Int {
     if s = stdin {
-      # The write end is non-blocking: a task blocked in write(2) would
-      # block its worker, and with it every task pinned there.
-      b: [Byte] = [0; 16]
-      r = alx_sys_pipe(b, 2)
-      fail ExecError.Start("pipe", -r) if r < 0
-      p = (get64(b, 0), get64(b, 1))
-      w = p[1]
-      data = s.bytes.to_a
-      spawn {
-        eagain = alx_sys_const("EAGAIN")
-        off = 0
-        while off < data.size {
-          n = c_write(w.to_i32, data[off...data.size], data.size - off)
-          if n < 0 {
-            break if C.errno != eagain
-            break if alx_fd_wait(w, 2) < 0
-            next
-          }
-          off += n
-        }
-        close_fd(w)
-      }
-      return p[0]
+      return ~feeder_fd(s)
     }
     ~open_null(0)
   }
 
-  # A relative program path with a slash is relative to `dir` (as in Go).
+  # A relative program path with a slash (or any relative Path given as
+  # such) is relative to `dir` (as in Go).
+  def prog_path(p: Str, given: Bool) -> Str {
+    return p if strings.has_prefix(p, "/") || (!given && !strings.contains(p, "/"))
+    return "./" + p if dir == "" && !strings.contains(p, "/")
+    return p if dir == ""
+    path.join([dir, p])
+  }
+
   def prog_args(a: [Str]) -> [Str] {
-    p = a[0]
-    return a if dir == "" || !strings.contains(p, "/") || strings.has_prefix(p, "/")
-    [path.join([dir, p])] + a[1...a.size]
-  }
-
-  def env_count -> Int {
-    if e = env {
-      return e.size
-    }
-    -1
-  }
-
-  def env_blob -> [Byte] {
-    b: [Byte] = []
-    if e = env {
-      b = argv_blob(e)
-    }
-    b << 0
-    b
+    [prog_path(a[0], false)] + a[1...a.size]
   }
 
   # fds [stdin, stdout, stderr] after the redirects, in order; files opened
@@ -398,12 +996,12 @@ pub struct Cmd {
       k = r.kind
       if k == R_ERR_TO_OUT {
         fds[2] = fds[1]
-      } else if k == R_OUT_TO_ERR {
+      } elsif k == R_OUT_TO_ERR {
         fds[1] = fds[2]
       } else {
         fd = open_redir(r)
         if !fd.ok? {
-          for o in opened { close_fd(o) }
+          for o in opened { alx_fd_close(o) }
         }
         f = ~fd
         opened << f
@@ -432,9 +1030,87 @@ pub struct Cmd {
   }
 }
 
-# A Cmd for `name args...` (Go's Command).
+def ok_unit -> ~Unit {}
+
+def kill_all(pids: [Int]) -> ~Unit {
+  first: Error? = none
+  for pid in pids {
+    r = os.new_process(pid).kill
+    first = r.err if first == none && r.err?
+  }
+  if e = first {
+    fail e
+  }
+}
+
+def close_files(fs: [os.File]) {
+  for f in fs {
+    g = f
+    _ = g.close!
+  }
+}
+
+# b with (fd, mode) appended as two native-endian int64s.
+def put_pair(b: [Byte], fd: Int, mode: Int) -> [Byte] {
+  out = b
+  for v in [fd, mode] {
+    k = 0
+    while k < 8 {
+      out << ((v >> (8 * k)) & 255).as_u8
+      k += 1
+    }
+  }
+  out
+}
+
+# Whether the non-blocking notification pipe fd has its byte (or its end).
+def ready_now(fd: Int) -> Bool {
+  one: [Byte] = [0]
+  n = c_read(fd.to_i32, one, 1)
+  n >= 0
+}
+
+# A pipe whose read end gets a byte after `delay` nanoseconds (a timer
+# wait! can poll). Its read end (non-blocking).
+def delay_pipe(delay: Int) -> Int {
+  b: [Byte] = [0; 16]
+  alx_sys_pipe(b, 1)
+  r = get64(b, 0)
+  w = get64(b, 1)
+  spawn {
+    time.sleep(time.nanosecond * delay)
+    one: [Byte] = [1]
+    c_write(w.to_i32, one, 1)
+    alx_fd_close(w)
+  }
+  r
+}
+
+# A Cmd for `name args...` (Go's Command): a name without a slash is looked
+# up in $PATH now; a failure is kept in `err` and returned by run/start!.
 pub def command(name: Str, args: [Str]) -> Cmd {
-  Cmd.new(stages: [Stage.new(args: [name] + args, redirs: [])], dir: "", env: none, stdin: none, passthrough: false, check: default_check, timeout: time.Duration.new(0))
+  c = Cmd.new(stages: [Stage.new(args: [name] + args, redirs: [])], dir: "", env: none, stdin: none, passthrough: false, check: default_check)
+  if !strings.contains(name, "/") && name != "" {
+    lp = look_path(name)
+    if e = lp.err {
+      c.err = e
+      if p = lookup_path(name) {
+        c.lpath = p
+      }
+    } else {
+      c.lpath = lp.unwrap
+    }
+  }
+  c
+}
+
+# Go's CommandContext: command(name, args) whose process is killed (Go's
+# default Cancel) when ctx is done before it exits.
+pub def command_context(ctx: context.Context, name: Str, args: [Str]) -> Cmd {
+  c = command(name, args)
+  c.ctx = ctx
+  c.kill_on_cancel = true
+  c
 }
 
 # The Cmd a command literal builds, from the parser's split: one group per
@@ -449,11 +1125,11 @@ pub def from_literal(groups: [[Str]], kinds: [Int]) -> Cmd {
     k = kinds[i]
     if k == 0 || k == 10 {
       for w in groups[i] { args << w }
-    } else if k == 1 {
+    } elsif k == 1 {
       stages << Stage.new(args: args, redirs: redirs)
       args = []
       redirs = []
-    } else if k - 2 == R_ERR_TO_OUT || k - 2 == R_OUT_TO_ERR {
+    } elsif k - 2 == R_ERR_TO_OUT || k - 2 == R_OUT_TO_ERR {
       redirs << Redir.new(kind: k - 2, file: "")
     } else {
       redirs << Redir.new(kind: k - 2, file: groups[i + 1][0])
@@ -462,38 +1138,149 @@ pub def from_literal(groups: [[Str]], kinds: [Int]) -> Cmd {
     i += 1
   }
   stages << Stage.new(args: args, redirs: redirs)
-  Cmd.new(stages: stages, dir: "", env: none, stdin: none, passthrough: true, check: default_check, timeout: time.Duration.new(0))
+  c = Cmd.new(stages: stages, dir: "", env: none, stdin: none, passthrough: true, check: default_check)
+  name = stages[0].args.size > 0 ? stages[0].args[0] : ""
+  if name != "" && !strings.contains(name, "/") {
+    lp = look_path(name)
+    if e = lp.err {
+      c.err = e
+    } else {
+      c.lpath = lp.unwrap
+    }
+  }
+  c
 }
 
 def default_check -> Bool { (os.getenv("ALX_EXEC_NOFAIL") || "") != "1" }
 
-# The path of the executable `name` would run: itself if it has a slash,
-# else the first match in $PATH (Go's LookPath).
-pub def look_path(name: Str) -> ~Str {
+# The path of the executable `name` would run (Go's LookPath): itself if it
+# has a slash, else the first match in $PATH. A match relative to the
+# current directory (a "." or relative $PATH entry) fails with Dot (Go's
+# ErrDot; the path is returned by lookup_path).
+pub def look_path(name: Str) -> ~Str<ExecError> {
+  fail ExecError.NotFound(name) if name == "" || name == "." || name == ".."
   if strings.contains(name, "/") {
-    return name if executable(name)
-    fail ExecError.NotFound(name)
+    code = find_executable(name)
+    return name if code == 0
+    fail ExecError.Lookup(name, code)
   }
-  dirs = (os.getenv("PATH") || "").split(":")
-  for d in dirs {
-    p = path.join([d == "" ? "." : d, name])
-    return p if executable(p)
+  if p = lookup_path(name) {
+    fail ExecError.Dot(name, p) if !strings.has_prefix(p, "/") && !strings.contains(os.getenv("GODEBUG") || "", "execerrdot=0")
+    return p
   }
   fail ExecError.NotFound(name)
 }
 
-def executable(p: Str) -> Bool {
+# The first $PATH match for name, relative or not.
+def lookup_path(name: Str) -> Str? {
+  pv = os.getenv("PATH") || ""
+  # Go's filepath.SplitList: an empty $PATH has no entries.
+  dirs: [Str] = pv == "" ? [] : pv.split(":")
+  for d in dirs {
+    p = path.join([d == "" ? "." : d, name])
+    return p if find_executable(p) == 0
+  }
+  none
+}
+
+# Go's findExecutable: 0, or the errno why the file isn't one.
+def find_executable(p: Str) -> Int {
   r = os.stat(p)
-  if !r.ok? {
-    return false
+  if e = r.err {
+    return e.errno
   }
   info = r.unwrap
-  info.is_regular && (info.mode & 0o111) != 0
+  return alx_sys_const("EISDIR") if info.is_dir
+  return 0 if c_access(p, 1) == 0
+  return C.errno if (info.mode & 0o111) == 0
+  0
+}
+
+# Go's dedupEnv: later entries win, order kept; an entry with NUL is dropped
+# (and reported). (The environment, the error text or "".)
+pub def dedup_env(env: [Str]) -> ([Str], Str) {
+  dedup_env_case(false, false, env)
+}
+
+# Go's dedupEnvCase: keys compared without case if no_case; NUL allowed if
+# nul_ok.
+def dedup_env_case(no_case: Bool, nul_ok: Bool, env: [Str]) -> ([Str], Str) {
+  err = ""
+  out: [Str] = []
+  saw: Map[Str, Bool] = {}
+  n = env.size
+  while n > 0 {
+    kv = env[n - 1]
+    n -= 1
+    if !nul_ok && kv.bytes.any? { |b| b == 0 } {
+      err = "exec: environment variable contains NUL"
+      next
+    }
+    i = strings.index(kv, "=")
+    i = strings.index(kv[1...kv.size], "=") + 1 if i == 0
+    if i < 0 {
+      out << kv if kv != ""
+      next
+    }
+    k = kv[0...i]
+    k = strings.to_lower(k) if no_case
+    next if saw.key?(k)
+    saw[k] = true
+    out << kv
+  }
+  (out.reverse, err)
+}
+
+# Go's prefixSuffixSaver over the bytes b: the first and last n bytes, with
+# "... omitting N bytes ..." between when there were more.
+def prefix_suffix(b: [Byte], n: Int) -> [Byte] {
+  return b if b.size <= 2 * n
+  out = b[0...n].dup
+  for x in "\n... omitting #{b.size - 2 * n} bytes ...\n".bytes { out << x }
+  for x in b[b.size - n...b.size] { out << x }
+  out
+}
+
+def env_count(e: [Str]?) -> Int {
+  if v = e {
+    return v.size
+  }
+  -1
+}
+
+def env_blob(e: [Str]?) -> [Byte] {
+  b: [Byte] = []
+  if v = e {
+    b = argv_blob(v)
+  }
+  b << 0
+  b
+}
+
+def fd_blob(fds: [Int]) -> [Byte] {
+  b: [Byte] = [0; 8 * fds.size]
+  i = 0
+  while i < fds.size {
+    v = fds[i]
+    k = 0
+    while k < 8 {
+      b[i * 8 + k] = ((v >> (8 * k)) & 255).as_u8
+      k += 1
+    }
+    i += 1
+  }
+  b
+}
+
+def state_of(pid: Int, b: [Byte], wall: Int) -> os.ProcessState {
+  killed = get64(b, 0) == 1
+  code = get64(b, 1)
+  os.ProcessState.new(pid: pid, exit_code: killed ? -1 : code, signal: killed ? code : 0, user_ns: get64(b, 2), sys_ns: get64(b, 3), max_rss: get64(b, 4), wall_ns: wall)
 }
 
 # The state deciding a pipeline's status: the last stage's, unless an earlier
 # one failed (not by SIGPIPE).
-def deciding(states: [ProcessState]) -> ProcessState {
+def deciding(states: [os.ProcessState]) -> os.ProcessState {
   i = 0
   while i + 1 < states.size {
     s = states[i]
@@ -501,57 +1288,6 @@ def deciding(states: [ProcessState]) -> ProcessState {
     i += 1
   }
   states[states.size - 1]
-}
-
-# Reads a and b (-1: none) to end of file: (a's bytes, b's bytes).
-# With deadline >= 0 (alx_mono_ns), gives up then: the third value is true
-# and the descriptors are closed.
-def drain(a0: Int, b0: Int, deadline: Int) -> ([Byte], [Byte], Bool) {
-  out: [Byte] = []
-  err: [Byte] = []
-  a = a0
-  b = b0
-  buf: [Byte] = [0; 65536]
-  eagain = alx_sys_const("EAGAIN")
-  while a >= 0 || b >= 0 {
-    if deadline >= 0 && alx_mono_ns >= deadline {
-      close_fd(a) if a >= 0
-      close_fd(b) if b >= 0
-      return (out, err, true)
-    }
-    progress = false
-    if a >= 0 {
-      n = c_read(a.to_i32, buf, buf.size)
-      if n > 0 {
-        for x in buf[0...n] { out << x }
-        progress = true
-      } else if n == 0 || C.errno != eagain {
-        close_fd(a)
-        a = -1
-        progress = true
-      }
-    }
-    if b >= 0 {
-      n = c_read(b.to_i32, buf, buf.size)
-      if n > 0 {
-        for x in buf[0...n] { err << x }
-        progress = true
-      } else if n == 0 || C.errno != eagain {
-        close_fd(b)
-        b = -1
-        progress = true
-      }
-    }
-    if !progress {
-      if deadline < 0 {
-        alx_sys_poll2(a, b)
-      } else {
-        left = deadline - alx_mono_ns
-        alx_sys_poll2_timeout(a, b, left > 0 ? left : 0)
-      }
-    }
-  }
-  (out, err, false)
 }
 
 def argv_blob(xs: [Str]) -> [Byte] {
@@ -588,86 +1324,19 @@ def show_redir(r: Redir) -> Str {
   }
 }
 
-def signal_name(s: Int) -> Str {
-  return "bus error" if s == alx_sys_const("SIGBUS")
-  return "broken pipe" if s == alx_sys_const("SIGPIPE")
-  case s {
-    1 => "hangup"
-    2 => "interrupt"
-    3 => "quit"
-    4 => "illegal instruction"
-    6 => "abort trap"
-    9 => "killed"
-    11 => "segmentation fault"
-    15 => "terminated"
-    _ => "signal #{s}"
-  }
-}
-
-def close_fd(fd: Int) {
-  c_close(fd.to_i32)
-}
-
-# Two pipe ends: (read, write).
-def os_pipe(nonblock: Bool) -> ~(Int, Int) {
+# Two pipe ends: (read, write); nonblock: bit 0 the read end, bit 1 the
+# write end.
+def os_pipe(nonblock: Int) -> ~(Int, Int)<ExecError> {
   b: [Byte] = [0; 16]
-  r = alx_sys_pipe(b, nonblock ? 1 : 0)
+  r = alx_sys_pipe(b, nonblock)
   fail ExecError.Start("pipe", -r) if r < 0
   (get64(b, 0), get64(b, 1))
 }
 
-def open_null(mode: Int) -> ~Int {
+def open_null(mode: Int) -> ~Int<ExecError> {
   fd = alx_sys_open("/dev/null", (mode | alx_sys_const("O_CLOEXEC")).to_i32, 0)
   fail ExecError.Start("/dev/null", C.errno) if fd < 0
   fd.to_i
-}
-
-def wait(pid: Int, t0: Int) -> ~ProcessState {
-  b: [Byte] = [0; 40]
-  r = alx_sys_wait(pid, b)
-  fail ExecError.Start("wait", -r) if r < 0
-  state_of(pid, t0, b)
-}
-
-# SIGKILL to pids[from...]: the ones not yet waited for.
-def kill_all(pids: [Int], from: Int) {
-  sigkill = alx_sys_const("SIGKILL")
-  i = from
-  while i < pids.size {
-    c_kill(pids[i].to_i32, sigkill.to_i32)
-    i += 1
-  }
-}
-
-# Waits for pid until the deadline (alx_mono_ns); then kills pids[k...] and
-# waits for pid to die. (state, timed out).
-def wait_until(pid: Int, t0: Int, deadline: Int, pids: [Int], k: Int) -> ~(ProcessState, Bool) {
-  b: [Byte] = [0; 40]
-  step = 500000
-  timed_out = false
-  loop {
-    r = alx_sys_wait_nohang(pid, b)
-    fail ExecError.Start("wait", -r) if r < 0
-    break if r == 1
-    if alx_mono_ns >= deadline {
-      timed_out = true
-      kill_all(pids, k)
-      r2 = alx_sys_wait(pid, b)
-      fail ExecError.Start("wait", -r2) if r2 < 0
-      break
-    }
-    left = deadline - alx_mono_ns
-    alx_sleep_ns(step < left ? step : left)
-    step = step * 2 if step < 10000000
-  }
-  (state_of(pid, t0, b), timed_out)
-}
-
-def state_of(pid: Int, t0: Int, b: [Byte]) -> ProcessState {
-  wall = alx_mono_ns - t0
-  killed = get64(b, 0) == 1
-  code = get64(b, 1)
-  ProcessState.new(pid: pid, exit_code: killed ? -1 : code, signal: killed ? code : 0, user_ns: get64(b, 2), sys_ns: get64(b, 3), max_rss: get64(b, 4), wall_ns: wall)
 }
 
 # The k-th native-endian (little-endian) Int of b.

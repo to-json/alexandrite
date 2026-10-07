@@ -1,0 +1,206 @@
+# Minimal RFC 6724 destination address selection (Go's addrselect.go).
+
+import "net/netip"
+import "slices"
+
+# Sorts addrs by RFC 6724 preference, finding each one's source address.
+def sort_by_rfc6724(addrs: [IPAddr]) {
+  return if addrs.size < 2
+  sort_by_rfc6724_with_srcs(addrs, src_addrs(addrs))
+}
+
+# Go's sortByRFC6724withSrcs: srcs[i] is addrs[i]'s source address (none:
+# unreachable).
+def sort_by_rfc6724_with_srcs(addrs: [IPAddr], srcs: [netip.Addr?]) {
+  panic "internal error" if addrs.size != srcs.size
+  infos: [Rfc6724Info] = []
+  for i in 0...addrs.size {
+    infos << Rfc6724Info.new(addr: addrs[i], addr_attr: ip_attr_of(netip.addr_from_slice(addrs[i].ip.bytes)), src: srcs[i], src_attr: ip_attr_of(srcs[i]))
+  }
+  slices.sort_stable_func(infos, ->(a: Rfc6724Info, b: Rfc6724Info) -> Int { compare_by_rfc6724(a, b) })
+  for i in 0...infos.size {
+    addrs[i] = infos[i].addr
+  }
+}
+
+# Go's srcAddrs: "connects" a UDP socket to each address to see whether it
+# has a route and from which source (no packets are sent).
+def src_addrs(addrs: [IPAddr]) -> [netip.Addr?] {
+  srcs: [netip.Addr?] = []
+  for a in addrs {
+    src: netip.Addr? = none
+    r = dial_udp("udp", none, UDPAddr.new(ip: a.ip, port: 53, zone: a.zone))
+    if r.ok? {
+      c = r.unwrap
+      if la = c.local_net_addr {
+        src = netip.addr_from_slice(addr_ip(la).bytes)
+      }
+      c.close!
+    }
+    srcs << src
+  }
+  srcs
+}
+
+# Go's ipAttr.
+struct IpAttr {
+  scope: Int
+  precedence: Int
+  label: Int
+}
+
+def ip_attr_of(ip0: netip.Addr?) -> IpAttr {
+  ip = ip0 || return IpAttr.new(scope: 0, precedence: 0, label: 0)
+  return IpAttr.new(scope: 0, precedence: 0, label: 0) unless ip.valid?
+  m = classify_policy(ip)
+  IpAttr.new(scope: classify_scope(ip), precedence: m.precedence, label: m.label)
+}
+
+struct Rfc6724Info {
+  addr: IPAddr
+  addr_attr: IpAttr
+  src: netip.Addr?
+  src_attr: IpAttr
+}
+
+def valid_src?(a: netip.Addr?) -> Bool {
+  if x = a {
+    return x.valid?
+  }
+  false
+}
+
+# Go's compareByRFC6724 (RFC 6724 section 6): -1 prefers a, 1 b.
+def compare_by_rfc6724(a: Rfc6724Info, b: Rfc6724Info) -> Int {
+  da = a.addr.ip
+  db = b.addr.ip
+  attr_da = a.addr_attr
+  attr_db = b.addr_attr
+  attr_sda = a.src_attr
+  attr_sdb = b.src_attr
+  # Rule 1: avoid unusable destinations.
+  return 0 if !valid_src?(a.src) && !valid_src?(b.src)
+  return -1 unless valid_src?(b.src)
+  return 1 unless valid_src?(a.src)
+  # Rule 2: prefer matching scope.
+  return -1 if attr_da.scope == attr_sda.scope && attr_db.scope != attr_sdb.scope
+  return 1 if attr_da.scope != attr_sda.scope && attr_db.scope == attr_sdb.scope
+  # Rules 3 and 4 (deprecated and home addresses) aren't implemented (as
+  # in Go).
+  # Rule 5: prefer matching label.
+  return -1 if attr_sda.label == attr_da.label && attr_sdb.label != attr_db.label
+  return 1 if attr_sda.label != attr_da.label && attr_sdb.label == attr_db.label
+  # Rule 6: prefer higher precedence.
+  return -1 if attr_da.precedence > attr_db.precedence
+  return 1 if attr_da.precedence < attr_db.precedence
+  # Rule 7 (native transport) isn't implemented (as in Go).
+  # Rule 8: prefer smaller scope.
+  return -1 if attr_da.scope < attr_db.scope
+  return 1 if attr_da.scope > attr_db.scope
+  # Rule 9: the longest matching prefix, IPv6 only.
+  if !da.to4.present? && !db.to4.present? {
+    ca = common_prefix_len(a.src.unwrap, da)
+    cb = common_prefix_len(b.src.unwrap, db)
+    return -1 if ca > cb
+    return 1 if ca < cb
+  }
+  # Rule 10: leave the order unchanged.
+  0
+}
+
+# Go's policyTableEntry.
+struct PolicyTableEntry {
+  prefix: netip.Prefix
+  precedence: Int
+  label: Int
+}
+
+def policy_entry(b0: Byte, b1: Byte, b10: Byte, b11: Byte, b15: Byte, bits: Int, precedence: Int, label: Int) -> PolicyTableEntry {
+  a: [Byte; 16] = [0; 16]
+  a[0] = b0
+  a[1] = b1
+  a[10] = b10
+  a[11] = b11
+  a[15] = b15
+  PolicyTableEntry.new(prefix: netip.prefix_from(netip.addr_from16(a), bits), precedence: precedence, label: label)
+}
+
+# RFC 6724 section 2.1, by prefix length, longest first.
+def rfc6724_policy_table -> [PolicyTableEntry] {
+  [
+    # ::1/128
+    policy_entry(0, 0, 0, 0, 1, 128, 50, 0),
+    # ::ffff:0:0/96: IPv4-compatible, etc.
+    policy_entry(0, 0, 0xff, 0xff, 0, 96, 35, 4),
+    # ::/96
+    policy_entry(0, 0, 0, 0, 0, 96, 1, 3),
+    # 2001::/32: Teredo
+    policy_entry(0x20, 0x01, 0, 0, 0, 32, 5, 5),
+    # 2002::/16: 6to4
+    policy_entry(0x20, 0x02, 0, 0, 0, 16, 30, 2),
+    # 3ffe::/16
+    policy_entry(0x3f, 0xfe, 0, 0, 0, 16, 1, 12),
+    # fec0::/10
+    policy_entry(0xfe, 0xc0, 0, 0, 0, 10, 1, 11),
+    # fc00::/7
+    policy_entry(0xfc, 0, 0, 0, 0, 7, 3, 13),
+    # ::/0
+    policy_entry(0, 0, 0, 0, 0, 0, 40, 1)
+  ]
+}
+
+# Go's policyTable.Classify: the entry of the longest prefix holding ip.
+def classify_policy(ip0: netip.Addr) -> PolicyTableEntry {
+  ip = ip0.is4? ? netip.addr_from16(ip0.as16) : ip0
+  for ent in rfc6724_policy_table {
+    return ent if ent.prefix.contains?(ip)
+  }
+  PolicyTableEntry.new(prefix: netip.Prefix.new, precedence: 0, label: 0)
+}
+
+# RFC 6724 section 3.1 scopes.
+SCOPE_INTERFACE_LOCAL = 0x1
+SCOPE_LINK_LOCAL = 0x2
+SCOPE_ADMIN_LOCAL = 0x4
+SCOPE_SITE_LOCAL = 0x5
+SCOPE_ORG_LOCAL = 0x8
+SCOPE_GLOBAL = 0xe
+
+# Go's classifyScope.
+def classify_scope(ip: netip.Addr) -> Int {
+  return SCOPE_LINK_LOCAL if ip.loopback? || ip.link_local_unicast?
+  ipv6 = ip.is6? && !ip.is4in6?
+  b = ip.as16
+  return b[1].to_i & 0xf if ipv6 && ip.multicast?
+  # Site-local addresses (RFC 3513 section 2.5.6, deprecated by RFC 3879).
+  return SCOPE_SITE_LOCAL if ipv6 && b[0] == 0xfe && b[1] & 0xc0 == 0xc0
+  SCOPE_GLOBAL
+}
+
+# Go's commonPrefixLen: the bits a and b share, up to a's prefix (64 bits
+# for IPv6); IPv4 addresses compare as IPv4; 0 across versions.
+def common_prefix_len(a: netip.Addr, b0: IP) -> Int {
+  b = (b0.to4 || b0).bytes
+  x = a.as_slice
+  return 0 if x.size != b.size
+  n = x.size > 8 ? 8 : x.size
+  cpl = 0
+  for i in 0...n {
+    if x[i] == b[i] {
+      cpl += 8
+      next
+    }
+    bits = 8
+    ab = x[i].to_i
+    bb = b[i].to_i
+    loop {
+      ab = ab >> 1
+      bb = bb >> 1
+      bits -= 1
+      if ab == bb {
+        return cpl + bits
+      }
+    }
+  }
+  cpl
+}

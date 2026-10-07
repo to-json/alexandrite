@@ -6,8 +6,9 @@
 #     Load / Store / Swap /               load / store(v) / swap(v) /
 #     CompareAndSwap / Add / And / Or     compare_and_swap(old, new) / add(d) / and(m) / or(m)
 #   atomic.Bool                         new_bool(v) -> Boolean: load, store, swap, compare_and_swap
+#   atomic.Uintptr                      new_uintptr(v) -> Uintptr (U64: as Uint64)
 #   atomic.Value                        new_value[T] -> Value[T]: load (T?), store, swap (T?),
-#                                         compare_and_swap(old, new)
+#                                         compare_and_swap(old (T?), new)
 #   atomic.Pointer[T]                   Value[T] (alexandrite has no pointers)
 #   AddInt32(&x, d), LoadInt64(&x), ... the methods above (no pointers to plain ints)
 #
@@ -28,12 +29,22 @@
 #    the state inline, alx's are handles.
 #  - `atomic.Bool` is `Boolean` (the name Bool is the language's type).
 #  - No functions on addresses (AddInt32(&x, d), SwapPointer, ...) and no
-#    Uintptr or Pointer[T]: there are no pointers. Value[T] takes Pointer's
-#    place.
+#    Pointer[T]: there are no pointers. Value[T] takes Pointer's place.
+#    Uintptr is a U64 (pointers are 64-bit on every alx target).
 #  - Value is generic, so Go's panics for storing nil or values of different
 #    types can't happen; `load` returns none before the first store.
 #    `compare_and_swap(old, new)` compares with `==` (Go panics on
-#    incomparable types; alx refuses them at compile time).
+#    incomparable types; alx refuses them at compile time); `old` is a `T?`
+#    so that none plays Go's nil.
+#
+# Tests: atomic_test.go's method tests (the function forms on addresses
+# test the same operations), hammers and memory-order tests, value_test.go
+# and example_test.go, translated; vec_atomic_test.alx holds Go's results of
+# random add/and/or/swap/compare-and-swap sequences for every width. Not
+# translated: TestUnaligned64, TestAutoAligned64 (alignment of 64-bit
+# fields), TestNilDeref (nil pointers), the Pointer and SwapPointer tests,
+# TestValuePanic's nil and inconsistent-type cases (impossible with a typed
+# Value), the benchmarks.
 
 # ---------------------------------------------------------------------- Int64
 
@@ -104,6 +115,42 @@ pub struct Uint64 {
 
 pub def new_uint64(x: U64) -> Uint64 {
   Uint64.new(v: Atomic.new(x.as_i64))
+}
+
+# -------------------------------------------------------------------- Uintptr
+
+# Go's atomic.Uintptr: an unsigned integer as wide as a pointer, U64 on
+# every target alx has (Uint64's twin).
+pub struct Uintptr {
+  v: Atomic[Int]
+
+  pub def load -> U64 { v.load.as_u64 }
+  pub def store(x: U64) { v.store(x.as_i64) }
+  pub def swap(x: U64) -> U64 { v.swap(x.as_i64).as_u64 }
+  pub def compare_and_swap(old: U64, new: U64) -> Bool { v.compare_and_swap(old.as_i64, new.as_i64) }
+  # Adds delta (wrapping); returns the new value. To subtract c, add
+  # `^(c - 1)` as in Go (or `0 -% c`).
+  pub def add(delta: U64) -> U64 { v.add(delta.as_i64).as_u64 }
+
+  pub def and(mask: U64) -> U64 {
+    m = mask.as_i64
+    loop {
+      old = v.load
+      return old.as_u64 if v.compare_and_swap(old, old & m)
+    }
+  }
+
+  pub def or(mask: U64) -> U64 {
+    m = mask.as_i64
+    loop {
+      old = v.load
+      return old.as_u64 if v.compare_and_swap(old, old | m)
+    }
+  }
+}
+
+pub def new_uintptr(x: U64) -> Uintptr {
+  Uintptr.new(v: Atomic.new(x.as_i64))
 }
 
 # ---------------------------------------------------------------------- Int32
@@ -226,12 +273,17 @@ pub struct Value[T] {
   }
 
   # Stores new if the current value is old (`==`); reports whether it did.
-  # Before the first store nothing matches.
-  pub def compare_and_swap(old: T, new: T) -> Bool {
+  # Before the first store only `none` matches (Go's CompareAndSwap(nil,
+  # new) on an empty Value); after it, `none` never does.
+  pub def compare_and_swap(old: T?, new: T) -> Bool {
     st.lock { |v|
       ok = false
       if cur = v {
-        ok = cur == old
+        if o = old {
+          ok = cur == o
+        }
+      } else {
+        ok = old == none
       }
       v = new if ok
       ok

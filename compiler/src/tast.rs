@@ -747,6 +747,9 @@ pub struct TProgram {
     /// Each interface's implementors, in tag order, with the instance of
     /// each of its methods (in declaration order).
     pub ifaces: HashMap<String, Vec<(Ty, Vec<FuncId>)>>,
+    /// `#[shareable]` interfaces: each implementor and where it was first
+    /// converted to it (port-issues #270).
+    pub shareable: HashMap<String, Vec<(Ty, crate::diag::Span)>>,
     /// `to_s` instances of types that are printed (by `Ty::show`), so
     /// printing a slice of them uses each element's `to_s` (Go's Stringer).
     pub stringers: HashMap<String, FuncId>,
@@ -763,6 +766,8 @@ pub struct TProgram {
     /// `M::SetGlobal` at the start of main rather than from a literal.
     pub vars: Vec<usize>,
     /// For each interface whose values are compared with `==`: the
-    /// `__eq` instance of each implementor, in tag order.
+    /// `__eq` instance of each implementor, in tag order. Under "Error"
+    /// (no interface has that name): each error type's, by error index,
+    /// when Error values are compared.
     pub iface_eqs: HashMap<String, Vec<FuncId>>,
 }

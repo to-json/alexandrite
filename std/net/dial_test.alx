@@ -1,0 +1,440 @@
+# Go's dial_test.go, translated. Left out: TestProhibitionaryDialArg,
+# TestDialerFallbackDelay and TestDialCancel (external network: a wildcard
+# listener, unroutable "slow" destinations), TestDialerDualStack (skipped as
+# flaky in Go), TestDialClosedPortFailFast (Windows only),
+# TestDialWithNonZeroDeadline (a user-defined Context type; alx's Context is
+# a struct). TestDialerDualStackFDLeak dials without Go's socket counting
+# (no socktest). The keep-alive and control-context checks read the socket
+# options and count calls instead of Go's test hooks and context values.
+
+import "bufio"
+import "context"
+import "net/netip"
+import "os"
+import "time"
+
+test "DialLocal" {
+  ln = new_local_listener("tcp")
+  _, port = split_host_port(ln.addr).unwrap
+  c = dial("tcp", join_host_port("", port)).unwrap
+  c.close!
+  ln.close!
+}
+
+test "DialerDualStackFDLeak" {
+  if supports_ipv4? && supports_ipv6? {
+    lns = new_dual_stack_listener.unwrap
+    port = lns[0].port
+    servers = (0...2).map { |i|
+      ln = lns[i]
+      spawn {
+        loop {
+          r = ln.accept
+          break if r.err?
+          c = r.unwrap
+          c.close!
+        }
+      }
+    }.to_a
+    dialers = (0...10).map { |_i|
+      spawn {
+        d = Dialer.new(dual_stack: true, timeout: time.second * 5)
+        r = d.dial("tcp", join_host_port("localhost", "#{port}"))
+        if r.ok? {
+          c = r.unwrap
+          c.close!
+        }
+        r.err? ? r.err.unwrap.message : ""
+      }
+    }.to_a
+    for t in dialers {
+      assert_eq t.wait.unwrap, ""
+    }
+    for l in lns {
+      ll = l
+      ll.close!
+    }
+    for t in servers {
+      t.wait
+    }
+  }
+}
+
+SLOW_DST4 = "198.18.0.254"
+SLOW_DST6 = "2001:2::254"
+
+def make_addrs(ips: [Str], port: Str) -> [Addr] {
+  out: [Addr] = []
+  for ip in ips {
+    out << resolve_tcp_addr("tcp", join_host_port(ip, port)).unwrap
+  }
+  out
+}
+
+test "DialParallel" {
+  instant = 0
+  fallback_delay = 200000000
+  copies: [Str] = []
+  for _i in 0...1000 {
+    copies << "::1"
+  }
+  none_s: [Str] = []
+  tests: [([Str], [Str], Str, Bool, Int)] = [
+    (["127.0.0.1"], none_s, "", true, instant),
+    (["::1"], none_s, "", true, instant),
+    (["127.0.0.1", "::1"], [SLOW_DST6], "tcp6", true, instant),
+    (["::1", "127.0.0.1"], [SLOW_DST4], "tcp4", true, instant),
+    ([SLOW_DST4], ["::1"], "", true, fallback_delay),
+    (["127.0.0.1", "::1"], none_s, "tcp4", true, instant),
+    (["::1", "127.0.0.1"], none_s, "tcp6", true, instant),
+    ([SLOW_DST4, SLOW_DST6], ["::1", "127.0.0.1"], "tcp6", true, fallback_delay),
+    (["127.0.0.1"], ["::1"], "tcp4", true, instant),
+    (["::1"], ["127.0.0.1"], "tcp6", true, instant),
+    (["127.0.0.1"], none_s, "tcp4", false, instant),
+    (none_s, none_s, "", false, instant),
+    (copies, none_s, "", true, instant)
+  ]
+  forever = time.minute * 60
+  i = 0
+  for tt in tests {
+    ps, fs, teardown, expect_ok, expect_elapsed = tt
+    TEST_HOOK_DIAL_TCP.store("parallel:" + teardown)
+    primaries = make_addrs(ps, "80")
+    fallbacks = make_addrs(fs, "80")
+    d = Dialer.new(fallback_delay: time.Duration.new(fallback_delay))
+    d.fallback_delay = forever if expect_elapsed == instant
+    sd = SysDialer.new(d: d, network: "tcp", address: "?")
+    start = time.now
+    r = sd.dial_parallel(context.background, primaries, fallbacks)
+    elapsed = time.since(start).ns
+    if expect_ok {
+      assert r.ok?, "##{i}: got #{r.err?}; want nil"
+    } else {
+      assert r.err?, "##{i}: got nil; want non-nil"
+    }
+    assert elapsed >= expect_elapsed && elapsed < forever.ns, "##{i}: got #{elapsed}ns; want >= #{expect_elapsed}ns, < forever"
+    ctx, cancel = context.with_cancel(context.background)
+    canceler = spawn {
+      time.sleep(time.millisecond * 5)
+      cancel.call
+    }
+    sd.dial_parallel(ctx, primaries, fallbacks)
+    canceler.wait
+    i += 1
+  }
+  TEST_HOOK_DIAL_TCP.store("")
+}
+
+test "DialParallelSpuriousConnection" {
+  if supports_ipv4? && supports_ipv6? {
+    lns = new_dual_stack_listener.unwrap
+    port = "#{lns[0].port}"
+    read_deadline = time.now.add(time.second * 5)
+    handlers = (0...2).map { |i|
+      ln = lns[i]
+      dl = read_deadline.unix_nano
+      spawn {
+        r = ln.accept
+        if r.ok? {
+          c = r.unwrap
+          c.set_read_deadline(time.unix(0, dl))
+          b: [Byte] = [0]
+          rr = c.read!(b)
+          c.close!
+          rr.ok? && rr.unwrap == 0 ? "" : "got #{rr.err? ? rr.err.unwrap.message : "data"}; want EOF"
+        } else {
+          r.err.unwrap.message
+        }
+      }
+    }.to_a
+    TEST_HOOK_BARRIER.store(0)
+    TEST_HOOK_DIAL_TCP.store("barrier")
+    d = Dialer.new(fallback_delay: time.millisecond * 100)
+    sd = SysDialer.new(d: d, network: "tcp", address: "?")
+    c = sd.dial_parallel(context.background, make_addrs(["127.0.0.1"], port), make_addrs(["::1"], port)).unwrap
+    c.close!
+    for t in handlers {
+      assert_eq t.wait.unwrap, ""
+    }
+    TEST_HOOK_DIAL_TCP.store("")
+    for l in lns {
+      ll = l
+      ll.close!
+    }
+  }
+}
+
+test "DialerPartialDeadline" {
+  now = time.date(2000, 1, 1, 0, 0, 0, 0, time.utc).unix_nano
+  s = 1000000000
+  tests: [(Int, Int, Int, Int, Bool)] = [
+    (now, now + 12 * s, 1, now + 12 * s, false),
+    (now, now + 12 * s, 2, now + 6 * s, false),
+    (now, now + 12 * s, 3, now + 4 * s, false),
+    (now, now + 12 * s, 999, now + 2 * s, false),
+    (now, now + 1900000000, 999, now + 1900000000, false),
+    (now, 0, 1, 0, false),
+    (now - 1000000, now, 1, now, false),
+    (now, now, 1, 0, true),
+    (now + 1000000, now, 1, 0, true)
+  ]
+  for tt in tests {
+    n, deadline, addrs, expect, timeout = tt
+    got = partial_deadline(n, deadline, addrs)
+    if timeout {
+      assert !got.present?, "want errTimeout"
+    } else {
+      assert_eq got.unwrap, expect
+    }
+  }
+}
+
+test "DialerLocalAddr" {
+  if supports_ipv4? && supports_ipv6? {
+    tests: [(Str, Str, Addr?, Bool)] = [
+      ("tcp4", "127.0.0.1", none, false),
+      ("tcp4", "127.0.0.1", TCPAddr.new, false),
+      ("tcp4", "127.0.0.1", TCPAddr.new(ip: pip("0.0.0.0")), false),
+      ("tcp4", "127.0.0.1", TCPAddr.new(ip: pip("0.0.0.0").to4.unwrap), false),
+      ("tcp4", "127.0.0.1", TCPAddr.new(ip: pip("::")), true),
+      ("tcp4", "127.0.0.1", TCPAddr.new(ip: pip("127.0.0.1").to4.unwrap), false),
+      ("tcp4", "127.0.0.1", TCPAddr.new(ip: pip("127.0.0.1").to16.unwrap), false),
+      ("tcp4", "127.0.0.1", TCPAddr.new(ip: ipv6_loopback), true),
+      ("tcp4", "127.0.0.1", UDPAddr.new, true),
+      ("tcp4", "127.0.0.1", UnixAddr.new, true),
+      ("tcp6", "::1", none, false),
+      ("tcp6", "::1", TCPAddr.new, false),
+      ("tcp6", "::1", TCPAddr.new(ip: pip("0.0.0.0")), false),
+      ("tcp6", "::1", TCPAddr.new(ip: pip("0.0.0.0").to4.unwrap), false),
+      ("tcp6", "::1", TCPAddr.new(ip: pip("::")), false),
+      ("tcp6", "::1", TCPAddr.new(ip: pip("127.0.0.1").to4.unwrap), true),
+      ("tcp6", "::1", TCPAddr.new(ip: pip("127.0.0.1").to16.unwrap), true),
+      ("tcp6", "::1", TCPAddr.new(ip: ipv6_loopback), false),
+      ("tcp6", "::1", UDPAddr.new, true),
+      ("tcp6", "::1", UnixAddr.new, true),
+      ("tcp", "127.0.0.1", none, false),
+      ("tcp", "127.0.0.1", TCPAddr.new, false),
+      ("tcp", "127.0.0.1", TCPAddr.new(ip: pip("0.0.0.0")), false),
+      ("tcp", "127.0.0.1", TCPAddr.new(ip: pip("0.0.0.0").to4.unwrap), false),
+      ("tcp", "127.0.0.1", TCPAddr.new(ip: pip("127.0.0.1").to4.unwrap), false),
+      ("tcp", "127.0.0.1", TCPAddr.new(ip: pip("127.0.0.1").to16.unwrap), false),
+      ("tcp", "127.0.0.1", TCPAddr.new(ip: ipv6_loopback), true),
+      ("tcp", "127.0.0.1", UDPAddr.new, true),
+      ("tcp", "127.0.0.1", UnixAddr.new, true),
+      ("tcp", "::1", none, false),
+      ("tcp", "::1", TCPAddr.new, false),
+      ("tcp", "::1", TCPAddr.new(ip: pip("0.0.0.0")), false),
+      ("tcp", "::1", TCPAddr.new(ip: pip("0.0.0.0").to4.unwrap), false),
+      ("tcp", "::1", TCPAddr.new(ip: pip("::")), false),
+      ("tcp", "::1", TCPAddr.new(ip: pip("127.0.0.1").to4.unwrap), true),
+      ("tcp", "::1", TCPAddr.new(ip: pip("127.0.0.1").to16.unwrap), true),
+      ("tcp", "::1", TCPAddr.new(ip: ipv6_loopback), false),
+      ("tcp", "::1", UDPAddr.new, true),
+      ("tcp", "::1", UnixAddr.new, true),
+      ("tcp", "127.0.0.1", TCPAddr.new(ip: pip("::")), !supports_ipv4map?)
+    ]
+    ln4 = new_local_listener("tcp4")
+    ln6 = new_local_listener("tcp6")
+    servers = [ln4, ln6].map { |ln|
+      spawn {
+        loop {
+          r = ln.accept
+          break if r.err?
+          c = r.unwrap
+          c.close!
+        }
+      }
+    }.to_a
+    a4 = ln4.addr
+    a6 = ln6.addr
+    for tt in tests {
+      network, raddr, laddr, want_err = tt
+      d = Dialer.new(local_addr: laddr)
+      ip = pip(raddr)
+      addr = ip.to4.present? ? a4 : a6
+      r = d.dial(network, addr)
+      assert r.err? == want_err, "#{network} #{addr_s(laddr)}->#{raddr}: got #{r.err? ? r.err.unwrap.message : "ok"}; want error #{want_err}"
+      if e = r.err {
+        if p = parse_dial_error(e) {
+          assert false, p
+        }
+      } else {
+        c = r.unwrap
+        c.close!
+      }
+    }
+    ln4.close!
+    ln6.close!
+    for t in servers {
+      t.wait
+    }
+  }
+}
+
+test "DialerKeepAlive" {
+  ln = new_local_listener("tcp", ListenConfig.new(keep_alive: time.Duration.new(-1)))
+  srv = spawn {
+    loop {
+      r = ln.accept
+      break if r.err?
+      c = r.unwrap
+      c.close!
+    }
+  }
+  tests: [(Int, Int)] = [(-1, -1), (0, 15), (5, 5), (30, 30)]
+  for tt in tests {
+    ka, expected = tt
+    d = Dialer.new(keep_alive: time.second * ka)
+    c = d.dial("tcp", ln.addr).unwrap
+    on = c.nfd.getsockopt("SO_KEEPALIVE").unwrap != 0
+    if expected < 0 {
+      assert !on, "keep_alive #{ka}: keep-alive is on"
+    } else {
+      assert on, "keep_alive #{ka}: keep-alive is off"
+      assert_eq c.nfd.getsockopt("TCP_KEEPIDLE").unwrap, expected
+    }
+    c.close!
+  }
+  ln.close!
+  srv.wait
+}
+
+test "CancelAfterDial" {
+  ln = new_local_listener("tcp")
+  srv = spawn {
+    loop {
+      r = ln.accept
+      break if r.err?
+      c = r.unwrap
+      rb = bufio.new_reader(c)
+      line = rb.read_string!(10).unwrap || ""
+      c.write!(line.bytes.to_a)
+      c.close!
+    }
+  }
+  for _i in 0...10 {
+    cancel = Chan[Bool].new
+    d = Dialer.new(cancel: cancel)
+    r = d.dial("tcp", ln.addr)
+    cancel.close
+    time.sleep(time.millisecond * 10)
+    c = r.unwrap
+    message = "echo!\n"
+    c.write!(message.bytes.to_a).unwrap
+    rb = bufio.new_reader(c)
+    line = rb.read_string!(10).unwrap || ""
+    assert_eq line, message
+    assert !rb.read_byte!.unwrap.present?, "want EOF"
+    c.close!
+  }
+  ln.close!
+  srv.wait
+}
+
+test "DialListenerAddr" {
+  if testable_network?("tcp4") {
+    ln = listen("tcp4", "localhost:0").unwrap
+    _, port = split_host_port(ln.addr).unwrap
+    c = dial("tcp4", "[::]:" + port).unwrap
+    c.close!
+    ln.close!
+  }
+}
+
+test "DialerControl" {
+  for network in ["tcp", "tcp4", "tcp6", "unix", "unixpacket"] {
+    next unless testable_network?(network)
+    ln = new_local_listener(network)
+    d = Dialer.new(control: control_hook)
+    c = d.dial(network, ln.addr).unwrap
+    c.close!
+    ln.close!
+  }
+  for network in ["udp", "udp4", "udp6", "unixgram"] {
+    next unless testable_network?(network)
+    c1 = new_local_packet_listener(network)
+    d = Dialer.new(control: control_hook)
+    c2 = d.dial(network, c1.local_addr).unwrap
+    c2.close!
+    c1.close!
+    os.remove(c1.local_addr) if network == "unixgram"
+  }
+}
+
+# Go's ControlContext tests pass an id through a context value (alx's
+# contexts carry none); here the hook counts its calls and checks it got a
+# live context.
+def counting_control(calls: Atomic[Int]) -> ((context.Context, Str, Str, RawConn) -> ~Unit)? {
+  f = ->(ctx: context.Context, n: Str, a: Str, rc: RawConn) -> ~Unit {
+    fail errors_new("canceled context") if ctx.done?
+    calls.add(1)
+    ~control_on_conn_setup(n, a, rc)
+  }
+  f
+}
+
+test "DialerControlContext" {
+  for network in ["tcp", "tcp4", "tcp6", "unix", "unixpacket"] {
+    next unless testable_network?(network)
+    ln = new_local_listener(network)
+    calls = Atomic.new(0)
+    d = Dialer.new(control_context: counting_control(calls))
+    c = d.dial_context(context.background, network, ln.addr).unwrap
+    assert_eq calls.load, 1
+    c.close!
+    ln.close!
+  }
+}
+
+test "DialContext" {
+  for network in ["tcp", "tcp4", "tcp6", "unix", "unixpacket"] {
+    next unless testable_network?(network)
+    ln = new_local_listener(network)
+    calls = Atomic.new(0)
+    d = Dialer.new(control_context: counting_control(calls))
+    c: Conn? = none
+    if net_kind(network) == 0 {
+      raddr = netip.parse_addr_port(ln.addr).unwrap
+      c = d.dial_tcp(context.background, network, netip.AddrPort.new, raddr).unwrap
+    } else {
+      uaddr = resolve_unix_addr(network, ln.addr).unwrap
+      c = d.dial_unix(context.background, network, none, uaddr).unwrap
+    }
+    assert_eq calls.load, 1
+    cc = c.unwrap
+    cc.close!
+    ln.close!
+  }
+  for network in ["udp", "udp4", "udp6", "unixgram"] {
+    next unless testable_network?(network)
+    c1 = new_local_packet_listener(network)
+    calls = Atomic.new(0)
+    d = Dialer.new(control_context: counting_control(calls))
+    c2: Conn? = none
+    if net_kind(network) == 1 {
+      raddr = netip.parse_addr_port(c1.local_addr).unwrap
+      c2 = d.dial_udp(context.background, network, netip.AddrPort.new, raddr).unwrap
+    } else {
+      uaddr = resolve_unix_addr(network, c1.local_addr).unwrap
+      c2 = d.dial_unix(context.background, network, none, uaddr).unwrap
+    }
+    assert_eq calls.load, 1
+    cc = c2.unwrap
+    cc.close!
+    c1.close!
+    os.remove(c1.local_addr) if network == "unixgram"
+  }
+}
+
+# Dialer and ListenConfig keep the Multipath TCP choice (Go's defaults:
+# off for dialing, on for listening); alx makes plain TCP sockets.
+test "MultipathTCPStatus" {
+  d = Dialer.new
+  assert !d.multipath_tcp
+  d.set_multipath_tcp!(true)
+  assert d.multipath_tcp
+  lc = ListenConfig.new
+  assert lc.multipath_tcp
+  lc.set_multipath_tcp!(false)
+  assert !lc.multipath_tcp
+}

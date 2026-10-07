@@ -1,0 +1,186 @@
+# /etc/nsswitch.conf (Go's nss.go).
+
+import "errors"
+import "os"
+
+NSS_CONFIG_PATH = "/etc/nsswitch.conf"
+
+# Go's nssConf: the state of the machine's nsswitch.conf.
+struct NssConf {
+  # Modification time (Unix ns).
+  mtime: Int
+  # Why the file couldn't be opened or parsed.
+  err: Error?
+  # The sources of each database ("hosts", ...).
+  sources: Map[Str, [NssSource]]
+
+  # Go's errors.Is(nss.err, fs.ErrNotExist).
+  def not_exist? -> Bool {
+    if e = err {
+      return os.is_not_exist(e)
+    }
+    false
+  }
+}
+
+# Go's nssSource: one source ("files", "dns", "mdns4_minimal") and its
+# bracketed criteria.
+struct NssSource {
+  source: Str
+  criteria: [NssCriterion]
+
+  # Whether every criterion is the default action (Go's standardCriteria).
+  def standard_criteria? -> Bool {
+    for i in 0...criteria.size {
+      return false unless criteria[i].standard_status_action?(i == criteria.size - 1)
+    }
+    true
+  }
+}
+
+# Go's nssCriterion: "[!status=action]", lower case.
+struct NssCriterion {
+  negate: Bool
+  status: Str
+  action: Str
+
+  # Whether c is the same as not giving it (Go's standardStatusAction); last
+  # is whether it is the last criterion.
+  def standard_status_action?(last: Bool) -> Bool {
+    return false if negate
+    d = ""
+    if status == "success" {
+      d = "return"
+    } elsif status == "notfound" || status == "unavail" || status == "tryagain" {
+      d = "continue"
+    } else {
+      return false
+    }
+    return true if last && action == "return"
+    action == d
+  }
+}
+
+def nss_conf_error(e: Error) -> NssConf { NssConf.new(mtime: 0, err: e, sources: {}) }
+
+# Go's parseNSSConfFile.
+def parse_nss_conf_file(file: Str) -> NssConf {
+  fr = open_lines(file)
+  if e = fr.err {
+    return nss_conf_error(e)
+  }
+  st = os.stat(file)
+  if e = st.err {
+    return nss_conf_error(e)
+  }
+  conf = parse_nss_conf(fr.unwrap)
+  conf.mtime = st.unwrap.mod_time
+  conf
+}
+
+# Go's parseNSSConf.
+def parse_nss_conf(f: LineFile) -> NssConf {
+  conf = NssConf.new(mtime: 0, sources: {})
+  loop {
+    line0 = f.read_line || break
+    line = trim_space(remove_comment(line0))
+    next if line.size == 0
+    colon = index_byte(line, 58)
+    if colon == -1 {
+      conf.err = errors.new("no colon on line")
+      return conf
+    }
+    db = trim_space(line[0...colon])
+    srcs = line[colon + 1...line.size]
+    loop {
+      srcs = trim_space(srcs)
+      break if srcs.size == 0
+      sp = index_byte(srcs, 32)
+      src = ""
+      if sp == -1 {
+        src = srcs
+        srcs = ""
+      } else {
+        src = srcs[0...sp]
+        srcs = trim_space(srcs[sp + 1...srcs.size])
+      }
+      criteria: [NssCriterion] = []
+      if srcs.size > 0 && srcs[0] == 91 {
+        bclose = index_byte(srcs, 93)
+        if bclose == -1 {
+          conf.err = errors.new("unclosed criterion bracket")
+          return conf
+        }
+        r = parse_criteria(srcs[1...bclose])
+        if r.err? {
+          conf.err = errors.new("invalid criteria: " + srcs[1...bclose])
+          return conf
+        }
+        criteria = r.unwrap
+        srcs = srcs[bclose + 1...srcs.size]
+      }
+      list: [NssSource] = conf.sources[db] || []
+      list << NssSource.new(source: src, criteria: criteria)
+      conf.sources[db] = list
+    }
+  }
+  conf
+}
+
+# Go's parseCriteria: "foo=bar !foo=bar".
+def parse_criteria(x: Str) -> ~[NssCriterion] {
+  c: [NssCriterion] = []
+  for f0 in fields_of(x) {
+    f = f0
+    neg = false
+    if f.size > 0 && f[0] == 33 {
+      neg = true
+      f = f[1...f.size]
+    }
+    fail errors.new("criterion too short") if f.size < 3
+    eq = index_byte(f, 61)
+    fail errors.new("criterion lacks equal sign") if eq == -1
+    f = lower_ascii_str(f)
+    c << NssCriterion.new(negate: neg, status: f[0...eq], action: f[eq + 1...f.size])
+  }
+  c
+}
+
+# The parsed nsswitch.conf and when it was last checked (Go's
+# nsswitchConfig).
+struct NssState {
+  conf: NssConf?
+  # Monotonic ns of the last check.
+  last_checked: Int
+}
+
+NSS_STATE = Mutex[NssState].new(NssState.new(conf: none, last_checked: 0))
+
+# Go's getSystemNSS: the parsed nsswitch.conf, re-read when it changed
+# (checked at most every 5 s).
+def get_system_nss -> NssConf {
+  NSS_STATE.lock { |s|
+    now = alx_mono_ns()
+    if !s.conf.present? {
+      s.conf = parse_nss_conf_file(NSS_CONFIG_PATH)
+      s.last_checked = now
+    } elsif s.last_checked <= now - 5000000000 {
+      s.last_checked = now
+      mtime = 0
+      st = os.stat(NSS_CONFIG_PATH)
+      mtime = st.unwrap.mod_time if st.ok?
+      cur = s.conf.unwrap
+      s.conf = parse_nss_conf_file(NSS_CONFIG_PATH) if mtime != cur.mtime
+    }
+    s.conf.unwrap
+  }
+}
+
+# For tests (Go's setSystemNSS): use conf, checked again after `add_ns`
+# from now.
+def set_system_nss(conf: NssConf, add_ns: Int) {
+  NSS_STATE.lock { |s|
+    s.conf = conf
+    s.last_checked = alx_mono_ns() + add_ns
+  }
+}

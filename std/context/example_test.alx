@@ -1,0 +1,144 @@
+#![test(external)]
+# Go's context/example_test.go. ExampleAfterFunc_connection is not here:
+# alx's net.Conn has no read deadlines to interrupt a read with.
+
+import "context"
+import "errors"
+import "sync"
+import "time"
+
+example "WithCancel" {
+  # gen sends integers until the context is cancelled, so the task ends
+  # instead of leaking.
+  gen = ->(ctx: context.Context) -> Chan[Int] {
+    dst = Chan[Int].new
+    d = ctx.done
+    _ = spawn {
+      n = 1
+      loop {
+        stop = false
+        select {
+          when _ = d.recv => stop = true
+          when dst.send(n) => n += 1
+        }
+        break if stop
+      }
+    }
+    dst
+  }
+  ctx, cancel = context.with_cancel(context.background)
+  defer { cancel() }
+  ch = gen.call(ctx)
+  loop {
+    n = ch.recv || break
+    puts n
+    break if n == 5
+  }
+} outputs "1\n2\n3\n4\n5\n"
+
+example "WithDeadline" {
+  never_ready = Chan[Bool].new
+  d = time.now.add(time.millisecond)
+  ctx, cancel = context.with_deadline(context.background, d)
+  defer { cancel() }
+  done = ctx.done
+  select {
+    when _ = never_ready.recv => puts "ready"
+    when _ = done.recv => puts ctx.err
+  }
+} outputs "context deadline exceeded\n"
+
+example "WithTimeout" {
+  never_ready = Chan[Bool].new
+  ctx, cancel = context.with_timeout(context.background, time.millisecond)
+  defer { cancel() }
+  done = ctx.done
+  select {
+    when _ = never_ready.recv => puts "ready"
+    when _ = done.recv => puts ctx.err
+  }
+} outputs "context deadline exceeded\n"
+
+# Go's `type favContextKey string`.
+struct FavContextKey {
+  name: Str
+
+  pub def to_s -> Str { name }
+}
+
+example "WithValue" {
+  f = ->(ctx: context.Context, k: FavContextKey) {
+    v: Str? = context.value(ctx, k)
+    if x = v {
+      puts "found value: #{x}"
+    } else {
+      puts "key not found: #{k}"
+    }
+  }
+  k = FavContextKey.new(name: "language")
+  ctx = context.with_value(context.background, k, "Go")
+  f.call(ctx, k)
+  f.call(ctx, FavContextKey.new(name: "color"))
+} outputs "found value: Go\nkey not found: color\n"
+
+# Waits on a Cond until the condition holds or the context is done.
+def wait_on_cond(ctx: context.Context, cond: sync.Cond, met: () -> Bool) -> Error? {
+  c = cond
+  stopf = context.after_func(ctx, ->() {
+    l = c.l
+    l.lock
+    c.broadcast
+    l.unlock
+  })
+  defer { _ = stopf() }
+  # The Cond's lock is held by the caller.
+  while !met() {
+    cond.wait
+    if e = ctx.err {
+      return e
+    }
+  }
+  none
+}
+
+example "AfterFunc_cond" {
+  cond = sync.new_cond(sync.new_lock)
+  wg = sync.new_wait_group
+  out = Mutex[[Str]].new([])
+  for _i in 0...4 {
+    c = cond
+    o = out
+    wg.go(->() {
+      ctx, cancel = context.with_timeout(context.background, time.millisecond)
+      l = c.l
+      l.lock
+      e = wait_on_cond(ctx, c, ->() -> Bool { false })
+      l.unlock
+      cancel()
+      msg = "#{e}"
+      o.lock { |xs| xs << msg }
+    })
+  }
+  wg.wait
+  out.lock { |xs| xs.each { |x| puts x } }
+} outputs "context deadline exceeded\ncontext deadline exceeded\ncontext deadline exceeded\ncontext deadline exceeded\n"
+
+example "AfterFunc_merge" {
+  # A context cancelled when either of two contexts is.
+  merge_cancel = ->(ctx: context.Context, cancel_ctx: context.Context) -> (context.Context, () -> Unit) {
+    merged, cancel = context.with_cancel_cause(ctx)
+    stop = context.after_func(cancel_ctx, ->() { cancel(context.cause(cancel_ctx)) })
+    (merged, ->() {
+      _ = stop()
+      cancel(context.ContextError.Canceled)
+    })
+  }
+  ctx1, cancel1 = context.with_cancel_cause(context.background)
+  defer { cancel1(errors.new("ctx1 canceled")) }
+  ctx2, cancel2 = context.with_cancel_cause(context.background)
+  merged_ctx, merged_cancel = merge_cancel.call(ctx1, ctx2)
+  defer { merged_cancel() }
+  cancel2(errors.new("ctx2 canceled"))
+  merged_ctx.done.recv
+  puts context.cause(merged_ctx)
+} outputs "ctx2 canceled\n"

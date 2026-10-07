@@ -1,0 +1,190 @@
+# R11 (port-issues #177): a map local to a looping function keeps its own
+# compacting region when helpers index it by a key argument, when named
+# locals hold what is read from it within one iteration, and when its keys
+# are iterated; and gives it up whenever something read from it outlives
+# an iteration. Run under ASan, a value compacted away too early is a crash;
+# the checksums catch a reused block.
+N = 1500
+
+def val(i: Int) -> Str {
+  "v#{i}:" + "abcdefgh" * 250
+}
+
+def sum(s: Str) -> Int {
+  t = 0
+  for b in s.bytes {
+    t = (t * 31 + b.to_i) % 1000003
+  }
+  t
+}
+
+def count_key(m: Map[Str, Str], k: Str) -> Int {
+  (m[k] || "").size
+}
+
+def get_or(m: Map[Str, Str], k: Str) -> Str {
+  m[k] || ""
+}
+
+def has(m: Map[Str, Str], k: Str) -> Bool {
+  m.has_key?(k)
+}
+
+def stash(out: Map[Int, Str], m: Map[Str, Str], k: Str) {
+  out[out.size] = m[k] || ""
+}
+
+# (a) read-only helpers indexed by a key argument: owner region.
+def helpers -> Int {
+  docs: Map[Str, Str] = {}
+  i = 0
+  total = 0
+  while i < N {
+    docs["f#{i % 10}"] = val(i)
+    total += count_key(docs, "f#{i % 7}")
+    total += has(docs, "f3") ? 1 : 0
+    total = (total + sum(get_or(docs, "f#{i % 5}"))) % 1000003
+    i += 1
+  }
+  total
+}
+
+# (b) named locals holding what is read, within one iteration: owner region.
+def locals -> Int {
+  docs: Map[Str, Str] = {}
+  i = 0
+  total = 0
+  while i < N {
+    uri = "f#{i % 10}"
+    docs[uri] = val(i)
+    if i % 2 == 0 {
+      t = docs["f1"] || ""
+      total = (total + sum(t)) % 1000003
+    }
+    if old = docs["f2"] {
+      total = (total + old.size) % 1000003
+    }
+    if i % 3 == 0 {
+      w = docs[uri] || ""
+      total = (total + sum(w[0...12])) % 1000003
+    } else {
+      i += 1
+      next
+    }
+    total = (total + w.size) % 1000003
+    head = (docs[uri] || "")[0...10]
+    total = (total + sum(head)) % 1000003
+    i += 1
+  }
+  total
+}
+
+# (c) keys and pairs iterated, keys used for lookups: owner region.
+def keys -> Int {
+  docs: Map[Str, Str] = {}
+  i = 0
+  total = 0
+  while i < N {
+    docs["f#{i % 10}"] = val(i)
+    if i % 50 == 0 {
+      for k in docs.keys {
+        total = (total + sum(docs[k] || "")) % 1000003
+      }
+      for k, v in docs {
+        total = (total + k.size + v.size) % 1000003
+      }
+    }
+    i += 1
+  }
+  total
+}
+
+# Safety: a local read in a later iteration than the one that set it.
+def stale -> Int {
+  docs: Map[Str, Str] = {}
+  i = 0
+  total = 0
+  while i < N {
+    docs["f#{i % 10}"] = val(i)
+    if i % 7 == 0 {
+      t = docs["f#{i % 10}"] || ""
+    }
+    total = (total + sum(t)) % 1000003
+    i += 1
+  }
+  total
+}
+
+# Safety: values and keys kept across iterations, directly and through
+# helpers that return or store them.
+# (Each returns a number: a string built from what was kept would make
+# the map reach the caller, and the map would never be compacted at all.)
+def show(xs: [Str]) -> Int {
+  parts: [Str] = []
+  for s in xs {
+    parts << "#{s[0...6]}/#{sum(s)}"
+  }
+  puts parts.join(" ")
+  parts.size
+}
+
+def kept_values -> Int {
+  docs: Map[Str, Str] = {}
+  keep: [Str] = []
+  i = 0
+  while i < N {
+    docs["f#{i % 10}"] = val(i)
+    keep << (docs["f#{i % 10}"] || "") if i % 300 == 0
+    i += 1
+  }
+  show(keep)
+}
+
+def kept_keys -> Int {
+  docs: Map[Str, Str] = {}
+  names: [Str] = []
+  i = 0
+  while i < N {
+    docs["f#{i % 10}"] = val(i)
+    if i % 500 == 0 {
+      for k in docs.keys {
+        names << k
+      }
+    }
+    i += 1
+  }
+  show([names.join(",")])
+}
+
+def kept_returned -> Int {
+  docs: Map[Str, Str] = {}
+  last = ""
+  i = 0
+  while i < N {
+    docs["f#{i % 10}"] = val(i)
+    last = get_or(docs, "f#{i % 10}") if i % 300 == 0
+    i += 1
+  }
+  show([last])
+}
+
+def kept_stashed -> Int {
+  docs: Map[Str, Str] = {}
+  saved: Map[Int, Str] = {}
+  i = 0
+  while i < N {
+    docs["f#{i % 10}"] = val(i)
+    stash(saved, docs, "f#{i % 10}") if i % 400 == 1
+    i += 1
+  }
+  show(saved.values)
+}
+
+puts helpers
+puts locals
+puts keys
+puts stale
+puts kept_values
+puts kept_keys
+puts kept_returned
+puts kept_stashed

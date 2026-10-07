@@ -87,6 +87,13 @@
 #    (signal 9). Only the stages are killed, not their children (no process
 #    groups; wait_delay bounds the copying after). Zero (the default) means
 #    no limit.
+#  - Memory (port-issues #273): no task runs per command unless a context
+#    is watched (command_context with a cancelable ctx); a Cmd doesn't hold
+#    its context (a slot in CTXS, taken out at start: a copy of a Cmd made
+#    before start and started after the original runs without it), and
+#    command copies the name and args. wait! finds the exits by wait4 once
+#    the pipes are done, or by polling them (1-50 ms) while a WaitDelay or
+#    a timeout with no pipes needs them sooner.
 #  - SysProcAttr doesn't exist (no syscall package).
 #  - Output's ExitError.Stderr keeps Go's 32 KiB prefix and suffix; capture
 #    keeps everything.
@@ -465,12 +472,11 @@ pub struct Cmd {
     pumps = s.pumps
     pids = s.pids
     np = pids.size
-    sts: [os.ProcessState] = []
-    reaped: [Bool] = []
-    for _j in 0...np {
-      sts << os.ProcessState.new
-      reaped << false
-    }
+    # Made at their size, not pushed onto `[]`: a push onto an empty array
+    # placed in another's region allocates in the program region (an
+    # empty array has no storage to find its region by; port-issues #273).
+    sts: [os.ProcessState] = [os.ProcessState.new; np]
+    reaped: [Bool] = [false; np]
     nreaped = 0
     wb: [Byte] = [0; 40]
     deadline = s.deadline
@@ -514,11 +520,13 @@ pub struct Cmd {
         until = t if until == 0 || t < until
         backoff = backoff * 2 if backoff < 50000000
       }
-      blob: [Byte] = []
+      n = 0
+      for p in pumps { n += 1 if p.fd >= 0 }
+      blob: [Byte] = [0; 16 * (n > 0 ? n : 1)]
       n = 0
       for p in pumps {
         next if p.fd < 0
-        blob = put_pair(blob, p.fd, p.kind == P_FEED ? 2 : 1)
+        set_pair(blob, n, p.fd, p.kind == P_FEED ? 2 : 1)
         n += 1
       }
       # A feed with bytes waiting to be read from its reader doesn't wait.
@@ -746,9 +754,9 @@ pub struct Cmd {
   # Starts every stage. mode: 0 per the fields (Go's Start), 1 stdout and
   # stderr captured (stderr only if unset), 3 both captured together.
   def start_with!(mode: Int) -> ~Unit {
-    fail ExecError.Usage("exec: already started") if st.size > 0 || started
+    r = start_run(mode)
     self.started = true
-    s = ~start_run(mode)
+    s = ~r
     self.st = [s]
   }
 
@@ -765,7 +773,7 @@ pub struct Cmd {
       ~r0
     }
     env_v = r0.unwrap
-    s = RunState.new()
+    s = RunState.new(out: empty_bytes, errb: empty_bytes)
     to_close: [Int] = []
     pumps: [Pump] = []
     failure: Error? = none
@@ -1116,17 +1124,23 @@ def close_files(fs: [os.File]) {
   }
 }
 
-# b with (fd, mode) appended as two native-endian int64s.
-def put_pair(b: [Byte], fd: Int, mode: Int) -> [Byte] {
-  out = b
-  for v in [fd, mode] {
-    k = 0
-    while k < 8 {
-      out << ((v >> (8 * k)) & 255).as_u8
-      k += 1
-    }
+# Pair i of b set to (fd, mode), two native-endian int64s.
+def set_pair(b: [Byte], i: Int, fd: Int, mode: Int) {
+  k = 0
+  while k < 8 {
+    b[16 * i + k] = ((fd >> (8 * k)) & 255).as_u8
+    b[16 * i + 8 + k] = ((mode >> (8 * k)) & 255).as_u8
+    k += 1
   }
-  out
+}
+
+# An empty byte array with storage (a slice of one byte): pushing onto it
+# allocates in the region it was made in, where a push onto `[]` of an
+# array placed in another's region allocates in the program region
+# (port-issues #273).
+def empty_bytes -> [Byte] {
+  b: [Byte] = [0; 1]
+  b[0...0]
 }
 
 # The contexts of Cmds made by command_context and not started yet: a Cmd

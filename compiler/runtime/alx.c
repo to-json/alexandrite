@@ -2997,24 +2997,36 @@ int64_t alx_sys_poll2_timeout(int64_t a, int64_t b, int64_t timeout_ns) {
  * pairs, mode 1 read / 2 write (negative fds are skipped). A task parks on
  * the poller; a plain thread poll(2)s. 0 or -errno. */
 int64_t alx_sys_polln(const uint8_t *blob, int64_t n) {
+    return alx_sys_polln_until(blob, n, 0);
+}
+
+/* alx_sys_polln with a deadline: until (monotonic ns, 0 = none). With no
+ * descriptor to wait on, it sleeps until the deadline. 0, -ETIMEDOUT or
+ * -errno. */
+int64_t alx_sys_polln_until(const uint8_t *blob, int64_t n, int64_t until) {
     int *fds = malloc(sizeof(int) * (size_t)(n ? n : 1));
     int *modes = malloc(sizeof(int) * (size_t)(n ? n : 1));
     if (!fds || !modes) alx_panic("out of memory", "runtime");
+    int live = 0;
     for (int64_t i = 0; i < n; i++) {
         int64_t v[2];
         memcpy(v, blob + 16 * i, 16);
         fds[i] = (int)v[0];
         modes[i] = (int)v[1];
+        if (fds[i] >= 0) live++;
     }
     int64_t r = 0;
-    if (tl_task) {
-        r = fd_wait_task(fds, modes, (int)n, 0);
+    if (live == 0 && until > 0) {
+        int64_t left = until - mono_ns();
+        if (left > 0) alx_sleep_ns(left);
+        r = -ETIMEDOUT;
+    } else if (tl_task) {
+        r = fd_wait_task(fds, modes, (int)n, until);
     } else {
         struct pollfd *pf = calloc((size_t)(n ? n : 1), sizeof *pf);
         if (!pf) alx_panic("out of memory", "runtime");
         for (int64_t i = 0; i < n; i++) { pf[i].fd = fds[i]; pf[i].events = modes[i] == 1 ? POLLIN : POLLOUT; }
-        while (poll(pf, (nfds_t)n, -1) < 0)
-            if (errno != EINTR) { r = -errno; break; }
+        r = fd_poll_until(pf, (int)n, until);
         free(pf);
     }
     free(fds);

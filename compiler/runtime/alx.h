@@ -531,6 +531,7 @@ int64_t alx_sys_spawn2(const char *path, const uint8_t *argv, int64_t argc, cons
 /* Blocks until one of n descriptors is ready: blob holds n (fd, mode)
  * int64 pairs, mode 1 read / 2 write; negative fds are skipped. 0 or -errno. */
 int64_t alx_sys_polln(const uint8_t *blob, int64_t n);
+int64_t alx_sys_polln_until(const uint8_t *blob, int64_t n, int64_t until);
 /* Blocks until a or b (either may be -1) is readable or hung up. 0 or -errno. */
 int64_t alx_sys_poll2(int64_t a, int64_t b);
 int64_t alx_sys_poll2_timeout(int64_t a, int64_t b, int64_t timeout_ns);

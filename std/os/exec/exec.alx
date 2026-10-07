@@ -79,8 +79,8 @@
 #    returned as is.
 #  - wait_delay is an Int of nanoseconds (Go: time.Duration).
 #  - `c.timeout = time.Duration` (not in Go; CommandContext with a deadline
-#    in one field): a deadline context of its own over `ctx` (or
-#    context.background). When it passes before the command (every stage)
+#    in one field): a deadline wait! keeps itself (no context or task), as
+#    well as `ctx`'s. When it passes before the command (every stage)
 #    has exited, the stages are killed (SIGKILL; Cancel instead when set),
 #    reaped, and the wait fails with ExecError.Timeout, whatever `check`
 #    says; its info has the stderr captured so far and the ProcessState
@@ -115,7 +115,8 @@ extern def alx_sys_spawn2(path: Str, argv: [Byte], argc: Int, env: [Byte], envc:
 extern def alx_sys_exec(argv: [Byte], argc: Int, env: [Byte], envc: Int, dir: Str, fd0: Int, fd1: Int, fd2: Int) -> Int
 extern def alx_sys_wait(pid: Int, out: [Byte]) -> Int
 extern def alx_sys_pipe(out: [Byte], nonblock: Int) -> Int
-extern def alx_sys_polln(blob: [Byte], n: Int) -> Int
+extern def alx_sys_polln_until(blob: [Byte], n: Int, until: Int) -> Int
+extern def alx_sys_wait_nohang(pid: Int, out: [Byte]) -> Int
 extern def alx_fd_wait(fd: Int, mode: Int) -> Int
 extern def alx_fd_close(fd: Int) -> Int
 extern def alx_sys_open(p: Str, flags: I32, mode: I32) -> I32
@@ -264,24 +265,19 @@ struct RunState {
   pids: [Int]
   t0s: [Int]
   procs: [os.Process]
-  # Parent ends closed after wait (the *_pipe! pipes).
-  parent: [os.File]
   # The copying wait! does, one per pipe: kind P_FEED (stdin_reader into
   # fd), P_POUR_OUT / P_POUR_ERR (fd into stdout / stderr), P_CAP_OUT /
   # P_CAP_ERR (fd captured). fd is the parent's (non-blocking) end; -1 once
   # done.
   pumps: [Pump]
-  # Written (one byte) by the task waiting for the processes when they
-  # have all exited; the states come down `exited`.
-  notify: Int
-  exited: Chan[[os.ProcessState]]
-  # The context watcher: told when the process ended, answers its error.
-  finished: Chan[Bool]
-  watch: Chan[Error?]
-  watching: Bool
-  # The watcher's context is `timeout`'s own; stop releases its timer.
-  timed: Bool
-  stop: [() -> Unit]
+  # `timeout`'s deadline (alx_mono_ns; 0: none), and whether it passed
+  # and wait! killed the stages.
+  deadline: Int
+  timed_out: Bool
+  # The first error copying to or from stdin_reader / stdout / stderr.
+  copy_err: ExecError?
+  # The context watcher (a task), when there is one.
+  watch: [Watch]
   states: [os.ProcessState]
   waited: Bool
   out: [Byte]
@@ -289,6 +285,17 @@ struct RunState {
 
   # The bytes captured for kind 1 (stdout) or 2 (stderr).
   def out_bytes(kind: Int) -> [Byte] { kind == 1 ? out : errb }
+}
+
+# The task watching a Cmd's context: wait! closes `finished` when the
+# processes have ended; the watcher answers the context's error on `res`.
+# Only a Cmd with a cancelable context has one. Everything a task holds
+# lives in the program region, so neither the Cmd nor its RunState may
+# reach one: the watcher gets its context from CTXS, not from the Cmd
+# (port-issues #273).
+struct Watch {
+  finished: Chan[Bool]
+  res: Chan[Error?]
 }
 
 P_FEED = 0
@@ -318,7 +325,7 @@ pub struct Cmd {
   wait_delay: Int                  # Go's WaitDelay (nanoseconds; 0: none)
   cancel: ((os.Process) -> ~Unit)? # Go's Cancel, given the process
   kill_on_cancel: Bool             # Go's default Cancel (command_context): kill it
-  ctx: context.Context?            # Go's ctx (command_context)
+  ctx_id: Int                      # Go's ctx (command_context): its slot in CTXS (0: none)
   err: ExecError?                  # Go's Err: a lookup failure from command()
   lpath: Str                       # Go's Path when it differs from args[0]
   child_files: [os.File]           # the child's ends of the *_pipe! pipes
@@ -347,42 +354,40 @@ pub struct Cmd {
   # Runs to completion (Go's Run). Output is discarded unless `passthrough`
   # or stdout/stderr are set.
   pub def run -> ~os.ProcessState {
-    c = self
-    ~c.start_with!(0)
-    ~c.wait!
-    ps = c.process_state
-    ps.unwrap
+    sa = [~start_run(0)]
+    ~finish(sa, check)
+    deciding(sa[0].states)
   }
 
   # Its standard output (Go's Output). A nonzero exit is ExecError.Exit with
   # the stderr text (when stderr isn't set).
   pub def output -> ~Str {
     fail ExecError.Usage("exec: Stdout already set") if stdout != none
-    c = self
-    ~c.start_with!(1)
-    ~c.wait!
-    Str.from_bytes(c.st[0].out_bytes(1))
+    sa = [~start_run(1)]
+    ~finish(sa, check)
+    Str.from_bytes(sa[0].out)
   }
 
   # Standard output and error, interleaved as written (Go's CombinedOutput).
   pub def combined_output -> ~Str {
     fail ExecError.Usage("exec: Stdout already set") if stdout != none
     fail ExecError.Usage("exec: Stderr already set") if stderr != none
-    c = self
-    ~c.start_with!(3)
-    ~c.wait!
-    Str.from_bytes(c.st[0].out_bytes(1))
+    sa = [~start_run(3)]
+    ~finish(sa, check)
+    Str.from_bytes(sa[0].out)
   }
 
   # Runs it and returns both outputs and the ProcessState; fails only if it
   # can't be started (a nonzero exit is in `state`). Not in Go.
+  #
+  # run, output, combined_output and capture keep the run's state in a
+  # local (`sa`), not in a copy of the Cmd: what is stored into a copy of a
+  # parameter goes to the program region (port-issues #273).
   pub def capture -> ~Captured {
-    c = self
-    c.check = false
-    ~c.start_with!(1)
-    ~c.wait!
-    s = c.st[0]
-    Captured.new(stdout: Str.from_bytes(s.out_bytes(1)), stderr: Str.from_bytes(s.out_bytes(2)), state: deciding(s.states), states: s.states)
+    sa = [~start_run(1)]
+    ~finish(sa, false)
+    s = sa[0]
+    Captured.new(stdout: Str.from_bytes(s.out_bytes(1)), stderr: Str.from_bytes(s.out_bytes(2)), state: deciding(s.states), states: s.states.dup)
   }
 
   # Starts it (Go's Start); wait! waits for it.
@@ -397,38 +402,42 @@ pub struct Cmd {
   # can't share the writer with the caller unsynchronized).
   pub def wait! -> ~Unit {
     fail ExecError.Usage("exec: not started") if st.size == 0
-    s = st[0]
-    fail ExecError.Usage("exec: Wait was already called") if s.waited
+    fail ExecError.Usage("exec: Wait was already called") if st[0].waited
     self.st[0].waited = true
-    copy_err = self.~pump!
-    states = st[0].states
+    ~finish(st, check)
+  }
+
+  # wait! for the state in sa[0] (`chk`: fail on a nonzero exit). Its
+  # errors are copies: one holding both self's and sa's storage would tie
+  # the two together (and send sa to the program region).
+  def finish(sa: [RunState], chk: Bool) -> ~Unit {
+    s = sa[0]
+    pump(sa)
+    copy_err = sa[0].copy_err
+    states = sa[0].states
     for p in s.procs {
       q = p
       q.release!.unwrap
     }
     state = deciding(states)
     failure: Error? = none
-    if check && !state.success {
-      failure = ExecError.Exit(ExitInfo.new(cmd: to_s, state: state, stderr: Str.from_bytes(prefix_suffix(st[0].errb, 32 << 10))))
+    if chk && !state.success {
+      failure = ExecError.Exit(ExitInfo.new(cmd: own(to_s), state: state, stderr: Str.from_bytes(prefix_suffix(sa[0].errb, 32 << 10).dup)))
     }
-    if s.watching {
-      s.finished.close
-      w = s.watch.recv
-      for f in s.stop { f.call }
-      werr: Error? = none
+    werr: Error? = none
+    if s.watch.size > 0 {
+      wt = s.watch[0]
+      wt.finished.close
+      w = wt.res.recv
       if e = w {
         werr = e
       }
+    }
+    if sa[0].timed_out {
+      failure = ExecError.Timeout(ExitInfo.new(cmd: own(to_s), state: state, stderr: Str.from_bytes(sa[0].errb.dup)))
+    } elsif failure == none {
       if e = werr {
-        parent_live = true
-        if c = ctx {
-          parent_live = c.err == none
-        }
-        if s.timed && parent_live {
-          failure = ExecError.Timeout(ExitInfo.new(cmd: to_s, state: state, stderr: Str.from_bytes(st[0].errb)))
-        } elsif failure == none {
-          failure = e
-        }
+        failure = e
       }
     }
     if failure == none {
@@ -436,7 +445,7 @@ pub struct Cmd {
         failure = ce
       }
     }
-    close_files(s.parent)
+    close_files(parent_files)
     if e = failure {
       fail e
     }
@@ -444,20 +453,67 @@ pub struct Cmd {
 
   # Copies between the pipes and the readers / writers until every pipe is
   # done and the processes have exited (WaitDelay bounds the copying once
-  # they have). The first copy error.
-  def pump! -> ~ExecError? {
-    s = st[0]
+  # they have), and reaps them; kills them when `timeout` passes. No task
+  # waits for the processes: a task's storage lives in the program region
+  # (port-issues #273). Exits are found by blocking waits once the pipes
+  # are done, or by polling (wait4 WNOHANG, every 1-50 ms) while something
+  # needs them earlier: a WaitDelay with pipes still open, a deadline with
+  # no pipes. The first copy error goes to `copy_err` (not returned: a
+  # result tied to self would send all it touches to the program region).
+  def pump(sa: [RunState]) {
+    s = sa[0]
     pumps = s.pumps
+    pids = s.pids
+    np = pids.size
+    sts: [os.ProcessState] = []
+    reaped: [Bool] = []
+    for _j in 0...np {
+      sts << os.ProcessState.new
+      reaped << false
+    }
+    nreaped = 0
+    wb: [Byte] = [0; 40]
+    deadline = s.deadline
+    killed = false
+    delay_at = 0 # when WaitDelay ends (alx_mono_ns), once they have exited
+    delay_over = false
+    kill_at = 0 # Cancel was called at the deadline: kill after WaitDelay
+    backoff = 1000000
     first: ExecError? = none
-    exited = false
-    timer = -1 # read end of the WaitDelay timer's pipe
     pending: [Byte] = []
     feed_eof = false
     buf: [Byte] = [0; 65536]
+    # stdin_reader and the stdout / stderr writers get their own buffer:
+    # what an interface call is given lives in the program region
+    # (port-issues #178, #273), so `buf` stays out of their reach and this
+    # one is made only when a reader or writer is set (once per run).
+    xbuf: [Byte] = []
     eagain = alx_sys_const("EAGAIN")
     loop {
       open = pumps.any? { |p| p.fd >= 0 }
-      break if exited && !open
+      break if nreaped == np && !open
+      if !open && (deadline == 0 || killed) && kill_at == 0 {
+        # Only the processes are left, and nothing to watch the clock for.
+        for j in 0...np {
+          next if reaped[j]
+          alx_sys_wait(pids[j], wb)
+          sts[j] = state_of(pids[j], wb, alx_mono_ns - s.t0s[j])
+          reaped[j] = true
+          nreaped += 1
+        }
+        next
+      }
+      # Exits are needed before the pipes are done: poll for them.
+      watch_exit = nreaped < np && (!open || (wait_delay > 0 && delay_at == 0))
+      until = 0
+      until = deadline if deadline > 0 && !killed
+      until = delay_at if delay_at > 0 && !delay_over && (until == 0 || delay_at < until)
+      until = kill_at if kill_at > 0 && (until == 0 || kill_at < until)
+      if watch_exit {
+        t = alx_mono_ns + backoff
+        until = t if until == 0 || t < until
+        backoff = backoff * 2 if backoff < 50000000
+      }
       blob: [Byte] = []
       n = 0
       for p in pumps {
@@ -465,36 +521,53 @@ pub struct Cmd {
         blob = put_pair(blob, p.fd, p.kind == P_FEED ? 2 : 1)
         n += 1
       }
-      if !exited {
-        blob = put_pair(blob, s.notify, 1)
-        n += 1
-      }
-      if timer >= 0 {
-        blob = put_pair(blob, timer, 1)
-        n += 1
-      }
       # A feed with bytes waiting to be read from its reader doesn't wait.
       feeding = pumps.any? { |p| p.kind == P_FEED && p.fd >= 0 } && pending.size == 0 && !feed_eof
-      alx_sys_polln(blob, n) if !feeding
-      # The processes.
-      if !exited && ready_now(s.notify) {
-        exited = true
-        self.st[0].states = s.exited.recv.unwrap
-        alx_fd_close(s.notify)
-        if wait_delay > 0 && pumps.any? { |p| p.fd >= 0 } {
-          timer = delay_pipe(wait_delay)
+      alx_sys_polln_until(blob, n, until) if !feeding
+      if watch_exit {
+        for j in 0...np {
+          next if reaped[j]
+          if alx_sys_wait_nohang(pids[j], wb) == 1 {
+            sts[j] = state_of(pids[j], wb, alx_mono_ns - s.t0s[j])
+            reaped[j] = true
+            nreaped += 1
+          }
         }
       }
+      now = alx_mono_ns
+      if nreaped == np && wait_delay > 0 && delay_at == 0 && open {
+        delay_at = now + wait_delay
+      }
+      # `timeout` passed: kill what hasn't exited (Cancel, when set, gets
+      # the last stage, as from a context).
+      if deadline > 0 && !killed && now >= deadline && nreaped < np {
+        killed = true
+        sa[0].timed_out = true
+        live: [Int] = []
+        for j in 0...np { live << pids[j] if !reaped[j] }
+        if f0 = cancel {
+          g = f0.dup
+          _ = g.call(os.new_process(pids[np - 1]))
+          kill_at = now + wait_delay if wait_delay > 0
+        } else {
+          _ = kill_all(live)
+        }
+      }
+      if kill_at > 0 && now >= kill_at {
+        kill_at = 0
+        live: [Int] = []
+        for j in 0...np { live << pids[j] if !reaped[j] }
+        _ = kill_all(live)
+      }
       # WaitDelay expired: Go closes the pipes and returns ErrWaitDelay.
-      if timer >= 0 && ready_now(timer) {
+      if delay_at > 0 && !delay_over && now >= delay_at {
+        delay_over = true
         for i in 0...pumps.size {
           if pumps[i].fd >= 0 {
             alx_fd_close(pumps[i].fd)
             pumps[i].fd = -1
           }
         }
-        alx_fd_close(timer)
-        timer = -1
         first = ExecError.Usage(ERR_WAIT_DELAY) if first == none
         next
       }
@@ -505,14 +578,15 @@ pub struct Cmd {
           if pending.size == 0 && !feed_eof {
             if r = stdin_reader {
               rd = r
-              got = rd.read!(buf)
+              xbuf = [0.as_u8; 65536] if xbuf.size == 0
+              got = rd.read!(xbuf)
               if e = got.err {
-                first = ExecError.Usage(e.message) if first == none
+                first = ExecError.Usage(own(e.message)) if first == none
                 feed_eof = true
               } elsif got.unwrap == 0 {
                 feed_eof = true
               } else {
-                pending = buf[0...got.unwrap].dup
+                pending = xbuf[0...got.unwrap].dup
               }
             }
           }
@@ -536,17 +610,19 @@ pub struct Cmd {
         if r > 0 {
           chunk = buf[0...r]
           if p.kind == P_CAP_OUT {
-            for x in chunk { self.st[0].out << x }
+            for x in chunk { sa[0].out << x }
           } elsif p.kind == P_CAP_ERR {
-            for x in chunk { self.st[0].errb << x }
+            for x in chunk { sa[0].errb << x }
           } else {
             wr = p.kind == P_POUR_OUT ? stdout : stderr
             if w = wr {
               dst = w
-              res = dst.write!(chunk.dup)
+              xbuf = [0.as_u8; 65536] if xbuf.size == 0
+              copy(xbuf, chunk)
+              res = dst.write!(xbuf[0...r])
               if e = res.err {
                 # Go's copier stops, closing its end (the writer gets EPIPE).
-                first = ExecError.Usage(e.message) if first == none
+                first = ExecError.Usage(own(e.message)) if first == none
                 alx_fd_close(p.fd)
                 pumps[i].fd = -1
               }
@@ -558,8 +634,8 @@ pub struct Cmd {
         }
       }
     }
-    alx_fd_close(timer) if timer >= 0
-    first
+    sa[0].states = sts
+    sa[0].copy_err = first
   }
 
   # Go's StdinPipe: the write end of a pipe that will be the program's
@@ -672,14 +748,24 @@ pub struct Cmd {
   def start_with!(mode: Int) -> ~Unit {
     fail ExecError.Usage("exec: already started") if st.size > 0 || started
     self.started = true
-    r0 = self.prepare_check
+    s = ~start_run(mode)
+    self.st = [s]
+  }
+
+  # Starts every stage (start_with! without the bookkeeping in self): the
+  # run's state, which holds nothing of self's (see capture).
+  def start_run(mode: Int) -> ~RunState {
+    fail ExecError.Usage("exec: already started") if st.size > 0 || started
+    # The context leaves CTXS here: only the watcher needs it from now on.
+    ctx = take_ctx(ctx_id)
+    r0 = self.prepare_check(ctx)
     if r0.err? {
       close_files(child_files)
       close_files(parent_files)
       ~r0
     }
     env_v = r0.unwrap
-    s = RunState.new(exited: Chan[[os.ProcessState]].new(1), finished: Chan[Bool].new(0), watch: Chan[Error?].new(1))
+    s = RunState.new()
     to_close: [Int] = []
     pumps: [Pump] = []
     failure: Error? = none
@@ -811,50 +897,21 @@ pub struct Cmd {
       }
       fail f
     }
-    s.parent = parent_files
     s.pumps = pumps
-    # A task waits for the processes and says so on a pipe wait! polls.
-    note = ~os_pipe(1)
-    s.notify = note[0]
-    nw = note[1]
-    pids = s.pids.dup
-    t0s = s.t0s.dup
-    ex = s.exited
-    spawn {
-      states: [os.ProcessState] = []
-      j = 0
-      while j < pids.size {
-        b: [Byte] = [0; 40]
-        alx_sys_wait(pids[j], b)
-        states << state_of(pids[j], b, alx_mono_ns - t0s[j])
-        j += 1
-      }
-      ex << states
-      one: [Byte] = [1]
-      c_write(nw.to_i32, one, 1)
-      alx_fd_close(nw)
-    }
-    # `timeout`: a deadline context of its own over ctx; its end kills.
-    wctx = ctx
-    if timeout.ns > 0 {
-      tc, stop = context.with_timeout(ctx || context.background, timeout)
-      wctx = tc
-      s.timed = true
-      s.stop = [stop]
-    }
+    s.deadline = s.t0s[0] + timeout.ns if timeout.ns > 0
     # Go's watchCtx: on cancellation, call Cancel (and kill after WaitDelay).
-    if c = wctx {
-      if c.cancelable? && (cancel != none || kill_on_cancel || wait_delay != 0 || s.timed) {
-        s.watching = true
+    if c = ctx {
+      if c.cancelable? && (cancel != none || kill_on_cancel || wait_delay != 0) {
         cx = c # a Context is #[shareable]: tasks may hold it
         cf: ((os.Process) -> ~Unit)? = none
         if f0 = cancel {
           cf = f0.dup
         }
-        kill = kill_on_cancel || s.timed
+        kill = kill_on_cancel
         wpids = s.pids.dup
-        fin = s.finished
-        res = s.watch
+        fin = Chan[Bool].new(0)
+        res = Chan[Error?].new(1)
+        s.watch = [Watch.new(finished: fin, res: res)]
         delay = wait_delay
         spawn {
           canceled = false
@@ -896,13 +953,13 @@ pub struct Cmd {
         }
       }
     }
-    self.st = [s]
+    s
   }
 
   # Checks before a start (Go's Start): the lookup error, no command, a
   # Cancel without a context, a cancelled context, a NUL in the
   # environment. The environment to run with (none: ours).
-  def prepare_check -> ~[Str]? {
+  def prepare_check(ctx: context.Context?) -> ~[Str]? {
     if e = err {
       fail e
     }
@@ -949,7 +1006,16 @@ pub struct Cmd {
     fail ExecError.Start("pipe", -r) if r < 0
     p = (get64(b, 0), get64(b, 1))
     w = p[1]
-    data = s.bytes.to_a
+    # What the pipe holds at once goes in now; a task writes the rest
+    # (only then: what a task holds is never freed, port-issues #273).
+    data0 = s.bytes
+    n0 = data0.size == 0 ? 0 : c_write(w.to_i32, data0, data0.size)
+    n0 = 0 if n0 < 0
+    if n0 == data0.size {
+      alx_fd_close(w)
+      return p[0]
+    }
+    data = data0[n0...data0.size].dup
     spawn {
       eagain = alx_sys_const("EAGAIN")
       off = 0
@@ -1063,38 +1129,59 @@ def put_pair(b: [Byte], fd: Int, mode: Int) -> [Byte] {
   out
 }
 
-# Whether the non-blocking notification pipe fd has its byte (or its end).
-def ready_now(fd: Int) -> Bool {
-  one: [Byte] = [0]
-  n = c_read(fd.to_i32, one, 1)
-  n >= 0
+# The contexts of Cmds made by command_context and not started yet: a Cmd
+# holds its slot number (ctx_id), start takes it out. A Cmd holding the
+# context itself would follow it into the program region, with all it
+# holds, as soon as the watcher task got it (port-issues #273). Slots are
+# reused; a Cmd never started keeps its slot.
+CTXS = Mutex[[context.Context?]].new([])
+
+def hold_ctx(c: context.Context) -> Int {
+  CTXS.lock { |xs|
+    i = 0
+    while i < xs.size && xs[i] != none { i += 1 }
+    if i == xs.size {
+      xs << c
+    } else {
+      xs[i] = c
+    }
+    i + 1
+  }
 }
 
-# A pipe whose read end gets a byte after `delay` nanoseconds (a timer
-# wait! can poll). Its read end (non-blocking).
-def delay_pipe(delay: Int) -> Int {
-  b: [Byte] = [0; 16]
-  alx_sys_pipe(b, 1)
-  r = get64(b, 0)
-  w = get64(b, 1)
-  spawn {
-    time.sleep(time.nanosecond * delay)
-    one: [Byte] = [1]
-    c_write(w.to_i32, one, 1)
-    alx_fd_close(w)
+def take_ctx(id: Int) -> context.Context? {
+  return none if id <= 0
+  CTXS.lock { |xs|
+    c: context.Context? = none
+    if id <= xs.size {
+      c = xs[id - 1]
+      xs[id - 1] = none
+    }
+    c
   }
-  r
 }
 
 # A Cmd for `name args...` (Go's Command): a name without a slash is looked
 # up in $PATH now; a failure is kept in `err` and returned by run/start!.
 pub def command(name: Str, args: [Str]) -> Cmd {
-  c = Cmd.new(stages: [Stage.new(args: [name] + args, redirs: [])], dir: "", env: none, stdin: none, passthrough: false, check: default_check)
+  # Copies of the strings: a Cmd holding its caller's strings ties them
+  # to everything later stored in it, and a helper that builds and returns
+  # a Cmd from its parameters would put all of it in the program region
+  # (port-issues #271, #273). Not `[name] + args` either: combining two
+  # parameters ties each to the other (#272).
+  argv: [Str] = []
+  argv << own(name)
+  for a in args { argv << own(a) }
+  c = Cmd.new(stages: [Stage.new(args: argv, redirs: [])], dir: "", env: none, stdin: none, passthrough: false, check: default_check)
   if !strings.contains(name, "/") && name != "" {
-    lp = look_path(name)
+    # The lookup's result is kept and may hold the name (an error): given
+    # the caller's string, it and all the lookup made (a stat per $PATH
+    # entry) would live in the program region.
+    nm = own(name)
+    lp = look_path(nm)
     if e = lp.err {
       c.err = e
-      if p = lookup_path(name) {
+      if p = lookup_path(nm) {
         c.lpath = p
       }
     } else {
@@ -1104,11 +1191,18 @@ pub def command(name: Str, args: [Str]) -> Cmd {
   c
 }
 
+# A copy of s that shares nothing with it (see command).
+def own(s: Str) -> Str {
+  b: [Byte] = []
+  for x in s.bytes { b << x }
+  Str.from_bytes(b)
+}
+
 # Go's CommandContext: command(name, args) whose process is killed (Go's
 # default Cancel) when ctx is done before it exits.
 pub def command_context(ctx: context.Context, name: Str, args: [Str]) -> Cmd {
   c = command(name, args)
-  c.ctx = ctx
+  c.ctx_id = hold_ctx(ctx)
   c.kill_on_cancel = true
   c
 }
@@ -1185,7 +1279,9 @@ def lookup_path(name: Str) -> Str? {
 
 # Go's findExecutable: 0, or the errno why the file isn't one.
 def find_executable(p: Str) -> Int {
-  r = os.stat(p)
+  # A copy: the stat's result (and its error) holds the name, and would
+  # be placed with p's storage, which may be the program region's.
+  r = os.stat(own(p))
   if e = r.err {
     return e.errno
   }
@@ -1219,14 +1315,16 @@ def dedup_env_case(no_case: Bool, nul_ok: Bool, env: [Str]) -> ([Str], Str) {
     i = strings.index(kv, "=")
     i = strings.index(kv[1...kv.size], "=") + 1 if i == 0
     if i < 0 {
-      out << kv if kv != ""
+      out << own(kv) if kv != ""
       next
     }
     k = kv[0...i]
     k = strings.to_lower(k) if no_case
     next if saw.key?(k)
     saw[k] = true
-    out << kv
+    # Copies: a result holding the caller's strings would be tied to them
+    # (a Cmd's environment, for start: port-issues #273).
+    out << own(kv)
   }
   (out.reverse, err)
 }

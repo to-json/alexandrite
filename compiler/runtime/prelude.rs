@@ -839,6 +839,43 @@ mod rt {
         }
         0
     }
+    /// alx_sys_polln with a deadline (shim_alx_mono_ns's clock, 0: none):
+    /// 0, -ETIMEDOUT (60 on macOS, 110 on Linux) or -errno. With no
+    /// descriptor it sleeps until the deadline.
+    pub unsafe fn shim_alx_sys_polln_until(blob: *mut u8, n: i64, until: i64) -> i64 {
+        let etimedout: i64 = if cfg!(target_os = "linux") { 110 } else { 60 };
+        let mut fds: Vec<PollFd> = (0..n.max(0) as usize)
+            .map(|i| {
+                let mut v = [0i64; 2];
+                unsafe { std::ptr::copy_nonoverlapping(blob.add(16 * i), v.as_mut_ptr() as *mut u8, 16) };
+                PollFd { fd: v[0] as i32, events: if v[1] == 1 { 1 } else { 4 }, revents: 0 }
+            })
+            .collect();
+        if until <= 0 {
+            return unsafe { shim_alx_sys_polln(blob, n) };
+        }
+        loop {
+            let left = until - unsafe { shim_alx_mono_ns() };
+            if left <= 0 {
+                return -etimedout;
+            }
+            if fds.iter().all(|f| f.fd < 0) {
+                unsafe { shim_alx_sleep_ns(left) };
+                continue;
+            }
+            let ms = ((left + 999_999) / 1_000_000) as i32;
+            let r = unsafe { poll(fds.as_mut_ptr(), fds.len() as std::ffi::c_ulong, ms) };
+            if r > 0 {
+                return 0;
+            }
+            if r < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.kind() != std::io::ErrorKind::Interrupted {
+                    return neg_errno(&e);
+                }
+            }
+        }
+    }
     pub unsafe fn shim_alx_fd_wait(fd: i64, mode: i64) -> i64 {
         // In slices: closing a descriptor in another thread doesn't wake a
         // poll on it (macOS), so check now and then that it's still open.

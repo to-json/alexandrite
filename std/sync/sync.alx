@@ -22,11 +22,12 @@
 #
 # How each maps onto the language:
 #  - `Lock` (Go's Mutex; the name Mutex is the language's own guarded-value
-#    lock) is a one-slot channel used as a semaphore: lock sends, unlock
-#    receives. Unlike the language's `Mutex[T].lock { }`, a Lock can be held
-#    across calls and released by another task, as Go's can. `with { }` holds
-#    it for a block. Waiting on it parks the task, so a self-deadlock is
-#    reported as "all tasks are asleep: deadlock", as in Go.
+#    lock) is a flag and a queue of parked waiters under a `Mutex`: unlock
+#    hands the lock to the first waiter (FIFO, Go's starvation mode). Unlike
+#    the language's `Mutex[T].lock { }`, a Lock can be held across calls and
+#    released by another task, as Go's can. `with { }` holds it for a block.
+#    Waiting on it parks the task, so a self-deadlock is reported as "all
+#    tasks are asleep: deadlock", as in Go.
 #  - WaitGroup, RWMutex, Cond and Once keep their counters in a `Mutex[...]`
 #    and park waiters on channels that are closed to wake them (a closed
 #    channel wakes every receiver: Go's runtime semaphores).
@@ -55,6 +56,24 @@
 #    "sync: runlock of unlocked RWMutex", "sync: unlock of unlocked
 #    RWMutex".
 #  - Go's Cond.L is `c.l`; Cond has no copy check (a copy is the same Cond).
+#  - Panics: a function that panics in `Once.do` still counts as run (Go's);
+#    once_func / once_value / once_values panic again on every later call,
+#    with "sync: the once function panicked" (Go re-panics with the
+#    original value; alx has no recover to keep it). A panic in a task that
+#    `WaitGroup.go` started makes `wait` panic with its message (Go's ends
+#    the process before Wait returns).
+#
+# Tests (sync_test.alx): Go's waitgroup, once, oncefunc, mutex, rwmutex,
+# cond, map, pool and example tests, translated; vec_map_test.alx holds
+# operation sequences run on Go's sync.Map. Not translated: TestSemaphore
+# (the runtime's semaphores), TestCondCopy (a copy is the same Cond: no
+# copy checker), TestMapMatchesHashTrieMap (an internal map),
+# TestIssue40999, TestMapRangeNoAllocations, TestMapClearOneAllocation,
+# TestPoolGC, TestPoolRelease, TestOnceXGC (garbage collection and
+# allocation counts), TestPoolDequeue / TestPoolChain (Go's internal
+# lock-free queues), TestNilPool and TestOnceFuncPanicNil (nil),
+# TestOnceFuncGoexit (runtime.Goexit), TestOnceFuncPanicTraceback (stack
+# traces), TestWaitGroupAlign (field alignment), the benchmarks.
 
 # Something that can be locked and unlocked (Go's Locker).
 pub interface Locker {
@@ -88,11 +107,17 @@ pub struct WaitGroup {
     add(-1)
   }
 
-  # Block (the task parks) until the count is 0.
+  # Block (the task parks) until the count is 0. If a task started by `go`
+  # panicked, `wait` panics with its message (Go's panic ends the process
+  # before Wait returns; Go issue 76126).
   pub def wait {
     ch = st.lock { |s| s.n == 0 ? none : s.ch }
     if c = ch {
       c.recv
+    }
+    why = st.lock { |s| s.panicked }
+    if m = why {
+      panic m
     }
   }
 
@@ -101,8 +126,14 @@ pub struct WaitGroup {
     add(1)
     g = f.dup
     wg = self
-    spawn {
-      g()
+    t = spawn { g() }
+    _ = spawn {
+      r = t.wait
+      if e = r.err {
+        m = e.message
+        m = m[13...m.size] if m.start_with?("alexandrite: ")
+        wg.st.lock { |s| s.panicked = m }
+      }
       wg.done
     }
   }
@@ -111,10 +142,12 @@ pub struct WaitGroup {
 struct WgState {
   n: Int
   ch: Chan[Bool]
+  # The message of a `go` task's panic.
+  panicked: Str?
 }
 
 pub def new_wait_group -> WaitGroup {
-  WaitGroup.new(st: Mutex.new(WgState.new(n: 0, ch: Chan[Bool].new)))
+  WaitGroup.new(st: Mutex.new(WgState.new(n: 0, ch: Chan[Bool].new, panicked: none)))
 }
 
 # ----------------------------------------------------------------------- Once
@@ -124,8 +157,16 @@ pub def new_wait_group -> WaitGroup {
 pub struct Once {
   st: Mutex[Bool]
 
-  # Run `f` unless it already ran; every caller returns after it has.
+  # Run `f` unless it already ran; every caller returns after it has. If f
+  # panics, the Once is done all the same (Go's): later calls return at
+  # once.
   pub def do(f: () -> Unit) {
+    m = st
+    if m.poisoned? {
+      # f panicked holding the lock: it ran.
+      m.clear_poison!
+      m.lock { |ran| ran = true }
+    }
     st.lock { |ran|
       if !ran {
         ran = true
@@ -135,7 +176,7 @@ pub struct Once {
   }
 
   pub def done? -> Bool {
-    st.lock { |ran| ran }
+    st.poisoned? || st.lock { |ran| ran }
   }
 }
 
@@ -155,6 +196,10 @@ pub def once_value[T](f: () -> T) -> () -> T {
   g = f.dup
   st = Mutex.new(OnceState[T].new(f: g, v: none))
   ->() -> T {
+    # f panicked (holding the lock): every later call panics too, as Go's
+    # OnceFunc/OnceValue/OnceValues re-panic (with this message: alx has no
+    # recover to keep Go's panic value).
+    panic "sync: the once function panicked" if st.poisoned?
     st.lock { |s|
       if v = s.v {
         v
@@ -181,32 +226,59 @@ pub def once_values[T, U](f: () -> (T, U)) -> () -> (T, U) {
 # ----------------------------------------------------------------------- Lock
 
 # A mutual-exclusion lock (Go's Mutex): `lock` / `unlock`, or `with { }`.
+# Waiters are served in arrival order: `unlock` hands the lock to the
+# longest waiting task (Go's starvation mode, always on), so a task that
+# keeps re-taking the lock can't starve another (Go's TestMutexFairness).
 pub struct Lock {
-  ch: Chan[Bool]
+  st: Mutex[LockState]
 
   # Acquire the lock, parking until it is free.
   pub def lock {
-    ch << true
+    wait = st.lock { |s|
+      if !s.locked {
+        s.locked = true
+        none
+      } else {
+        ch = Chan[Bool].new(1)
+        s.waiters << ch
+        ch
+      }
+    }
+    if ch = wait {
+      # Handed over by `unlock`: the lock is ours, still marked locked.
+      ch.recv
+    }
   }
 
-  # Release the lock. Unlocking an unlocked Lock panics.
+  # Release the lock (to the longest waiting task, if any). Unlocking an
+  # unlocked Lock panics.
   pub def unlock {
-    held = false
-    select {
-      when _ = ch.recv => held = true
-      else => held = false
+    r = st.lock { |s|
+      nobody: Chan[Bool]? = none
+      if !s.locked {
+        (true, nobody)
+      } elsif s.waiters.size == 0 {
+        s.locked = false
+        (false, nobody)
+      } else {
+        first: Chan[Bool]? = s.waiters[0]
+        s.waiters = s.waiters[1...s.waiters.size].dup
+        (false, first)
+      }
     }
-    panic "sync: unlock of unlocked mutex" if !held
+    panic "sync: unlock of unlocked mutex" if r[0]
+    if next_one = r[1] {
+      next_one << true
+    }
   }
 
   # Acquire the lock if it is free; report whether it was.
   pub def try_lock? -> Bool {
-    got = false
-    select {
-      when ch.send(true) => got = true
-      else => got = false
+    st.lock { |s|
+      ok = !s.locked
+      s.locked = true
+      ok
     }
-    got
   }
 
   # Run `f` holding the lock.
@@ -217,8 +289,15 @@ pub struct Lock {
   }
 }
 
+struct LockState {
+  locked: Bool
+  # Tasks parked in `lock`, first come first.
+  waiters: [Chan[Bool]]
+}
+
 pub def new_lock -> Lock {
-  Lock.new(ch: Chan[Bool].new(1))
+  ws: [Chan[Bool]] = []
+  Lock.new(st: Mutex.new(LockState.new(locked: false, waiters: ws)))
 }
 
 # -------------------------------------------------------------------- RWMutex

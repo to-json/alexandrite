@@ -1,0 +1,107 @@
+# Go's unixsock_linux_test.go, interface_linux_test.go (TestParseProcNet)
+# and error_posix_test.go, translated. The Linux tests return early
+# elsewhere.
+#
+# Not translated: TestInterfaceArrivalAndDeparture(ZoneCache) and the rest
+# of interface_linux_test.go (they create tunnel interfaces as root);
+# TestMaxAckBacklog (sock_linux_test.go: the kernel's somaxconn parsing of
+# Go's listen backlog; alx passes SOMAXCONN).
+
+import "time"
+
+test "UnixgramAutobind" {
+  return unless linux?
+  c1 = listen_unixgram("unixgram", UnixAddr.new(name: "", net: "unixgram")).unwrap
+  defer {
+    c1.close!
+  }
+  # The autobind address.
+  auto_addr = c1.local_addr
+  assert auto_addr.size > 1 && auto_addr[0] == 64, "invalid autobind address: #{auto_addr}"
+  c2 = dial_unix("unixgram", none, UnixAddr.new(name: auto_addr, net: "unixgram")).unwrap
+  defer {
+    c2.close!
+  }
+  assert_eq c2.remote_addr, c1.local_addr
+}
+
+test "UnixAutobindClose" {
+  return unless linux?
+  ln = listen_unix("unix", UnixAddr.new(name: "", net: "unix")).unwrap
+  ln.close!
+}
+
+# An abstract name starting with a NUL byte, as long as sun_path.
+test "UnixAbstractLongNameNulStart" {
+  return unless linux?
+  padded: [Byte] = [0; 108]
+  name = "abstract_test".bytes.to_a
+  for i in 0...name.size {
+    padded[i + 1] = name[i]
+  }
+  la = resolve_unix_addr("unix", Str.from_bytes(padded)).unwrap
+  c = listen_unix("unix", la).unwrap
+  c.close!
+}
+
+# An abstract name exactly as long as sun_path.
+test "UnixgramLinuxAbstractLongName" {
+  return unless linux? && testable_network?("unixgram")
+  addr_bytes: [Byte] = [0; 108]
+  name = "@abstract_test".bytes.to_a
+  for i in 0...name.size {
+    addr_bytes[i] = name[i]
+  }
+  addr = Str.from_bytes(addr_bytes)
+  la = resolve_unix_addr("unixgram", addr).unwrap
+  c = listen_unixgram("unixgram", la).unwrap
+  defer {
+    c.close!
+  }
+  data: [Byte] = [1, 2, 3, 4, 5]
+  # From an unbound socket (Go uses syscall.Sendto).
+  s = dial_unix("unixgram", none, UnixAddr.new(name: addr, net: "unixgram")).unwrap
+  s.write!(data).unwrap
+  s.close!
+  b: [Byte] = [0; 64]
+  c.set_read_deadline(time.now.add(time.millisecond * 100)).unwrap
+  n, from = c.read_from!(b).unwrap
+  assert !from.present?, "unexpected peer address: #{from.unwrap.to_s}"
+  assert_eq b[0...n], data
+}
+
+def igmp_interface_table -> [Str] { ["lo", "eth0", "eth1", "eth2", "eth0.100", "eth0.101", "eth0.102", "eth0.103", "device1tap2"] }
+
+test "ParseProcNet" {
+  ifmat4: [Addr] = []
+  for name in igmp_interface_table {
+    ifmat4 = ifmat4 + parse_proc_net_igmp("testdata/igmp", Interface.new(name: name))
+  }
+  assert_eq ifmat4.size, 14
+  ifmat6: [Addr] = []
+  for name in igmp_interface_table + ["pan0"] {
+    ifmat6 = ifmat6 + parse_proc_net_igmp6("testdata/igmp6", Interface.new(name: name))
+  }
+  assert_eq ifmat6.size, 18
+}
+
+def fd_failing(e: Error) -> ~NetFD { fail e }
+
+test "SpuriousENOTAVAIL" {
+  # Go's bare errno, os.SyscallError and OpError forms are all NetErrors
+  # here: with and without a system call name and an operation.
+  tests: [(Error, Bool)] = [
+    (op_error("", "", "", "", "", c("EADDRNOTAVAIL")), true),
+    (op_error("", "", "", "", "syscall", c("EADDRNOTAVAIL")), true),
+    (op_error("op", "", "", "", "", c("EADDRNOTAVAIL")), true),
+    (op_error("op", "", "", "", "syscall", c("EADDRNOTAVAIL")), true),
+    (op_error("", "", "", "", "", c("EINVAL")), false),
+    (op_error("", "", "", "", "syscall", c("EINVAL")), false),
+    (op_error("op", "", "", "", "", c("EINVAL")), false),
+    (op_error("op", "", "", "", "syscall", c("EINVAL")), false)
+  ]
+  for tt in tests {
+    e, ok = tt
+    assert spurious_enotavail?(fd_failing(e)) == ok, "spurious_enotavail?(#{e.message}) = #{!ok}; want #{ok}"
+  }
+}

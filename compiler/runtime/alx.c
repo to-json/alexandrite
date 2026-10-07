@@ -6,6 +6,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <setjmp.h>
 #include <signal.h>
 #include <sys/stat.h>
@@ -14,6 +15,9 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <stddef.h>
 
 /* ---------- memory ---------- */
 
@@ -1628,6 +1632,7 @@ struct AlxChan {
     bool slot_full, closed;
     uint64_t send_seq, taken_seq;  /* ticket of the slot's sender / last taken */
     int64_t recv_waiting, send_waiting;
+    int64_t plain_recv_waiting;    /* receivers in alx_chan_recv: they always take */
     WNode *w;                      /* parked senders / receivers / selects */
 };
 
@@ -1721,9 +1726,11 @@ bool alx_chan_recv(AlxChan *c, void *out) {
             return false;
         }
         c->recv_waiting++;
+        c->plain_recv_waiting++;
         if (c->send_waiting) wake(&c->w); /* a blocked select-sender may now proceed */
         bool ok = block_wait1(&c->w);
         c->recv_waiting--;
+        c->plain_recv_waiting--;
         if (!ok) deadlock();
     }
 }
@@ -1750,6 +1757,12 @@ static uint64_t rnd(void) {
     return tl_rng;
 }
 
+/* An unbuffered send in a select commits only with a receiver that takes
+ * the value: a receiver blocked in alx_chan_recv always does, so the value
+ * goes into the slot at once; a receiver blocked in a select may pick
+ * another case, so the value goes into the slot tentatively and the select
+ * parks until it is taken (the send case wins) or something else happens
+ * (the value is withdrawn and the cases are tried again). */
 int64_t alx_select(AlxSelCase *cs, int64_t n, bool has_default, const char *loc) {
     int64_t order[n ? n : 1];
     pthread_mutex_lock(&g_mu);
@@ -1760,26 +1773,46 @@ int64_t alx_select(AlxSelCase *cs, int64_t n, bool has_default, const char *loc)
             order[i] = order[j];
             order[j] = t;
         }
+        int64_t tentative = -1;
+        uint64_t ticket = 0;
         for (int64_t k = 0; k < n; k++) {
             int64_t i = order[k];
             AlxSelCase *s = &cs[i];
             if (s->is_send) {
-                if (s->ch->closed) {
+                AlxChan *c = s->ch;
+                if (c->closed) {
                     pthread_mutex_unlock(&g_mu);
                     alx_panic("send on a closed channel", loc);
                 }
-                if (try_put(s->ch, s->buf, true)) {
-                    wake(&s->ch->w);
-                    pthread_mutex_unlock(&g_mu);
-                    return i;
+                if (c->cap > 0 || c->plain_recv_waiting > 0) {
+                    if (try_put(c, s->buf, true)) {
+                        wake(&c->w);
+                        pthread_mutex_unlock(&g_mu);
+                        return i;
+                    }
+                } else if (tentative < 0 && !has_default && try_put(c, s->buf, true)) {
+                    tentative = i;
+                    ticket = c->send_seq;
+                    wake(&c->w);
                 }
             } else if (try_take(s->ch, s->buf)) {
                 s->ok = 1;
                 wake(&s->ch->w);
+                if (tentative >= 0) {
+                    /* Withdraw the tentative send: this case won. */
+                    AlxChan *tc = cs[tentative].ch;
+                    tc->slot_full = false;
+                    tc->send_seq--;
+                }
                 pthread_mutex_unlock(&g_mu);
                 return i;
             } else if (s->ch->closed) {
                 s->ok = 0;
+                if (tentative >= 0) {
+                    AlxChan *tc = cs[tentative].ch;
+                    tc->slot_full = false;
+                    tc->send_seq--;
+                }
                 pthread_mutex_unlock(&g_mu);
                 return i;
             }
@@ -1806,6 +1839,18 @@ int64_t alx_select(AlxSelCase *cs, int64_t n, bool has_default, const char *loc)
         for (int64_t i = 0; i < n; i++) {
             if (cs[i].is_send) cs[i].ch->send_waiting--;
             else cs[i].ch->recv_waiting--;
+        }
+        if (tentative >= 0) {
+            AlxChan *tc = cs[tentative].ch;
+            if (tc->taken_seq >= ticket) {
+                pthread_mutex_unlock(&g_mu);
+                return tentative;
+            }
+            /* Not taken (yet): withdraw it and look at every case again. */
+            if (tc->slot_full && tc->send_seq == ticket) {
+                tc->slot_full = false;
+                tc->send_seq--;
+            }
         }
         if (!ok) deadlock();
     }
@@ -1905,7 +1950,9 @@ const char *alx_argv(int64_t i) { return i >= 0 && i < g_argc ? g_argv[i] : NULL
 
 /* A task asleep parks on a deadline-ordered list; one timer thread wakes
  * each at its deadline. A plain thread (main) just sleeps. */
-typedef struct Timer { int64_t at; Parker *p; struct Timer *next; } Timer;
+/* keep: an fd wait's timer (alx_fd_wait_until); the timer thread marks it
+ * fired instead of freeing it, and the waiter frees it. */
+typedef struct Timer { int64_t at; Parker *p; struct Timer *next; bool keep, fired; } Timer;
 static Timer *g_timers;
 static pthread_cond_t g_tcv = PTHREAD_COND_INITIALIZER;
 static bool g_timer_thread;
@@ -1927,7 +1974,12 @@ static void *timer_main(void *arg) {
             /* Wait until the earliest deadline (or an earlier one arrives). */
             struct timespec rt;
             clock_gettime(CLOCK_REALTIME, &rt);
-            int64_t until = (int64_t)rt.tv_sec * 1000000000 + rt.tv_nsec + (g_timers->at - now);
+            /* At most a day at a time: a far deadline (a huge sleep) would
+             * overflow the absolute time, and an overflowed one returns at
+             * once, spinning this thread. */
+            int64_t wait = g_timers->at - now;
+            if (wait > 86400 * (int64_t)1000000000) wait = 86400 * (int64_t)1000000000;
+            int64_t until = (int64_t)rt.tv_sec * 1000000000 + rt.tv_nsec + wait;
             struct timespec dl = { (time_t)(until / 1000000000), (long)(until % 1000000000) };
             pthread_cond_timedwait(&g_tcv, &g_mu, &dl);
             continue;
@@ -1936,10 +1988,13 @@ static void *timer_main(void *arg) {
         g_timers = t->next;
         g_sleepers--;
         unpark(t->p);
-        free(t);
+        if (t->keep) t->fired = true;
+        else free(t);
     }
     return NULL;
 }
+
+static void timer_add(Timer *t);
 
 void alx_sleep_ns(int64_t ns) {
     if (ns <= 0) return;
@@ -1949,11 +2004,21 @@ void alx_sleep_ns(int64_t ns) {
         return;
     }
     Parker *p = cur_pk();
-    Timer *t = malloc(sizeof *t);
+    Timer *t = calloc(1, sizeof *t);
     if (!t) alx_panic("out of memory", "runtime");
-    t->at = mono_ns() + ns;
+    int64_t now = mono_ns();
+    t->at = ns > INT64_MAX - now ? INT64_MAX : now + ns; /* saturate: time.sleep(max Duration) */
     t->p = p;
     pthread_mutex_lock(&g_mu);
+    timer_add(t);
+    p->parked = true; p->dead = false;
+    if (p->counted) g_runnable--;
+    pthread_mutex_unlock(&g_mu);
+    sw_out(p->task, false);
+}
+
+/* Queue t on the timer list (g_mu held); it counts as a sleeper. */
+static void timer_add(Timer *t) {
     if (!g_timer_thread) {
         pthread_t th;
         pthread_attr_t at;
@@ -1969,10 +2034,12 @@ void alx_sleep_ns(int64_t ns) {
     *pp = t;
     if (g_timers == t) pthread_cond_signal(&g_tcv);
     g_sleepers++;
-    p->parked = true; p->dead = false;
-    if (p->counted) g_runnable--;
-    pthread_mutex_unlock(&g_mu);
-    sw_out(p->task, false);
+}
+
+/* Take t off the timer list if it's still there (g_mu held). */
+static void timer_cancel(Timer *t) {
+    for (Timer **pp = &g_timers; *pp; pp = &(*pp)->next)
+        if (*pp == t) { *pp = t->next; g_sleepers--; return; }
 }
 
 /* ---------- clocks (time) ---------- */
@@ -2038,7 +2105,18 @@ AlxStr alx_strerror(int64_t n) {
     return s;
 }
 
-int32_t alx_sys_open(const char *path, int32_t flags, int32_t mode) { return open(path, flags, (mode_t)mode); }
+/* open(2). In a task, opening a FIFO without O_NONBLOCK waits for the other
+ * end: that runs on a helper thread while the task parks (port-issues #166),
+ * so the task that opens the other end can run. */
+static int32_t open_on_helper(const char *path, int32_t flags, int32_t mode);
+static bool in_task(void);
+int32_t alx_sys_open(const char *path, int32_t flags, int32_t mode) {
+    if (!(flags & O_NONBLOCK) && in_task()) {
+        struct stat st;
+        if (stat(path, &st) == 0 && S_ISFIFO(st.st_mode)) return open_on_helper(path, flags, mode);
+    }
+    return open(path, flags, (mode_t)mode);
+}
 int32_t alx_sys_fcntl(int32_t fd, int32_t cmd, int64_t arg) { return fcntl(fd, cmd, (long)arg); }
 
 typedef struct { const char *name; int64_t val; } SysConst;
@@ -2063,10 +2141,36 @@ static const SysConst sys_consts[] = {
     SC(CLOCK_REALTIME) SC(CLOCK_MONOTONIC)
     SC(O_NOFOLLOW) SC(EINPROGRESS) SC(ENOTSUP) SC(EOVERFLOW) SC(ETXTBSY) SC(EDQUOT) SC(ESTALE) SC(ENOBUFS)
     SC(ECONNABORTED) SC(ENOTCONN) SC(EHOSTUNREACH) SC(ENETUNREACH) SC(EADDRNOTAVAIL) SC(EAFNOSUPPORT)
+    SC(EPROTOTYPE) SC(EOPNOTSUPP) SC(ENOPROTOOPT) SC(EPROTONOSUPPORT) SC(ENOTSOCK) SC(EISCONN) SC(EALREADY)
+    SC(EDESTADDRREQ) SC(EMSGSIZE) SC(ENETDOWN) SC(ENETRESET) SC(EHOSTDOWN) SC(ESHUTDOWN)
+    /* Socket constants (the Rust oracle's socket shims read them from here). */
+    SC(AF_UNIX) SC(AF_INET) SC(AF_INET6) SC(SOCK_STREAM) SC(SOCK_DGRAM) SC(SOCK_RAW) SC(SOCK_SEQPACKET)
+    SC(SOL_SOCKET) SC(IPPROTO_IP) SC(IPPROTO_IPV6) SC(IPPROTO_TCP) SC(MSG_PEEK) SC(MSG_OOB)
+    SC(SO_REUSEADDR) SC(SO_BROADCAST) SC(SO_KEEPALIVE) SC(SO_RCVBUF) SC(SO_SNDBUF) SC(SO_ERROR) SC(SO_TYPE) SC(SO_LINGER)
+    SC(TCP_NODELAY) SC(IPV6_V6ONLY) SC(IP_TTL) SC(IP_TOS) SC(IP_MULTICAST_TTL) SC(IP_MULTICAST_LOOP)
+    SC(IPV6_UNICAST_HOPS) SC(IPV6_MULTICAST_HOPS) SC(IPV6_MULTICAST_LOOP) SC(IPV6_MULTICAST_IF)
+#ifdef SO_REUSEPORT
+    SC(SO_REUSEPORT)
+#endif
+#ifdef SO_NOSIGPIPE
+    SC(SO_NOSIGPIPE)
+#endif
+#ifdef TCP_KEEPIDLE
+    SC(TCP_KEEPIDLE)
+#else
+    { "TCP_KEEPIDLE", (int64_t)TCP_KEEPALIVE },
+#endif
+#ifdef TCP_KEEPINTVL
+    SC(TCP_KEEPINTVL)
+#endif
+#ifdef TCP_KEEPCNT
+    SC(TCP_KEEPCNT)
+#endif
     SC(S_ISUID) SC(S_ISGID) SC(S_ISVTX) SC(S_IRGRP) SC(S_IWGRP) SC(S_IXGRP) SC(S_IROTH) SC(S_IWOTH) SC(S_IXOTH)
     SC(SIGHUP) SC(SIGINT) SC(SIGQUIT) SC(SIGILL) SC(SIGTRAP) SC(SIGABRT) SC(SIGFPE) SC(SIGKILL) SC(SIGUSR1)
     SC(SIGSEGV) SC(SIGUSR2) SC(SIGALRM) SC(SIGTERM) SC(SIGCHLD) SC(SIGCONT) SC(SIGSTOP) SC(SIGTSTP) SC(SIGTTIN)
     SC(SIGTTOU) SC(SIGURG) SC(SIGXCPU) SC(SIGXFSZ) SC(SIGVTALRM) SC(SIGPROF) SC(SIGWINCH) SC(SIGIO) SC(SIGSYS)
+    SC(UTIME_OMIT) SC(AT_FDCWD) SC(AT_SYMLINK_NOFOLLOW) SC(PIPE_BUF) SC(AT_REMOVEDIR)
 };
 #undef SC
 
@@ -2086,13 +2190,16 @@ int64_t alx_sys_const(const char *name) {
 #ifdef __APPLE__
 #define ALX_MTIME_NS(st) ((int64_t)(st).st_mtimespec.tv_sec * 1000000000 + (st).st_mtimespec.tv_nsec)
 #define ALX_ATIME_NS(st) ((int64_t)(st).st_atimespec.tv_sec * 1000000000 + (st).st_atimespec.tv_nsec)
+#define ALX_CTIME_NS(st) ((int64_t)(st).st_ctimespec.tv_sec * 1000000000 + (st).st_ctimespec.tv_nsec)
 #else
 #define ALX_MTIME_NS(st) ((int64_t)(st).st_mtim.tv_sec * 1000000000 + (st).st_mtim.tv_nsec)
 #define ALX_ATIME_NS(st) ((int64_t)(st).st_atim.tv_sec * 1000000000 + (st).st_atim.tv_nsec)
+#define ALX_CTIME_NS(st) ((int64_t)(st).st_ctim.tv_sec * 1000000000 + (st).st_ctim.tv_nsec)
 #endif
 
 static void stat_out(const struct stat *st, uint8_t *out) {
-    int64_t v[ALX_STAT_FIELDS] = { (int64_t)st->st_mode, (int64_t)st->st_size, ALX_MTIME_NS(*st), ALX_ATIME_NS(*st), (int64_t)st->st_ino, (int64_t)st->st_nlink };
+    int64_t v[ALX_STAT_FIELDS] = { (int64_t)st->st_mode, (int64_t)st->st_size, ALX_MTIME_NS(*st), ALX_ATIME_NS(*st), (int64_t)st->st_ino, (int64_t)st->st_nlink,
+                                   (int64_t)st->st_dev, (int64_t)st->st_uid, (int64_t)st->st_gid, (int64_t)st->st_rdev, ALX_CTIME_NS(*st) };
     memcpy(out, v, sizeof v);
 }
 
@@ -2135,6 +2242,17 @@ const char *alx_sys_dir_next(int64_t h, uint8_t *kind) {
     return NULL;
 }
 
+/* A directory handle over an open descriptor (a duplicate of it: closing the
+ * handle leaves fd open), or -errno (ENOTDIR for a file that isn't one). */
+int64_t alx_sys_dir_fdopen(int64_t fd) {
+    int d = dup((int)fd);
+    if (d < 0) return -(int64_t)errno;
+    fcntl(d, F_SETFD, FD_CLOEXEC);
+    DIR *dir = fdopendir(d);
+    if (!dir) { int e = errno; close(d); return -(int64_t)e; }
+    return (int64_t)(intptr_t)dir;
+}
+
 void alx_sys_dir_close(int64_t h) { closedir((DIR *)(intptr_t)h); }
 
 /* environ[i], NULL past the end. */
@@ -2144,6 +2262,25 @@ const char *alx_environ(int64_t i) {
     for (int64_t k = 0; k <= i; k++)
         if (!environ[k]) return NULL;
     return environ[i];
+}
+
+/* The running executable's path into out (n bytes): its length, or -errno
+ * (Go's os.Executable: /proc/self/exe on Linux, the loader's path on macOS). */
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
+int64_t alx_sys_executable(uint8_t *out, int64_t n) {
+#ifdef __APPLE__
+    uint32_t size = (uint32_t)n;
+    if (_NSGetExecutablePath((char *)out, &size) != 0) return -ENAMETOOLONG;
+    return (int64_t)strlen((const char *)out);
+#else
+    ssize_t r = readlink("/proc/self/exe", (char *)out, (size_t)n);
+    if (r < 0) return -errno;
+    if (r >= n) return -ENAMETOOLONG;
+    out[r] = 0;
+    return r;
+#endif
 }
 
 /* ---------- processes (std os/exec) ---------- */
@@ -2234,6 +2371,62 @@ int64_t alx_sys_pipe(uint8_t *out, int64_t nonblock) {
     int64_t v[2] = { p[0], p[1] };
     memcpy(out, v, sizeof v);
     return 0;
+}
+
+/* Like alx_sys_spawn, with the program's path apart from argv[0] (no $PATH
+ * search: a relative path is relative to this process's directory) and any
+ * number of descriptors: fds (nfds native-endian int64s) become the child's
+ * 0, 1, 2, 3, ...; -1 is inherited for 0-2 and closed above (Go's
+ * ProcAttr.Files / Cmd.ExtraFiles). The pid, or -errno. */
+int64_t alx_sys_spawn2(const char *path, const uint8_t *argv, int64_t argc, const uint8_t *env, int64_t envc,
+                       const char *dir, const uint8_t *fdblob, int64_t nfds) {
+    char **av = nul_list(argv, argc);
+    char **ev = envc >= 0 ? nul_list(env, envc) : environ;
+    if (!av || !ev) return -ENOMEM;
+    int64_t *fds = malloc(sizeof(int64_t) * (size_t)(nfds ? nfds : 1));
+    int *hi = malloc(sizeof(int) * (size_t)(nfds ? nfds : 1));
+    if (!fds || !hi) return -ENOMEM;
+    memcpy(fds, fdblob, sizeof(int64_t) * (size_t)nfds);
+    /* Each source first moves above every target number, so dup2(src, i)
+     * never overwrites a source still needed (and src == i still clears
+     * close-on-exec). */
+    int floor = (int)nfds + 3;
+    int rc = 0;
+    for (int64_t i = 0; i < nfds; i++) {
+        hi[i] = -1;
+        if (fds[i] >= 0) {
+            hi[i] = fcntl((int)fds[i], F_DUPFD_CLOEXEC, floor);
+            if (hi[i] < 0) { rc = errno; break; }
+        }
+    }
+    pid_t pid = 0;
+    if (!rc) {
+        posix_spawn_file_actions_t fa;
+        posix_spawn_file_actions_init(&fa);
+        for (int64_t i = 0; i < nfds; i++) {
+            if (hi[i] >= 0) posix_spawn_file_actions_adddup2(&fa, hi[i], (int)i);
+            else if (i > 2) posix_spawn_file_actions_addclose(&fa, (int)i);
+        }
+        if (dir && dir[0]) posix_spawn_file_actions_addchdir_np(&fa, dir);
+        posix_spawnattr_t at;
+        posix_spawnattr_init(&at);
+        sigset_t none, all;
+        sigemptyset(&none);
+        sigfillset(&all);
+        posix_spawnattr_setsigmask(&at, &none);
+        posix_spawnattr_setsigdefault(&at, &all);
+        posix_spawnattr_setflags(&at, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF);
+        rc = posix_spawn(&pid, path, &fa, &at, av, ev);
+        posix_spawn_file_actions_destroy(&fa);
+        posix_spawnattr_destroy(&at);
+    }
+    for (int64_t i = 0; i < nfds; i++)
+        if (hi[i] >= 0) close(hi[i]);
+    free(hi);
+    free(fds);
+    free(av);
+    if (envc >= 0) free(ev);
+    return rc ? -(int64_t)rc : (int64_t)pid;
 }
 
 int64_t alx_sys_exec(const uint8_t *argv, int64_t argc, const uint8_t *env, int64_t envc, const char *dir,
@@ -2616,11 +2809,14 @@ static bool poller_start(void) {
 }
 
 /* Park the current task until one of fds[i] is ready for modes[i] (1 read,
- * 2 write), has an error or hung up. Negative fds are skipped. Each fd gets
- * its own one-shot registration; whichever fires first wakes the task, and
- * the others are withdrawn here (a late event for one finds nothing). 0, or
- * -errno if an fd can't be polled. In a task only. */
-static int64_t fd_wait_task(const int *fds, const int *modes, int n) {
+ * 2 write), has an error or hung up, or (until > 0) the monotonic clock
+ * reaches `until`. Negative fds are skipped. Each fd gets its own one-shot
+ * registration; whichever fires first wakes the task, and the others (and
+ * the timer) are withdrawn here (a late event for one finds nothing). 0,
+ * -ETIMEDOUT if only the timer fired, or -errno if an fd can't be polled.
+ * In a task only. */
+static int64_t fd_wait_task(const int *fds, const int *modes, int n, int64_t until) {
+    if (until > 0 && mono_ns() >= until) return -ETIMEDOUT;
     IoWait *ws = calloc((size_t)(n ? n : 1), sizeof *ws);
     if (!ws) alx_panic("out of memory", "runtime");
     Parker *p = cur_pk();
@@ -2646,38 +2842,80 @@ static int64_t fd_wait_task(const int *fds, const int *modes, int n) {
         }
     }
     if (k == 0) { pthread_mutex_unlock(&g_mu); free(ws); return 0; }
+    Timer *t = NULL;
+    if (until > 0) {
+        t = calloc(1, sizeof *t);
+        if (!t) alx_panic("out of memory", "runtime");
+        t->at = until; t->p = p; t->keep = true;
+        timer_add(t);
+    }
     g_sleepers += k;
     p->parked = true; p->dead = false;
     if (p->counted) g_runnable--;
     pthread_mutex_unlock(&g_mu);
     sw_out(p->task, false);
-    if (k > 1) {
-        /* Withdraw the registrations that didn't fire. */
+    int fired = 0;
+    if (k > 1 || t) {
+        /* Withdraw the registrations that didn't fire, and the timer. */
         pthread_mutex_lock(&g_mu);
         for (int j = 0; j < k; j++) {
             IoWait **pp = IOW_B(ws[j].fd);
             while (*pp && *pp != &ws[j]) pp = &(*pp)->next;
-            if (*pp) { *pp = ws[j].next; g_sleepers--; }
+            if (*pp) { *pp = ws[j].next; g_sleepers--; } else fired++;
         }
+        if (t && !t->fired) timer_cancel(t);
         pthread_mutex_unlock(&g_mu);
     }
+    int64_t r = t && t->fired && fired == 0 ? -ETIMEDOUT : 0;
+    free(t);
     free(ws);
-    return 0;
+    return r;
+}
+
+/* poll(2) for a plain thread: until (monotonic ns, 0 = none). 0, -ETIMEDOUT
+ * or -errno. */
+static int64_t fd_poll_until(struct pollfd *pf, int n, int64_t until) {
+    for (;;) {
+        int ms = -1;
+        if (until > 0) {
+            int64_t left = until - mono_ns();
+            if (left <= 0) return -ETIMEDOUT;
+            ms = (int)((left + 999999) / 1000000);
+        }
+        int r = poll(pf, (nfds_t)n, ms);
+        if (r > 0) return 0;
+        if (r == 0) continue;
+        if (errno != EINTR) return -errno;
+    }
 }
 
 /* Wait until fd is readable (mode 1) or writable (mode 2), or has an error or
  * hung up (the caller retries its syscall and sees which). Parks the task;
  * outside a task it blocks in poll(2). 0, or -errno if the fd can't be polled. */
 int64_t alx_fd_wait(int64_t fd, int64_t mode) {
+    return alx_fd_wait_until(fd, mode, 0);
+}
+
+/* alx_fd_wait that gives up when the monotonic clock (alx_mono_ns) reaches
+ * `until` (0: never): -ETIMEDOUT then. Go's deadlines on network
+ * connections. */
+int64_t alx_fd_wait_until(int64_t fd, int64_t mode, int64_t until) {
     if (!tl_task) {
         struct pollfd pf;
         pf.fd = (int)fd; pf.events = mode == 1 ? POLLIN : POLLOUT; pf.revents = 0;
-        while (poll(&pf, 1, -1) < 0)
-            if (errno != EINTR) return -errno;
-        return 0;
+        return fd_poll_until(&pf, 1, until);
     }
     int f = (int)fd, m = (int)mode;
-    return fd_wait_task(&f, &m, 1);
+    return fd_wait_task(&f, &m, 1, until);
+}
+
+/* Wakes every task waiting on fd without closing it (they retry: a changed
+ * deadline takes effect at once). */
+int64_t alx_fd_wake(int64_t fd) {
+    pthread_mutex_lock(&g_mu);
+    iow_wake((int)fd, 0);
+    pthread_mutex_unlock(&g_mu);
+    return 0;
 }
 
 /* Wait until a or b (-1: none) is readable or hung up. A task parks, so its
@@ -2687,12 +2925,41 @@ int64_t alx_fd_wait(int64_t fd, int64_t mode) {
 int64_t alx_sys_poll2(int64_t a, int64_t b) {
     if (tl_task) {
         int fds[2] = { (int)a, (int)b }, modes[2] = { 1, 1 };
-        return fd_wait_task(fds, modes, 2);
+        return fd_wait_task(fds, modes, 2, 0);
     }
     struct pollfd pf[2] = { { (int)a, POLLIN, 0 }, { (int)b, POLLIN, 0 } };
     while (poll(pf, 2, -1) < 0)
         if (errno != EINTR) return -errno;
     return 0;
+}
+
+/* Wait until one of n descriptors is ready: blob holds n (fd, mode) int64
+ * pairs, mode 1 read / 2 write (negative fds are skipped). A task parks on
+ * the poller; a plain thread poll(2)s. 0 or -errno. */
+int64_t alx_sys_polln(const uint8_t *blob, int64_t n) {
+    int *fds = malloc(sizeof(int) * (size_t)(n ? n : 1));
+    int *modes = malloc(sizeof(int) * (size_t)(n ? n : 1));
+    if (!fds || !modes) alx_panic("out of memory", "runtime");
+    for (int64_t i = 0; i < n; i++) {
+        int64_t v[2];
+        memcpy(v, blob + 16 * i, 16);
+        fds[i] = (int)v[0];
+        modes[i] = (int)v[1];
+    }
+    int64_t r = 0;
+    if (tl_task) {
+        r = fd_wait_task(fds, modes, (int)n, 0);
+    } else {
+        struct pollfd *pf = calloc((size_t)(n ? n : 1), sizeof *pf);
+        if (!pf) alx_panic("out of memory", "runtime");
+        for (int64_t i = 0; i < n; i++) { pf[i].fd = fds[i]; pf[i].events = modes[i] == 1 ? POLLIN : POLLOUT; }
+        while (poll(pf, (nfds_t)n, -1) < 0)
+            if (errno != EINTR) { r = -errno; break; }
+        free(pf);
+    }
+    free(fds);
+    free(modes);
+    return r;
 }
 
 /* wait4(2) from a task: a helper thread blocks in it while the task parks
@@ -2763,6 +3030,238 @@ int64_t alx_fd_close(int64_t fd) {
 #endif
     pthread_mutex_unlock(&g_mu);
     return close((int)fd) == 0 ? 0 : -errno;
+}
+
+/* ---------- reads and writes that may block (std os, port-issues #166) ----------
+ * A task must not block its worker in read(2)/write(2) on a pipe, a FIFO, a
+ * terminal or a socket that isn't ready: the tasks pinned to that worker
+ * would stop with it (as exec's poll and wait4 did, #154). So, in a task:
+ *   - a non-blocking fd: the call, and on EAGAIN a park on the poller;
+ *   - a blocking fd that poll(2) says isn't ready: a park on the poller
+ *     until it is (then the call doesn't block: a read returns what's there;
+ *     a write to a pipe is cut to PIPE_BUF bytes, which a writable pipe
+ *     always takes; a socket is written with MSG_DONTWAIT);
+ *   - an fd the poller refuses: the call runs on a helper thread while the
+ *     task parks.
+ * Regular files and directories are always "ready" (as in Go: disk I/O isn't
+ * polled). Outside a task the call simply blocks (EAGAIN on a non-blocking fd
+ * poll(2)s and retries). A second reader racing for the same bytes can still
+ * block a worker between the readiness check and the read. */
+
+/* For mode 1 read / 2 write: 1 ready now (or in error: the call will say),
+ * 0 not ready, -1 poll(2) can't tell (macOS answers POLLNVAL for a named
+ * FIFO, and its kqueue misses the FIFO's end of file): the caller then makes
+ * the call on a helper thread. */
+static int fd_ready_now(int fd, int mode) {
+    struct pollfd pf;
+    pf.fd = fd; pf.events = mode == 1 ? POLLIN : POLLOUT; pf.revents = 0;
+    int r;
+    while ((r = poll(&pf, 1, 0)) < 0 && errno == EINTR) {}
+    if (r > 0 && (pf.revents & POLLNVAL)) return -1;
+    return r != 0;
+}
+
+typedef struct IoJob {
+    int fd, err, op; /* op: 0 read, 1 write, 2 open (path, flags, mode) */
+    int flags, mode;
+    char *path;
+    bool done, waiting;
+    uint8_t *buf;
+    size_t n;
+    ssize_t r;
+    Parker *p;
+} IoJob;
+
+static void *io_job_main(void *arg) {
+    IoJob *j = arg;
+    tl_uncounted = true;
+    ssize_t r;
+    do r = j->op == 2 ? open(j->path, j->flags, (mode_t)j->mode) : j->op == 1 ? write(j->fd, j->buf, j->n) : read(j->fd, j->buf, j->n);
+    while (r < 0 && errno == EINTR);
+    int err = r < 0 ? errno : 0;
+    pthread_mutex_lock(&g_mu);
+    j->r = r;
+    j->err = err;
+    j->done = true;
+    if (j->waiting) { j->waiting = false; g_sleepers--; unpark(j->p); }
+    pthread_mutex_unlock(&g_mu);
+    return NULL;
+}
+
+/* The call on a helper thread while the task parks. The bytes go through a
+ * heap copy: the task's stack may be another task's while it is parked. */
+static int64_t io_job_run(IoJob *j);
+static int64_t io_on_helper(int fd, bool wr, uint8_t *buf, int64_t n) {
+    IoJob *j = calloc(1, sizeof *j);
+    uint8_t *tmp = malloc(n > 0 ? (size_t)n : 1);
+    if (!j || !tmp) alx_panic("out of memory", "runtime");
+    if (wr && n > 0) memcpy(tmp, buf, (size_t)n);
+    j->fd = fd; j->op = wr ? 1 : 0; j->buf = tmp; j->n = (size_t)n;
+    int64_t r = io_job_run(j);
+    if (!wr && r > 0) memcpy(buf, tmp, (size_t)r);
+    free(tmp);
+    free(j);
+    return r;
+}
+
+static bool in_task(void) { return tl_task != NULL; }
+
+/* open(2) on a helper thread: the fd, or -1 with errno set. */
+static int32_t open_on_helper(const char *path, int32_t flags, int32_t mode) {
+    IoJob *j = calloc(1, sizeof *j);
+    char *pc = strdup(path);
+    if (!j || !pc) alx_panic("out of memory", "runtime");
+    j->op = 2; j->path = pc; j->flags = flags; j->mode = mode;
+    int64_t r = io_job_run(j);
+    free(pc);
+    free(j);
+    if (r < 0) { errno = (int)-r; return -1; }
+    return (int32_t)r;
+}
+
+/* Runs j on a new helper thread, the task parked until it's done: the
+ * result, or -errno. */
+static int64_t io_job_run(IoJob *j) {
+    j->p = cur_pk();
+    pthread_t th;
+    pthread_attr_t at;
+    pthread_attr_init(&at);
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    pthread_attr_setstacksize(&at, 64 << 10);
+    int rc = pthread_create(&th, &at, io_job_main, j);
+    pthread_attr_destroy(&at);
+    if (rc != 0) return -(int64_t)rc;
+    pthread_mutex_lock(&g_mu);
+    while (!j->done) {
+        Parker *p = j->p;
+        j->waiting = true;
+        g_sleepers++;
+        p->parked = true; p->dead = false;
+        if (p->counted) g_runnable--;
+        pthread_mutex_unlock(&g_mu);
+        sw_out(p->task, false);
+        pthread_mutex_lock(&g_mu);
+    }
+    pthread_mutex_unlock(&g_mu);
+    return j->r < 0 ? -(int64_t)j->err : (int64_t)j->r;
+}
+
+/* In a task, a blocking fd that isn't ready: park until it is. 0 = retry the
+ * check; 1 = the poller can't watch it (use a helper thread). */
+static int park_until_ready(int fd, int mode) {
+    int f = fd, m = mode;
+    return fd_wait_task(&f, &m, 1, 0) < 0 ? 1 : 0;
+}
+
+/* A task whose reads or writes never wait (its peer keeps up) would never
+ * leave its worker: every 16th call lets the tasks queued there run (as a
+ * select with a default does). */
+static void io_fair(void) {
+    static _Thread_local unsigned calls;
+    if (tl_task && (++calls & 15) == 0) alx_task_yield();
+}
+
+/* A named FIFO on macOS: neither poll(2) nor kqueue ever reports its end of
+ * file (the last writer gone), so a read that would wait runs on a helper
+ * thread. (An anonymous pipe has no links.) */
+static bool named_fifo(int fd) {
+#ifdef __APPLE__
+    struct stat st;
+    return fstat(fd, &st) == 0 && S_ISFIFO(st.st_mode) && st.st_nlink > 0;
+#else
+    (void)fd;
+    return false;
+#endif
+}
+
+/* read(2): the count (0 at the end), or -errno. */
+int64_t alx_sys_read(int64_t fd, uint8_t *buf, int64_t n) {
+    bool woken = false;
+    int64_t backoff_ns = 1000000;
+    for (;;) {
+        if (tl_task && n > 0) {
+            int fl = fcntl((int)fd, F_GETFL);
+            if (fl >= 0 && !(fl & O_NONBLOCK)) {
+                int ready = fd_ready_now((int)fd, 1);
+                /* Woken by the poller but poll(2) still says no: an end of
+                 * file it doesn't report (macOS FIFOs). */
+                if (ready < 0 || (!ready && woken) || (!ready && named_fifo((int)fd))) return io_on_helper((int)fd, false, buf, n);
+                if (!ready) {
+                    woken = true;
+                    if (park_until_ready((int)fd, 1)) return io_on_helper((int)fd, false, buf, n);
+                    continue;
+                }
+            }
+        }
+        ssize_t r = read((int)fd, buf, (size_t)n);
+        if (r >= 0) { io_fair(); return r; }
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (named_fifo((int)fd)) {
+                /* Nothing would report the FIFO's end: look again soon (a
+                 * read at the end returns 0, not EAGAIN). */
+                alx_sleep_ns(backoff_ns);
+                if (backoff_ns < 20000000) backoff_ns *= 2;
+                continue;
+            }
+            int64_t w = alx_fd_wait(fd, 1);
+            if (w < 0) return w;
+            continue;
+        }
+        return -errno;
+    }
+}
+
+/* SIGPIPE, Go's way: a write to a broken pipe or socket fails with EPIPE,
+ * except on stdout and stderr, where SIGPIPE ends the program (as it would
+ * without the program's help). So SIGPIPE is ignored once anything else is
+ * written, and a broken stdout/stderr raises it with the default action. */
+static bool g_sigpipe_ignored;
+static void io_sigpipe_ignore(void) { signal(SIGPIPE, SIG_IGN); g_sigpipe_ignored = true; }
+static void io_epipe(int64_t fd) {
+    if (fd != 1 && fd != 2) return;
+    struct sigaction sa;
+    if (sigaction(SIGPIPE, NULL, &sa) == 0 && sa.sa_handler == SIG_IGN && g_sigpipe_ignored)
+        signal(SIGPIPE, SIG_DFL);
+    raise(SIGPIPE);
+}
+
+/* write(2): the count written (maybe fewer than n: callers loop), or -errno. */
+int64_t alx_sys_write(int64_t fd, const uint8_t *buf, int64_t n) {
+    if (fd > 2) {
+        static pthread_once_t once = PTHREAD_ONCE_INIT;
+        pthread_once(&once, io_sigpipe_ignore);
+    }
+    bool woken = false;
+    for (;;) {
+        size_t len = (size_t)n;
+        bool sock = false;
+        if (tl_task && n > 0) {
+            int fl = fcntl((int)fd, F_GETFL);
+            struct stat st;
+            if (fl >= 0 && !(fl & O_NONBLOCK) && fstat((int)fd, &st) == 0 && (S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode))) {
+                int ready = fd_ready_now((int)fd, 2);
+                if (ready < 0 || (!ready && woken)) return io_on_helper((int)fd, true, (uint8_t *)buf, n);
+                if (!ready) {
+                    woken = true;
+                    if (park_until_ready((int)fd, 2)) return io_on_helper((int)fd, true, (uint8_t *)buf, n);
+                    continue;
+                }
+                if (S_ISSOCK(st.st_mode)) sock = true;
+                else if (len > PIPE_BUF) len = PIPE_BUF;
+            }
+        }
+        ssize_t r = sock ? send((int)fd, buf, len, MSG_DONTWAIT) : write((int)fd, buf, len);
+        if (r >= 0) { io_fair(); return r; }
+        if (errno == EINTR) continue;
+        if (errno == EPIPE) { io_epipe(fd); return -EPIPE; }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            int64_t w = alx_fd_wait(fd, 2);
+            if (w < 0) return w;
+            continue;
+        }
+        return -errno;
+    }
 }
 
 /* ---------- sockets ---------- */
@@ -2983,4 +3482,605 @@ int64_t alx_sock_recvfrom(int64_t fd, uint8_t *buf, int64_t n, uint8_t *out) {
     if (len == 0) ss.ss_family = AF_UNIX; /* an unbound unixgram sender */
     sock_fmt(&ss, out);
     return (int64_t)r;
+}
+
+/* ---------- sockets, the general layer (std net) ----------
+ * std/net does what Go's net does on top of system calls (sock_posix.go and
+ * friends): it makes sockets, binds, connects and listens itself. Addresses
+ * cross this boundary in one layout-free form, 128 bytes:
+ *   [0]      family: 0 none, 1 unix, 4 inet, 6 inet6
+ *   [1..2]   port, big-endian (inet, inet6)
+ *   [4..7]   inet6 scope id, big-endian; for unix, the path's length
+ *   [8..23]  the address (inet: [8..11]); unix: the path (up to 104 bytes,
+ *            may hold NULs: Linux's abstract names)
+ * Every call returns -errno on failure. */
+
+#define ALX_SA_SIZE 128
+
+static int sa_family_of(int f) { return f == 1 ? AF_UNIX : f == 6 ? AF_INET6 : AF_INET; }
+
+/* The canonical form into a sockaddr: its length, or -EINVAL. */
+static int sa_from(const uint8_t *in, struct sockaddr_storage *ss, socklen_t *len) {
+    memset(ss, 0, sizeof *ss);
+    if (in[0] == 4) {
+        struct sockaddr_in *a = (void *)ss;
+        a->sin_family = AF_INET;
+        a->sin_port = htons((uint16_t)(in[1] << 8 | in[2]));
+        memcpy(&a->sin_addr, in + 8, 4);
+#ifdef __APPLE__
+        a->sin_len = sizeof *a;
+#endif
+        *len = sizeof *a;
+        return 0;
+    }
+    if (in[0] == 6) {
+        struct sockaddr_in6 *a = (void *)ss;
+        a->sin6_family = AF_INET6;
+        a->sin6_port = htons((uint16_t)(in[1] << 8 | in[2]));
+        a->sin6_scope_id = (uint32_t)in[4] << 24 | (uint32_t)in[5] << 16 | (uint32_t)in[6] << 8 | in[7];
+        memcpy(&a->sin6_addr, in + 8, 16);
+#ifdef __APPLE__
+        a->sin6_len = sizeof *a;
+#endif
+        *len = sizeof *a;
+        return 0;
+    }
+    if (in[0] == 1) {
+        struct sockaddr_un *u = (void *)ss;
+        size_t n = (size_t)in[6] << 8 | in[7];
+        if (n > sizeof u->sun_path || n > ALX_SA_SIZE - 8) return -EINVAL;
+        u->sun_family = AF_UNIX;
+        memcpy(u->sun_path, in + 8, n);
+        /* A path (not an abstract name) is NUL-terminated when there's room. */
+        *len = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + n);
+        if (n > 0 && in[8] != 0 && n < sizeof u->sun_path) *len += 1;
+#ifdef __APPLE__
+        u->sun_len = (uint8_t)*len;
+#endif
+        return 0;
+    }
+    return -EAFNOSUPPORT;
+}
+
+/* A sockaddr (len bytes) into the canonical form. */
+static void sa_to(const struct sockaddr_storage *ss, socklen_t len, uint8_t *out) {
+    memset(out, 0, ALX_SA_SIZE);
+    if (len == 0) return;
+    if (ss->ss_family == AF_INET) {
+        const struct sockaddr_in *a = (const void *)ss;
+        uint16_t p = ntohs(a->sin_port);
+        out[0] = 4; out[1] = (uint8_t)(p >> 8); out[2] = (uint8_t)p;
+        memcpy(out + 8, &a->sin_addr, 4);
+    } else if (ss->ss_family == AF_INET6) {
+        const struct sockaddr_in6 *a = (const void *)ss;
+        uint16_t p = ntohs(a->sin6_port);
+        uint32_t z = a->sin6_scope_id;
+        out[0] = 6; out[1] = (uint8_t)(p >> 8); out[2] = (uint8_t)p;
+        out[4] = (uint8_t)(z >> 24); out[5] = (uint8_t)(z >> 16); out[6] = (uint8_t)(z >> 8); out[7] = (uint8_t)z;
+        memcpy(out + 8, &a->sin6_addr, 16);
+    } else if (ss->ss_family == AF_UNIX) {
+        const struct sockaddr_un *u = (const void *)ss;
+        size_t off = offsetof(struct sockaddr_un, sun_path);
+        size_t n = len > off ? len - off : 0;
+        if (n > sizeof u->sun_path) n = sizeof u->sun_path;
+        if (n > ALX_SA_SIZE - 8) n = ALX_SA_SIZE - 8;
+        /* A path: up to its NUL. An abstract name (Linux, leading NUL): all
+         * of it. Elsewhere a leading NUL is an unnamed socket. */
+#ifdef __linux__
+        if (n > 0 && u->sun_path[0] != 0) n = strnlen(u->sun_path, n);
+#else
+        n = n > 0 ? strnlen(u->sun_path, n) : 0;
+#endif
+        out[0] = 1;
+        out[6] = (uint8_t)(n >> 8); out[7] = (uint8_t)n;
+        memcpy(out + 8, u->sun_path, n);
+    }
+}
+
+/* socket(2): family as the canonical form's, sotype 1 stream, 2 datagram,
+ * 3 raw, 5 seqpacket; non-blocking, close-on-exec, no SIGPIPE. */
+int64_t alx_net_socket(int64_t family, int64_t sotype, int64_t proto) {
+    sock_init();
+    int t = sotype == 1 ? SOCK_STREAM : sotype == 2 ? SOCK_DGRAM : sotype == 3 ? SOCK_RAW : SOCK_SEQPACKET;
+    int fd = socket(sa_family_of((int)family), t, (int)proto);
+    if (fd < 0) return -errno;
+    sock_prep(fd);
+    return fd;
+}
+
+int64_t alx_net_bind(int64_t fd, const uint8_t *sa) {
+    struct sockaddr_storage ss;
+    socklen_t len;
+    int rc = sa_from(sa, &ss, &len);
+    if (rc < 0) return rc;
+    return bind((int)fd, (struct sockaddr *)&ss, len) < 0 ? -errno : 0;
+}
+
+/* connect(2); -EINPROGRESS: wait writable, then alx_sock_error. */
+int64_t alx_net_connect(int64_t fd, const uint8_t *sa) {
+    struct sockaddr_storage ss;
+    socklen_t len;
+    int rc = sa_from(sa, &ss, &len);
+    if (rc < 0) return rc;
+    return connect((int)fd, (struct sockaddr *)&ss, len) < 0 ? -errno : 0;
+}
+
+int64_t alx_net_listen(int64_t fd, int64_t backlog) {
+    return listen((int)fd, (int)backlog) < 0 ? -errno : 0;
+}
+
+/* accept(2): the new descriptor (prepared like alx_net_socket's) and the
+ * peer's address in out. -EAGAIN: wait readable. */
+int64_t alx_net_accept(int64_t fd, uint8_t *out) {
+    struct sockaddr_storage ss;
+    socklen_t len = sizeof ss;
+    memset(&ss, 0, sizeof ss);
+    int c = accept((int)fd, (struct sockaddr *)&ss, &len);
+    if (c < 0) return -errno;
+    sock_prep(c);
+    sa_to(&ss, len, out);
+    return c;
+}
+
+/* The local (peer 0) or remote (peer 1) address into out. */
+int64_t alx_net_sockname(int64_t fd, uint8_t *out, int64_t peer) {
+    struct sockaddr_storage ss;
+    socklen_t len = sizeof ss;
+    memset(&ss, 0, sizeof ss);
+    int rc = peer ? getpeername((int)fd, (struct sockaddr *)&ss, &len) : getsockname((int)fd, (struct sockaddr *)&ss, &len);
+    if (rc < 0) return -errno;
+    sa_to(&ss, len, out);
+    return 0;
+}
+
+/* recvfrom(2) (flags: 1 MSG_PEEK, 2 MSG_OOB): the length, the sender in out
+ * (family 0 if it has none). -EAGAIN: wait readable. */
+int64_t alx_net_recvfrom(int64_t fd, uint8_t *buf, int64_t n, int64_t flags, uint8_t *out) {
+    struct sockaddr_storage ss;
+    socklen_t len = sizeof ss;
+    memset(&ss, 0, sizeof ss);
+    int f = (flags & 1 ? MSG_PEEK : 0) | (flags & 2 ? MSG_OOB : 0);
+    ssize_t r = recvfrom((int)fd, buf, (size_t)n, f, (struct sockaddr *)&ss, &len);
+    if (r < 0) return -errno;
+    sa_to(&ss, len, out);
+    return (int64_t)r;
+}
+
+/* sendto(2) to sa, or send(2) when sa's family is 0. -EAGAIN: wait writable. */
+int64_t alx_net_sendto(int64_t fd, const uint8_t *buf, int64_t n, const uint8_t *sa) {
+    ssize_t r;
+    if (sa[0] == 0) r = send((int)fd, buf, (size_t)n, 0);
+    else {
+        struct sockaddr_storage ss;
+        socklen_t len;
+        int rc = sa_from(sa, &ss, &len);
+        if (rc < 0) return rc;
+        r = sendto((int)fd, buf, (size_t)n, 0, (struct sockaddr *)&ss, len);
+    }
+    return r < 0 ? -errno : (int64_t)r;
+}
+
+/* recvmsg(2) with ancillary data: the data into buf, the control messages
+ * into oob, and into info (two native int64s) their length and the flags
+ * (1 MSG_TRUNC, 2 MSG_CTRUNC); the sender into out. The data length. */
+int64_t alx_net_recvmsg(int64_t fd, uint8_t *buf, int64_t n, uint8_t *oob, int64_t oobn, uint8_t *out, uint8_t *info) {
+    struct sockaddr_storage ss;
+    memset(&ss, 0, sizeof ss);
+    struct iovec iov = { buf, (size_t)n };
+    struct msghdr m;
+    memset(&m, 0, sizeof m);
+    m.msg_name = &ss; m.msg_namelen = sizeof ss;
+    m.msg_iov = &iov; m.msg_iovlen = 1;
+    if (oobn > 0) { m.msg_control = oob; m.msg_controllen = (socklen_t)oobn; }
+#ifdef MSG_CMSG_CLOEXEC
+    ssize_t r = recvmsg((int)fd, &m, MSG_CMSG_CLOEXEC);
+#else
+    ssize_t r = recvmsg((int)fd, &m, 0);
+#endif
+    if (r < 0) return -errno;
+    /* Received descriptors are close-on-exec, as Go makes them. */
+    for (struct cmsghdr *h = CMSG_FIRSTHDR(&m); h; h = CMSG_NXTHDR(&m, h)) {
+        if (h->cmsg_level != SOL_SOCKET || h->cmsg_type != SCM_RIGHTS) continue;
+        size_t cnt = (h->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+        int *p = (int *)(void *)CMSG_DATA(h);
+        for (size_t i = 0; i < cnt; i++) fcntl(p[i], F_SETFD, FD_CLOEXEC);
+    }
+    int64_t iv[2] = { (int64_t)m.msg_controllen, (m.msg_flags & MSG_TRUNC ? 1 : 0) | (m.msg_flags & MSG_CTRUNC ? 2 : 0) };
+    memcpy(info, iv, sizeof iv);
+    sa_to(&ss, m.msg_namelen, out);
+    return (int64_t)r;
+}
+
+/* sendmsg(2) with ancillary data oob (oobn bytes) to sa (family 0: the
+ * connected peer). The data length sent. */
+int64_t alx_net_sendmsg(int64_t fd, const uint8_t *buf, int64_t n, const uint8_t *oob, int64_t oobn, const uint8_t *sa) {
+    struct sockaddr_storage ss;
+    socklen_t len = 0;
+    if (sa[0] != 0) {
+        int rc = sa_from(sa, &ss, &len);
+        if (rc < 0) return rc;
+    }
+    uint8_t dummy = 0;
+    struct iovec iov = { (void *)buf, (size_t)n };
+    if (n == 0) { iov.iov_base = &dummy; iov.iov_len = 0; }
+    struct msghdr m;
+    memset(&m, 0, sizeof m);
+    if (len) { m.msg_name = &ss; m.msg_namelen = len; }
+    m.msg_iov = &iov; m.msg_iovlen = 1;
+    if (oobn > 0) { m.msg_control = (void *)oob; m.msg_controllen = (socklen_t)oobn; }
+    ssize_t r = sendmsg((int)fd, &m, 0);
+    return r < 0 ? -errno : (int64_t)r;
+}
+
+/* Builds the SCM_RIGHTS control message for fds (n native int64s) into out
+ * (room bytes): its length (Go's syscall.UnixRights), or -EINVAL if it
+ * won't fit. */
+int64_t alx_net_unix_rights(const uint8_t *fds, int64_t n, uint8_t *out, int64_t room) {
+    size_t need = CMSG_SPACE((size_t)n * sizeof(int));
+    if ((int64_t)need > room) return -EINVAL;
+    memset(out, 0, need);
+    struct cmsghdr *h = (struct cmsghdr *)(void *)out;
+    h->cmsg_level = SOL_SOCKET;
+    h->cmsg_type = SCM_RIGHTS;
+    h->cmsg_len = CMSG_LEN((size_t)n * sizeof(int));
+    int *p = (int *)(void *)CMSG_DATA(h);
+    for (int64_t i = 0; i < n; i++) { int64_t v; memcpy(&v, fds + 8 * i, 8); p[i] = (int)v; }
+    return (int64_t)need;
+}
+
+/* The descriptors in the SCM_RIGHTS messages of a control buffer (n bytes)
+ * into fds (room native int64s): how many, or -EINVAL for a malformed
+ * buffer. */
+int64_t alx_net_parse_rights(uint8_t *oob, int64_t n, uint8_t *fds, int64_t room) {
+    struct msghdr m;
+    memset(&m, 0, sizeof m);
+    m.msg_control = oob; m.msg_controllen = (socklen_t)n;
+    int64_t k = 0;
+    for (struct cmsghdr *h = CMSG_FIRSTHDR(&m); h; h = CMSG_NXTHDR(&m, h)) {
+        if (h->cmsg_len < CMSG_LEN(0) || (uint8_t *)h + h->cmsg_len > oob + n) return -EINVAL;
+        if (h->cmsg_level != SOL_SOCKET || h->cmsg_type != SCM_RIGHTS) continue;
+        size_t cnt = (h->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+        int *p = (int *)(void *)CMSG_DATA(h);
+        for (size_t i = 0; i < cnt && k < room; i++) { int64_t v = p[i]; memcpy(fds + 8 * k++, &v, 8); }
+    }
+    return k;
+}
+
+/* A socket option by name: level and option as Go's syscall names them. */
+static int sockopt_of(const char *name, int *level, int *opt) {
+    static const struct { const char *n; int l, o; } t[] = {
+        { "SO_REUSEADDR", SOL_SOCKET, SO_REUSEADDR },
+#ifdef SO_REUSEPORT
+        { "SO_REUSEPORT", SOL_SOCKET, SO_REUSEPORT },
+#endif
+        { "SO_BROADCAST", SOL_SOCKET, SO_BROADCAST },
+        { "SO_KEEPALIVE", SOL_SOCKET, SO_KEEPALIVE },
+        { "SO_RCVBUF", SOL_SOCKET, SO_RCVBUF },
+        { "SO_SNDBUF", SOL_SOCKET, SO_SNDBUF },
+        { "SO_ERROR", SOL_SOCKET, SO_ERROR },
+        { "SO_TYPE", SOL_SOCKET, SO_TYPE },
+        { "SO_LINGER", SOL_SOCKET, SO_LINGER },
+        { "TCP_NODELAY", IPPROTO_TCP, TCP_NODELAY },
+#ifdef TCP_KEEPIDLE
+        { "TCP_KEEPIDLE", IPPROTO_TCP, TCP_KEEPIDLE },
+#else
+        { "TCP_KEEPIDLE", IPPROTO_TCP, TCP_KEEPALIVE },
+#endif
+#ifdef TCP_KEEPINTVL
+        { "TCP_KEEPINTVL", IPPROTO_TCP, TCP_KEEPINTVL },
+#endif
+#ifdef TCP_KEEPCNT
+        { "TCP_KEEPCNT", IPPROTO_TCP, TCP_KEEPCNT },
+#endif
+        { "IPV6_V6ONLY", IPPROTO_IPV6, IPV6_V6ONLY },
+        { "IP_TTL", IPPROTO_IP, IP_TTL },
+        { "IP_TOS", IPPROTO_IP, IP_TOS },
+        { "IP_MULTICAST_TTL", IPPROTO_IP, IP_MULTICAST_TTL },
+        { "IP_MULTICAST_LOOP", IPPROTO_IP, IP_MULTICAST_LOOP },
+        { "IPV6_UNICAST_HOPS", IPPROTO_IPV6, IPV6_UNICAST_HOPS },
+        { "IPV6_MULTICAST_HOPS", IPPROTO_IPV6, IPV6_MULTICAST_HOPS },
+        { "IPV6_MULTICAST_LOOP", IPPROTO_IPV6, IPV6_MULTICAST_LOOP },
+        { "IPV6_MULTICAST_IF", IPPROTO_IPV6, IPV6_MULTICAST_IF },
+    };
+    for (size_t i = 0; i < sizeof t / sizeof t[0]; i++)
+        if (strcmp(t[i].n, name) == 0) { *level = t[i].l; *opt = t[i].o; return 0; }
+    return -ENOPROTOOPT;
+}
+
+/* setsockopt(2) with an int (SO_LINGER: v < 0 turns lingering off, else
+ * lingers v seconds; IP_MULTICAST_TTL / _LOOP take a byte on BSDs). */
+int64_t alx_net_setsockopt(int64_t fd, const char *name, int64_t v) {
+    int level, opt;
+    int rc = sockopt_of(name, &level, &opt);
+    if (rc < 0) return rc;
+    if (opt == SO_LINGER && level == SOL_SOCKET) {
+        struct linger l = { v >= 0, v >= 0 ? (int)v : 0 };
+        return setsockopt((int)fd, level, opt, &l, sizeof l) < 0 ? -errno : 0;
+    }
+#ifndef __linux__
+    if (level == IPPROTO_IP && (opt == IP_MULTICAST_TTL || opt == IP_MULTICAST_LOOP)) {
+        unsigned char b = (unsigned char)v;
+        return setsockopt((int)fd, level, opt, &b, sizeof b) < 0 ? -errno : 0;
+    }
+#endif
+    int iv = (int)v;
+    return setsockopt((int)fd, level, opt, &iv, sizeof iv) < 0 ? -errno : 0;
+}
+
+/* getsockopt(2) of an int: the value (>= 0), or -errno. SO_LINGER: the
+ * seconds it lingers, 0 when off. */
+int64_t alx_net_getsockopt(int64_t fd, const char *name) {
+    int level, opt;
+    int rc = sockopt_of(name, &level, &opt);
+    if (rc < 0) return rc;
+    if (opt == SO_LINGER && level == SOL_SOCKET) {
+        struct linger l;
+        socklen_t len = sizeof l;
+        if (getsockopt((int)fd, level, opt, &l, &len) < 0) return -errno;
+        return l.l_onoff ? l.l_linger : 0;
+    }
+    unsigned char b[sizeof(int)] = { 0 };
+    int iv = 0;
+    socklen_t len = sizeof iv;
+    if (getsockopt((int)fd, level, opt, b, &len) < 0) return -errno;
+    if (len == 1) return b[0];
+    memcpy(&iv, b, sizeof iv);
+    return iv;
+}
+
+/* Joins (join 1) or leaves (0) the multicast group ip (4 or 16 bytes, by
+ * family) on the interface ifindex (0: the default). For IPv4, ifaddr (4
+ * bytes) picks the interface instead. */
+int64_t alx_net_mcast(int64_t fd, int64_t family, const uint8_t *ip, int64_t ifindex, const uint8_t *ifaddr, int64_t join) {
+    if (family == 4) {
+        struct ip_mreq m;
+        memset(&m, 0, sizeof m);
+        memcpy(&m.imr_multiaddr, ip, 4);
+        memcpy(&m.imr_interface, ifaddr, 4);
+        return setsockopt((int)fd, IPPROTO_IP, join ? IP_ADD_MEMBERSHIP : IP_DROP_MEMBERSHIP, &m, sizeof m) < 0 ? -errno : 0;
+    }
+    struct ipv6_mreq m;
+    memset(&m, 0, sizeof m);
+    memcpy(&m.ipv6mr_multiaddr, ip, 16);
+    m.ipv6mr_interface = (unsigned)ifindex;
+    return setsockopt((int)fd, IPPROTO_IPV6, join ? IPV6_JOIN_GROUP : IPV6_LEAVE_GROUP, &m, sizeof m) < 0 ? -errno : 0;
+}
+
+/* IP_MULTICAST_IF for IPv4: the interface's address (4 bytes). */
+int64_t alx_net_mcast_if4(int64_t fd, const uint8_t *ifaddr) {
+    struct in_addr a;
+    memcpy(&a, ifaddr, 4);
+    return setsockopt((int)fd, IPPROTO_IP, IP_MULTICAST_IF, &a, sizeof a) < 0 ? -errno : 0;
+}
+
+/* getaddrinfo(3) for a host: "ip" or "ip%scope" lines into out (n bytes);
+ * the length, -ALX_ENOHOST for a name that doesn't exist, or -(ALX_ENOHOST
+ * + 1) for another failure (the message from alx_net_gai_error). family: 0
+ * any, 4, 6. Blocks the worker. */
+int64_t alx_net_getaddrinfo(const char *host, int64_t family, uint8_t *out, int64_t n) {
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_family = family == 4 ? AF_INET : family == 6 ? AF_INET6 : AF_UNSPEC;
+    hints.ai_flags = AI_ADDRCONFIG;
+    int rc = getaddrinfo(host, NULL, &hints, &res);
+    if (rc == EAI_NONAME
+#ifdef EAI_NODATA
+        || rc == EAI_NODATA
+#endif
+        || (rc == EAI_FAIL)) return -ALX_ENOHOST;
+    if (rc != 0) {
+        /* AI_ADDRCONFIG fails on hosts with no configured address: retry without. */
+        hints.ai_flags = 0;
+        rc = getaddrinfo(host, NULL, &hints, &res);
+        if (rc == EAI_NONAME) return -ALX_ENOHOST;
+        if (rc != 0) return -(ALX_ENOHOST + 1);
+    }
+    int64_t len = 0;
+    for (struct addrinfo *a = res; a; a = a->ai_next) {
+        char h[INET6_ADDRSTRLEN + 16];
+        if (a->ai_family == AF_INET6) {
+            const struct sockaddr_in6 *s6 = (const void *)a->ai_addr;
+            if (!inet_ntop(AF_INET6, &s6->sin6_addr, h, INET6_ADDRSTRLEN)) continue;
+            if (s6->sin6_scope_id) snprintf(h + strlen(h), 16, "%%%u", (unsigned)s6->sin6_scope_id);
+        } else if (a->ai_family == AF_INET) {
+            if (!inet_ntop(AF_INET, &((const struct sockaddr_in *)(const void *)a->ai_addr)->sin_addr, h, INET6_ADDRSTRLEN)) continue;
+        } else continue;
+        size_t hl = strlen(h);
+        if (len + (int64_t)hl + 1 > n) break;
+        memcpy(out + len, h, hl);
+        len += (int64_t)hl;
+        out[len++] = '\n';
+    }
+    freeaddrinfo(res);
+    return len;
+}
+
+/* The canonical name of host (getaddrinfo with AI_CANONNAME) into out:
+ * its length, or as alx_net_getaddrinfo's failures. */
+int64_t alx_net_canonname(const char *host, uint8_t *out, int64_t n) {
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_CANONNAME;
+    int rc = getaddrinfo(host, NULL, &hints, &res);
+    if (rc == EAI_NONAME) return -ALX_ENOHOST;
+    if (rc != 0) return -(ALX_ENOHOST + 1);
+    int64_t len = 0;
+    if (res && res->ai_canonname) {
+        size_t cl = strlen(res->ai_canonname);
+        if ((int64_t)cl > n) cl = (size_t)n;
+        memcpy(out, res->ai_canonname, cl);
+        len = (int64_t)cl;
+    }
+    freeaddrinfo(res);
+    return len;
+}
+
+/* Reverse lookup (getnameinfo with NI_NAMEREQD) of the address sa into out:
+ * the name's length, or -ALX_ENOHOST. Blocks the worker. */
+int64_t alx_net_getnameinfo(const uint8_t *sa, uint8_t *out, int64_t n) {
+    struct sockaddr_storage ss;
+    socklen_t len;
+    if (sa_from(sa, &ss, &len) < 0) return -ALX_ENOHOST;
+    char h[NI_MAXHOST];
+    int rc = getnameinfo((struct sockaddr *)&ss, len, h, sizeof h, NULL, 0, NI_NAMEREQD);
+    if (rc != 0) return rc == EAI_NONAME ? -ALX_ENOHOST : -(ALX_ENOHOST + 1);
+    size_t hl = strlen(h);
+    if ((int64_t)hl > n) hl = (size_t)n;
+    memcpy(out, h, hl);
+    return (int64_t)hl;
+}
+
+/* The network interfaces, one per line: "index name flags mtu hwaddr", the
+ * hardware address in hex ("" if none) and flags as Go's (1 up, 2
+ * broadcast, 4 loopback, 8 point-to-point, 16 multicast, 32 running); then
+ * their addresses: "@index family hexip prefixlen" lines. The length, or
+ * -errno. */
+#include <net/if.h>
+#include <ifaddrs.h>
+#include <sys/ioctl.h>
+#ifdef __APPLE__
+#  include <net/if_dl.h>
+#endif
+#ifdef __linux__
+#  include <netpacket/packet.h>
+#endif
+int64_t alx_net_interfaces(uint8_t *out, int64_t n) {
+    struct ifaddrs *ifs = NULL;
+    if (getifaddrs(&ifs) < 0) return -errno;
+    int64_t len = 0;
+    char line[512];
+    /* First pass: interfaces (one line each, at their first entry). */
+    for (struct ifaddrs *a = ifs; a; a = a->ifa_next) {
+        bool seen = false;
+        for (struct ifaddrs *b = ifs; b != a; b = b->ifa_next)
+            if (strcmp(b->ifa_name, a->ifa_name) == 0) { seen = true; break; }
+        if (seen) continue;
+        unsigned idx = if_nametoindex(a->ifa_name);
+        unsigned fl = a->ifa_flags, gf = 0;
+        if (fl & IFF_UP) gf |= 1;
+        if (fl & IFF_BROADCAST) gf |= 2;
+        if (fl & IFF_LOOPBACK) gf |= 4;
+        if (fl & IFF_POINTOPOINT) gf |= 8;
+        if (fl & IFF_MULTICAST) gf |= 16;
+        if (fl & IFF_RUNNING) gf |= 32;
+        int mtu = 0;
+        int s = socket(AF_INET, SOCK_DGRAM, 0);
+        if (s >= 0) {
+            struct ifreq r;
+            memset(&r, 0, sizeof r);
+            snprintf(r.ifr_name, sizeof r.ifr_name, "%s", a->ifa_name);
+            if (ioctl(s, SIOCGIFMTU, &r) == 0) mtu = r.ifr_mtu;
+            close(s);
+        }
+        char hw[128] = "";
+        for (struct ifaddrs *b = ifs; b; b = b->ifa_next) {
+            if (strcmp(b->ifa_name, a->ifa_name) != 0 || !b->ifa_addr) continue;
+            const unsigned char *p = NULL;
+            int hl = 0;
+#ifdef __APPLE__
+            if (b->ifa_addr->sa_family == AF_LINK) {
+                const struct sockaddr_dl *d = (const void *)b->ifa_addr;
+                p = (const unsigned char *)LLADDR(d); hl = d->sdl_alen;
+            }
+#endif
+#ifdef __linux__
+            if (b->ifa_addr->sa_family == AF_PACKET) {
+                const struct sockaddr_ll *d = (const void *)b->ifa_addr;
+                p = d->sll_addr; hl = d->sll_halen;
+            }
+#endif
+            if (p && hl > 0 && hl <= 32) {
+                bool zero = true;
+                for (int i = 0; i < hl; i++) if (p[i]) zero = false;
+                if (zero && (fl & IFF_LOOPBACK)) break;
+                for (int i = 0; i < hl; i++) snprintf(hw + 2 * i, 3, "%02x", p[i]);
+                break;
+            }
+        }
+        int k = snprintf(line, sizeof line, "%u %s %u %d %s\n", idx, a->ifa_name, gf, mtu, hw);
+        if (len + k > n) { freeifaddrs(ifs); return -ENOBUFS; }
+        memcpy(out + len, line, (size_t)k);
+        len += k;
+    }
+    for (struct ifaddrs *a = ifs; a; a = a->ifa_next) {
+        if (!a->ifa_addr) continue;
+        int f = a->ifa_addr->sa_family;
+        if (f != AF_INET && f != AF_INET6) continue;
+        const unsigned char *ip, *mk = NULL;
+        int il = f == AF_INET ? 4 : 16;
+        if (f == AF_INET) ip = (const void *)&((const struct sockaddr_in *)(const void *)a->ifa_addr)->sin_addr;
+        else ip = (const void *)&((const struct sockaddr_in6 *)(const void *)a->ifa_addr)->sin6_addr;
+        if (a->ifa_netmask) {
+            if (f == AF_INET) mk = (const void *)&((const struct sockaddr_in *)(const void *)a->ifa_netmask)->sin_addr;
+            else mk = (const void *)&((const struct sockaddr_in6 *)(const void *)a->ifa_netmask)->sin6_addr;
+        }
+        int ones = 0;
+        if (mk) for (int i = 0; i < il; i++) for (int b = 7; b >= 0; b--) if (mk[i] >> b & 1) ones++;
+        int k = snprintf(line, sizeof line, "@%u %d ", if_nametoindex(a->ifa_name), f == AF_INET ? 4 : 6);
+        for (int i = 0; i < il; i++) k += snprintf(line + k, sizeof line - (size_t)k, "%02x", ip[i]);
+        k += snprintf(line + k, sizeof line - (size_t)k, " %d\n", ones);
+        if (len + k > n) { freeifaddrs(ifs); return -ENOBUFS; }
+        memcpy(out + len, line, (size_t)k);
+        len += k;
+    }
+    freeifaddrs(ifs);
+    return len;
+}
+
+/* The multicast group memberships (getifmaddrs(3), the BSDs and macOS), one
+ * "index family hexip" line each, into out: the length, or -errno (-ENOSYS
+ * on Linux, where std/net reads /proc/net/igmp and igmp6 instead). */
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__DragonFly__)
+#  include <net/if_dl.h>
+int64_t alx_net_multicast_addrs(uint8_t *out, int64_t n) {
+    struct ifmaddrs *ifm = NULL;
+    if (getifmaddrs(&ifm) < 0) return -errno;
+    int64_t len = 0;
+    char line[128];
+    for (struct ifmaddrs *a = ifm; a; a = a->ifma_next) {
+        if (!a->ifma_addr || !a->ifma_name) continue;
+        int f = a->ifma_addr->sa_family;
+        if (f != AF_INET && f != AF_INET6) continue;
+        unsigned idx = 0;
+        if (a->ifma_name->sa_family == AF_LINK) idx = ((const struct sockaddr_dl *)(const void *)a->ifma_name)->sdl_index;
+        const unsigned char *ip;
+        int il = f == AF_INET ? 4 : 16;
+        if (f == AF_INET) ip = (const void *)&((const struct sockaddr_in *)(const void *)a->ifma_addr)->sin_addr;
+        else ip = (const void *)&((const struct sockaddr_in6 *)(const void *)a->ifma_addr)->sin6_addr;
+        int k = snprintf(line, sizeof line, "%u %d ", idx, f == AF_INET ? 4 : 6);
+        for (int i = 0; i < il; i++) k += snprintf(line + k, sizeof line - (size_t)k, "%02x", ip[i]);
+        line[k++] = '\n';
+        if (len + k > n) { freeifmaddrs(ifm); return -ENOBUFS; }
+        memcpy(out + len, line, (size_t)k);
+        len += k;
+    }
+    freeifmaddrs(ifm);
+    return len;
+}
+#else
+int64_t alx_net_multicast_addrs(uint8_t *out, int64_t n) { (void)out; (void)n; return -ENOSYS; }
+#endif
+
+/* socketpair(2) (sotype as alx_net_socket's) into fds (two native int64s). */
+int64_t alx_net_socketpair(int64_t sotype, uint8_t *fds) {
+    sock_init();
+    int t = sotype == 1 ? SOCK_STREAM : sotype == 2 ? SOCK_DGRAM : SOCK_SEQPACKET;
+    int p[2];
+    if (socketpair(AF_UNIX, t, 0, p) < 0) return -errno;
+    sock_prep(p[0]); sock_prep(p[1]);
+    int64_t v[2] = { p[0], p[1] };
+    memcpy(fds, v, sizeof v);
+    return 0;
+}
+
+/* dup(2) of a socket, prepared like alx_net_socket's (Go's FileConn and
+ * File methods). */
+int64_t alx_net_dup(int64_t fd, int64_t nonblock) {
+    int c = fcntl((int)fd, F_DUPFD_CLOEXEC, 0);
+    if (c < 0) return -errno;
+    int fl = fcntl(c, F_GETFL, 0);
+    if (fl >= 0) fcntl(c, F_SETFL, nonblock ? fl | O_NONBLOCK : fl & ~O_NONBLOCK);
+    return c;
 }

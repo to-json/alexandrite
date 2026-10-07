@@ -763,6 +763,8 @@ pub struct TProgram {
     /// `M::SetGlobal` at the start of main rather than from a literal.
     pub vars: Vec<usize>,
     /// For each interface whose values are compared with `==`: the
-    /// `__eq` instance of each implementor, in tag order.
+    /// `__eq` instance of each implementor, in tag order. Under "Error"
+    /// (no interface has that name): each error type's, by error index,
+    /// when Error values are compared.
     pub iface_eqs: HashMap<String, Vec<FuncId>>,
 }

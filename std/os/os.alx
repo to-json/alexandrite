@@ -1,52 +1,162 @@
-# Package os: Go's os for Unix, over the C FFI (L2).
+# Package os: Go's os for Unix (macOS, Linux), over the C FFI (L2).
 #
-# Conventions:
-#  - Failures are `FsError` values (`~T` results), carrying the operation, the
-#    path and the errno; the message reads like Go's: `open /x: no such file or
-#    directory`. Match with `case`:
-#        case e { NotExist => ...; Permission => ...; _ => ... }
-#    or use `is_not_exist(e)` / `is_exist(e)` / `is_permission(e)`.
-#    `e.failure` has the operation, path and errno (`e.errno` too); `Other`
-#    covers every other errno (`errno_message(code)` is its text).
-#  - End of file is not an error: `File.read!` returns 0 (GO-VS-RUBY F3).
-#  - `getenv(k)` is Go's LookupEnv: a `Str?`. Go's Getenv is `getenv(k) || ""`.
-#  - Open flags are portable alexandrite constants (`O_RDONLY`, `O_WRONLY`,
-#    `O_RDWR`, `O_APPEND`, `O_CREATE`, `O_EXCL`, `O_SYNC`, `O_TRUNC`), combined
-#    with `|` and translated to the platform's values by `open_file`. (Go's are
-#    the platform's own values, fixed at compile time; the runtime's constant
-#    table, `alx_sys_const`, is a runtime lookup here, so these are stable
-#    stand-ins.) Permissions are plain Ints: `0o644`.
-#  - `File` holds a file descriptor (in shared state, GO-VS-RUBY D36) and a
-#    name. Its `!` methods need a variable as receiver (`f = ~os.open(p);
-#    f.read!(buf)`). Copies of a File are the same file: `close!` on one copy
-#    closes them all, so a second close on any copy fails, as in Go.
-#  - `stdin` / `stdout` / `stderr` are functions returning those Files. Output
-#    through them is unbuffered; use bufio.Writer.
-#  - Times are Ints: nanoseconds since the Unix epoch.
-#  - Everything blocks the calling worker thread (the event loop arrives with
-#    L3).
+#   Go                                      alx
+#   Open / Create / OpenFile(name, flag, perm)  open / create / open_file -> ~File
+#   O_RDONLY ... O_TRUNC, syscall.O_NONBLOCK    O_RDONLY ... O_TRUNC, O_NONBLOCK (portable values)
+#   File.Read / Write / WriteString         read! / write! / write_string!
+#   File.ReadAt / WriteAt / Seek            read_at / write_at / seek!(off, whence)
+#   File.Close / Sync / Truncate / Chmod /  close! / sync! / truncate! / chmod! /
+#     Chown / Chdir / Stat / Fd / Name        chown! / chdir! / stat / fd / name
+#   File.ReadDir / Readdir / Readdirnames   read_dir!(n) / readdir!(n) / readdirnames!(n)
+#   File.ReadFrom / WriteTo                 read_from!(r) / write_to!(w)
+#   NewFile(fd, name)                       new_file(fd, name) -> File? (none for fd < 0)
+#   Pipe()                                  pipe -> ~(File, File)
+#   Stdin / Stdout / Stderr (vars)          STDIN / STDOUT / STDERR (Atomic[File], R11);
+#                                             stdin / stdout / stderr load them
+#   Stat / Lstat / SameFile                 stat / lstat -> ~FileInfo; same_file(a, b)
+#   FileInfo (Name, Size, Mode, ModTime,    struct FileInfo: name, size, mode (st_mode bits),
+#     IsDir, Sys)                             mod_time (ns), access_time, change_time, ino,
+#                                             nlink, dev, uid, gid, rdev; is_dir, is_regular,
+#                                             is_symlink, is_named_pipe, is_char_device, perm,
+#                                             go_mode (Go's FileMode bits)
+#   FileMode, ModePerm, ModeDir ...         io/fs's FileMode (fs.FileMode.new(bits: i.go_mode));
+#                                             here MODE_PERM, MODE_DIR ... are st_mode bits
+#   DirEntry, ReadDir(name)                 DirEntry (name, is_dir, type, info, to_s);
+#                                             read_dir(name), sorted
+#   ReadFile / WriteFile                    read_file / write_file (and read_file_string)
+#   Mkdir / MkdirAll / Remove / RemoveAll   mkdir / mkdir_all / remove / remove_all
+#   Rename / Link / Symlink / Readlink      rename / link / symlink / readlink
+#   Chmod / Chown / Lchown / Chtimes /      chmod / chown / lchown / chtimes(name, atime, mtime)
+#     Truncate                                (Int? ns; none = Go's zero Time: leave it) / truncate
+#   MkdirTemp / CreateTemp / TempDir        mkdir_temp / create_temp / temp_dir
+#   DirFS(dir)                              io/fs's dir_fs(dir) (io/fs imports os)
+#   CopyFS(dir, fsys)                       copy_fs(dir, fsys) (generic over the FS type)
+#   Getenv / LookupEnv / Setenv / Unsetenv  getenv(k) -> Str? (Go's LookupEnv; Getenv is
+#     / Clearenv / Environ                    `getenv(k) || ""`), lookup_env, setenv, unsetenv,
+#                                             clearenv, environ
+#   Expand / ExpandEnv                      expand(s) { |name| ... } / expand_env(s)
+#   Args (var)                              ARGS (Atomic[[Str]], R11); args loads it
+#   Exit / Getpid / Getppid / Getuid /      exit / getpid / getppid / getuid / geteuid / getgid /
+#     Geteuid / Getgid / Getegid /            getegid / getgroups / getpagesize
+#     Getgroups / Getpagesize
+#   Hostname / Getwd / Chdir / Executable   hostname / getwd / chdir / executable
+#   UserHomeDir / UserCacheDir /            user_home_dir / user_cache_dir / user_config_dir
+#     UserConfigDir
+#   StartProcess(name, argv, *ProcAttr)     start_process(name, argv, ProcAttr(dir, env, files))
+#   FindProcess / Process.Signal / Kill /   find_process / signal(sig: Int) / kill / wait! /
+#     Wait / Release / Pid                    release! / pid; new_process(pid) (for os/exec)
+#   ProcessState (ExitCode, Exited,         ProcessState: exit_code, exited, success, signal,
+#     Success, String, UserTime, ...)         to_s, user_time, system_time, max_rss, wall_ns
+#   Interrupt, Kill (Signals)               INTERRUPT, KILL (signal numbers); signal_name(n)
+#   PathError / LinkError / SyscallError    FsError, see below; fs_error / link_error /
+#     / NewSyscallError                        new_syscall_error
+#   ErrNotExist / ErrExist / ErrPermission  is_not_exist / is_exist / is_permission /
+#     / ErrClosed / ErrInvalid /              is_closed / is_invalid / is_process_done /
+#     ErrProcessDone; IsTimeout               is_timeout (and the ERR_* codes)
+#   DevNull, PathSeparator,                 DEV_NULL, PATH_SEPARATOR, PATH_LIST_SEPARATOR,
+#     PathListSeparator, IsPathSeparator      is_path_separator
+#
+# Errors: one error type, FsError, by kind (the variants are what programs
+# branch on: NotExist, Exist, Permission, IsDir, NotDir, NotEmpty, Other).
+# Each holds an FsFailure with Go's fields: `op`, `path` (a LinkError's Old),
+# `new_path` (its New), `code` (the errno, or an ERR_* code for Go's error
+# values: ERR_CLOSED "file already closed", ERR_PROCESS_DONE, ...) and
+# `kind` (PATH_ERROR, LINK_ERROR, SYSCALL_ERROR, PLAIN_ERROR: which of Go's
+# types it is; `e.link_error?` ... ask). Messages are Go's: "open /x: no such
+# file or directory", "rename a b: file exists", "setenv: invalid argument".
+# The functions declare `~T<FsError>`, so a held result's `.err` is an
+# FsError (S7).
+#
+# Differences from Go:
+#  - End of file is not an error: `read!` returns 0 (GO-VS-RUBY F3);
+#    read_dir!(n) etc. return an empty slice at the end where Go returns
+#    io.EOF, and read_at returns a short count where Go adds io.EOF.
+#  - Open flags are portable alexandrite constants, translated to the
+#    platform's by open_file (Go's are the platform's own values).
+#  - A File's state (descriptor, directory stream) lives in Atomics: copies
+#    are the same file (D36), and tasks may share one, as goroutines share an
+#    *os.File; close! by any of them wakes the others' pending reads and
+#    writes, which fail with ErrClosed. new_file(fd) returns none for a
+#    negative fd (Go's nil *File; alx has no nil, so Go's nil-File tests use a
+#    closed File). STDOUT.load is a copy: closing it doesn't mark other
+#    loads closed.
+#  - Reads and writes never block a task's worker (port-issues #166): in a
+#    task, a pipe, FIFO, terminal or socket that isn't ready parks the task
+#    on the runtime's poller (or a helper thread runs the call), so the tasks
+#    pinned to the same worker keep running; an O_NONBLOCK descriptor waits
+#    the same way (Go: an EAGAIN error from a descriptor it didn't make
+#    non-blocking itself). Opening a FIFO waits on a helper thread.
+#  - SIGPIPE is Go's: a write to a broken pipe or socket fails with EPIPE,
+#    except on stdout/stderr, where SIGPIPE ends the program.
+#  - No deadlines: SetDeadline / SetReadDeadline / SetWriteDeadline and
+#    ErrDeadlineExceeded / ErrNoDeadline are missing (the runtime's poller
+#    has no timed waits; std/net has no deadlines either, port-issues #241).
+#  - No os.Root / OpenRoot / OpenInRoot yet (port-issues #242).
+#  - Signals are numbers (INTERRUPT, KILL, or `signal.sigterm.number` from
+#    os/signal, which imports os); Process.signal(sig: Int).
+#  - ProcAttr.files: none is the null device for 0-2 (Go: closed), closed
+#    above. A Process is waited for with wait! (it changes state shared by
+#    its copies).
+#  - Times are Ints: nanoseconds since the Unix epoch (os doesn't import
+#    time). chtimes takes Int?: none leaves that time as it is.
+#  - FileInfo is a struct, not an interface; `mode` is st_mode (MODE_* are
+#    st_mode's bits), `go_mode` Go's FileMode bits. FileInfo.Sys doesn't
+#    exist: dev, uid, gid, rdev and the times are fields.
+#  - Getwd keeps Go's algorithm ($PWD when it names "."; getcwd; walking up
+#    through ".." for paths getcwd can't return).
+#  - executable under `alx run` (the JIT) is the alx compiler.
+#  - File.SyscallConn and ProcessState.Sys/SysUsage: no syscall package
+#    (max_rss, user_time, system_time are fields instead).
 #  - In the browser (GO-VS-RUBY D77), as in Go's js/wasm: stdout and stderr
 #    are the page's output, stdin is empty, the environment starts empty
 #    (setenv works), `args` is the program's name, and there is no file
 #    system: file operations fail with ENOSYS ("function not implemented").
+#
+# Tests: Go's os_test.go, file_test.go, path_test.go, env_test.go,
+# env_unix_test.go, error_test.go, error_unix_test.go, tempfile_test.go,
+# removeall_test.go, read_test.go, stat_test.go, os_unix_test.go,
+# pipe_test.go, fifo_test.go, exec_test.go, exec_unix_test.go,
+# getwd_unix_test.go, executable_test.go, copy_test.go (CopyFileToFile) and
+# example_test.go are translated (*_go_test.alx, env/error/... by file), with
+# vectors from Go (vec_expand_test.alx: Expand/ExpandEnv; vec_errors_test.alx:
+# errno, PathError/LinkError/SyscallError and signal texts). Not translated:
+#  - root_test.go, root_unix_test.go, TestRootDirFS and the rooted halves of
+#    testMaybeRooted tests: no os.Root yet.
+#  - timeout_test.go, timeout_unix_test.go, TestNewFileNonBlock,
+#    TestNonpollableDeadline: no deadlines.
+#  - TestFileChdirTestlog (Go's internal testlog), TestStatStdin's child
+#    half, TestStdPipe, TestReadNonblockingFd, TestLargeWriteToConsole
+#    (re-run the test binary as a helper that writes to its own stdout/stdin;
+#    the EPIPE half is TestEPIPE), TestReaddirRemoveRace (Go's internal stat
+#    hook; ReaddirStatFailures covers vanishing entries), TestNilProcessState
+#    String (no nil), TestWriteStringAlloc (allocation counting),
+#    TestMkdirAllAtSlash (non-hermetic: Go skips it outside its builders),
+#    TestRemoveAllNoFcntl (strace), TestLargeCopyViaNetwork and
+#    readfrom_unix_test.go / writeto_linux_test.go (copy_file_range /
+#    sendfile / splice internals); benchmarks.
 
 import "path"
 import "slices"
 
-extern def c_read(fd: I32, buf: [Byte], n: Int) -> Int = "read"
-extern def c_write(fd: I32, buf: [Byte], n: Int) -> Int = "write"
 extern def c_pread(fd: I32, buf: [Byte], n: Int, off: Int) -> Int = "pread"
 extern def c_pwrite(fd: I32, buf: [Byte], n: Int, off: Int) -> Int = "pwrite"
-extern def c_close(fd: I32) -> I32 = "close"
 extern def c_lseek(fd: I32, off: Int, whence: I32) -> Int = "lseek"
 extern def c_fsync(fd: I32) -> I32 = "fsync"
 extern def c_ftruncate(fd: I32, len: Int) -> I32 = "ftruncate"
 extern def c_truncate(p: Str, len: Int) -> I32 = "truncate"
 extern def c_fchmod(fd: I32, mode: I32) -> I32 = "fchmod"
 extern def c_chmod(p: Str, mode: I32) -> I32 = "chmod"
+extern def c_fchown(fd: I32, uid: I32, gid: I32) -> I32 = "fchown"
+extern def c_chown(p: Str, uid: I32, gid: I32) -> I32 = "chown"
+extern def c_lchown(p: Str, uid: I32, gid: I32) -> I32 = "lchown"
+extern def c_fchdir(fd: I32) -> I32 = "fchdir"
+extern def c_utimensat(dirfd: I32, p: Str, ts: [Byte], flags: I32) -> I32 = "utimensat"
 extern def c_mkdir(p: Str, mode: I32) -> I32 = "mkdir"
 extern def c_rmdir(p: Str) -> I32 = "rmdir"
 extern def c_unlink(p: Str) -> I32 = "unlink"
+extern def c_unlinkat(dirfd: I32, p: Str, flags: I32) -> I32 = "unlinkat"
+# openat without O_CREAT reads no mode: the variadic call is safe with three.
+extern def c_openat(dirfd: I32, p: Str, flags: I32) -> I32 = "openat"
 extern def c_rename(a: Str, b: Str) -> I32 = "rename"
 extern def c_link(a: Str, b: Str) -> I32 = "link"
 extern def c_symlink(a: Str, b: Str) -> I32 = "symlink"
@@ -58,11 +168,16 @@ extern def c_getpid -> I32 = "getpid"
 extern def c_getppid -> I32 = "getppid"
 extern def c_getuid -> I32 = "getuid"
 extern def c_getgid -> I32 = "getgid"
+extern def c_geteuid -> I32 = "geteuid"
+extern def c_getegid -> I32 = "getegid"
+extern def c_getgroups(n: I32, out: [Byte]) -> I32 = "getgroups"
+extern def c_getpagesize -> I32 = "getpagesize"
 extern def c_getenv(name: Str) -> Ptr = "getenv"
 extern def c_setenv(name: Str, value: Str, overwrite: I32) -> I32 = "setenv"
 extern def c_unsetenv(name: Str) -> I32 = "unsetenv"
 extern def c_exit(code: I32) = "exit"
 extern def c_isatty(fd: I32) -> Bool = "isatty"
+extern def c_kill(pid: I32, sig: I32) -> I32 = "kill"
 extern def alx_sys_open(p: Str, flags: I32, mode: I32) -> I32
 extern def alx_sys_const(name: Str) -> Int
 extern def alx_sys_stat(p: Str, out: [Byte], follow: I32) -> I32
@@ -70,10 +185,20 @@ extern def alx_sys_fstat(fd: I32, out: [Byte]) -> I32
 extern def alx_sys_dir_open(p: Str) -> Int
 extern def alx_sys_dir_next(h: Int, kind: [Byte]) -> Ptr
 extern def alx_sys_dir_close(h: Int)
+extern def alx_sys_dir_fdopen(fd: Int) -> Int
+extern def alx_sys_read(fd: Int, buf: [Byte], n: Int) -> Int
+extern def alx_sys_write(fd: Int, buf: [Byte], n: Int) -> Int
+extern def alx_sys_pipe(out: [Byte], nonblock: Int) -> Int
+extern def alx_sys_spawn(argv: [Byte], argc: Int, env: [Byte], envc: Int, dir: Str, fd0: Int, fd1: Int, fd2: Int) -> Int
+extern def alx_sys_spawn2(path: Str, argv: [Byte], argc: Int, env: [Byte], envc: Int, dir: Str, fds: [Byte], nfds: Int) -> Int
+extern def alx_sys_wait(pid: Int, out: [Byte]) -> Int
+extern def alx_sys_executable(out: [Byte], n: Int) -> Int
+extern def alx_fd_close(fd: Int) -> Int
 extern def alx_environ(i: Int) -> Ptr
 extern def alx_argc -> Int
 extern def alx_argv(i: Int) -> Ptr
 extern def alx_mono_ns -> Int
+extern def alx_wall_ns -> Int
 
 # ------------------------------------------------------------------ constants
 
@@ -86,8 +211,9 @@ pub O_CREATE = 16
 pub O_EXCL = 32
 pub O_SYNC = 64
 pub O_TRUNC = 128
+pub O_NONBLOCK = 256 # Go: syscall.O_NONBLOCK (reads and writes still wait, see read!)
 
-# Go's os.ModePerm, and the file type bits of FileInfo.mode.
+# Go's os.ModePerm, and the file type bits of FileInfo.mode (st_mode's).
 pub MODE_PERM = 0o777
 pub MODE_TYPE = 0o170000
 pub MODE_DIR = 0o040000
@@ -97,22 +223,62 @@ pub MODE_NAMED_PIPE = 0o010000
 pub MODE_CHAR_DEVICE = 0o020000
 pub MODE_DEVICE = 0o060000
 pub MODE_SOCKET = 0o140000
+pub MODE_SETUID = 0o4000
+pub MODE_SETGID = 0o2000
+pub MODE_STICKY = 0o1000
 
 pub PATH_SEPARATOR = "/"
+pub PATH_LIST_SEPARATOR = ":"
+pub DEV_NULL = "/dev/null"
 
-# The FsFailure code (not an errno) of a temp-file pattern containing "/".
-pub ERR_PATTERN_SEP = -1
+# Seek whence values (Go's io.SeekStart ..., the deprecated os.SEEK_SET ...).
+pub SEEK_SET = 0
+pub SEEK_CUR = 1
+pub SEEK_END = 2
+
+# FsFailure codes that are not errnos: Go's error values without an errno.
+pub ERR_PATTERN_SEP = -1      # "pattern contains path separator"
+pub ERR_CLOSED = -2           # Go's ErrClosed: "file already closed"
+pub ERR_NEGATIVE_OFFSET = -3  # "negative offset" (read_at / write_at)
+pub ERR_PROCESS_DONE = -4     # Go's ErrProcessDone: "os: process already finished"
+pub ERR_PROCESS_RELEASED = -5 # "os: process already released"
+pub ERR_WRITE_AT_APPEND = -6  # "os: invalid use of WriteAt on file opened with O_APPEND"
+pub ERR_INVALID = -7          # Go's ErrInvalid: "invalid argument"
+pub ERR_NO_HOME = -8          # "$HOME is not defined"
+pub ERR_NO_CACHE_HOME = -9    # "neither $XDG_CACHE_HOME nor $HOME are defined"
+pub ERR_NO_CONFIG_HOME = -10  # "neither $XDG_CONFIG_HOME nor $HOME are defined"
+pub ERR_CACHE_RELATIVE = -11  # "path in $XDG_CACHE_HOME is relative"
+pub ERR_CONFIG_RELATIVE = -12 # "path in $XDG_CONFIG_HOME is relative"
+pub ERR_EXIST = -13           # Go's ErrExist: "file already exists"
+pub ERR_NOT_EXIST = -14       # Go's ErrNotExist: "file does not exist"
+pub ERR_PROCESS_UNSET = -15   # "os: process not initialized"
+
+# What an FsFailure is, as Go's error types.
+pub PATH_ERROR = 0    # PathError: "op path: err"
+pub LINK_ERROR = 1    # LinkError: "op old new: err"
+pub SYSCALL_ERROR = 2 # SyscallError: "syscall: err"
+pub PLAIN_ERROR = 3   # an error value of its own (ErrProcessDone): "err"
 
 def c(name: Str) -> Int { alx_sys_const(name) }
 
+# macOS (else Linux): the errno numbers tell.
+def darwin? -> Bool { c("EAGAIN") == 35 }
+
 # ---------------------------------------------------------------------- errors
 
-# What failed: the operation (`open`, `mkdir`, ...), the path it was for ("" if
-# none) and errno.
+# What failed, as Go's PathError / LinkError / SyscallError: the operation
+# (`open`, `rename`; a SyscallError's syscall), the path ("" for a
+# SyscallError; a LinkError's old name), a LinkError's new name, and the
+# errno (or one of the ERR_* codes above). `kind` is PATH_ERROR, ...
 pub struct FsFailure {
   op: Str
   path: Str
+  new_path: Str
   code: Int
+  kind: Int
+
+  # Go's e.Err.Error(): "no such file or directory".
+  pub def err -> Str { errno_message(code) }
 }
 
 # A failed system call, by kind: the variants are what programs branch on;
@@ -129,7 +295,7 @@ pub error FsError {
 
   def message -> Str {
     f = failure
-    describe(f.op, f.path, f.code)
+    describe(f)
   }
 
   # The failed call's details.
@@ -145,18 +311,54 @@ pub error FsError {
     }
   }
 
-  # The errno.
+  # The errno (or ERR_* code).
   pub def errno -> Int {
     f = failure
     f.code
   }
+
+  # Go's PathError.Op / LinkError.Op / SyscallError.Syscall.
+  pub def op -> Str {
+    f = failure
+    f.op
+  }
+
+  # Go's PathError.Path (LinkError.Old).
+  pub def path -> Str {
+    f = failure
+    f.path
+  }
+
+  # Go's err.(*LinkError) / err.(*SyscallError) / err.(*PathError).
+  pub def link_error? -> Bool { failure.kind == LINK_ERROR }
+  pub def syscall_error? -> Bool { failure.kind == SYSCALL_ERROR }
+  pub def path_error? -> Bool { failure.kind == PATH_ERROR }
+
+  # Go's SyscallError.Timeout / os.IsTimeout: never, here (no deadlines).
+  pub def timeout? -> Bool { false }
 }
 
-# C's message for an errno, in Go's lower case: "no such file or directory".
+# C's message for an errno, in Go's lower case: "no such file or directory";
+# the ERR_* codes' messages for those.
 pub def errno_message(code: Int) -> Str {
-  # Not an errno: Go's errPatternHasSeparator (mkdir_temp, create_temp).
   return "pattern contains path separator" if code == ERR_PATTERN_SEP
+  return "file already closed" if code == ERR_CLOSED
+  return "negative offset" if code == ERR_NEGATIVE_OFFSET
+  return "os: process already finished" if code == ERR_PROCESS_DONE
+  return "os: process already released" if code == ERR_PROCESS_RELEASED
+  return "os: invalid use of WriteAt on file opened with O_APPEND" if code == ERR_WRITE_AT_APPEND
+  return "invalid argument" if code == ERR_INVALID
+  return "$HOME is not defined" if code == ERR_NO_HOME
+  return "neither $XDG_CACHE_HOME nor $HOME are defined" if code == ERR_NO_CACHE_HOME
+  return "neither $XDG_CONFIG_HOME nor $HOME are defined" if code == ERR_NO_CONFIG_HOME
+  return "path in $XDG_CACHE_HOME is relative" if code == ERR_CACHE_RELATIVE
+  return "path in $XDG_CONFIG_HOME is relative" if code == ERR_CONFIG_RELATIVE
+  return "file already exists" if code == ERR_EXIST
+  return "file does not exist" if code == ERR_NOT_EXIST
+  return "os: process not initialized" if code == ERR_PROCESS_UNSET
   s = C.strerror(code)
+  # Go's syscall table differs from macOS's strerror in a few places.
+  return "operation not supported" if s == "Operation not supported on socket"
   return s if s.size == 0 || s[0] < 65 || s[0] > 90
   # "I/O error" style messages keep their capitals.
   return s if s.size > 1 && s[1] >= 65 && s[1] <= 90
@@ -165,29 +367,60 @@ pub def errno_message(code: Int) -> Str {
   Str.from_bytes(b)
 }
 
-def describe(op: Str, path: Str, code: Int) -> Str {
-  m = errno_message(code)
-  return "#{op}: #{m}" if path.size == 0
-  "#{op} #{path}: #{m}"
+def describe(f: FsFailure) -> Str {
+  m = errno_message(f.code)
+  case f.kind {
+    0 => "#{f.op} #{f.path}: #{m}"
+    1 => "#{f.op} #{f.path} #{f.new_path}: #{m}"
+    2 => "#{f.op}: #{m}"
+    _ => m
+  }
 }
 
-# The FsError for errno `code`.
+# The FsError (a PathError) for errno `code`.
 pub def fs_error(op: Str, path: Str, code: Int) -> FsError {
   ferr(op + " " + path, code)
 }
 
-# fs_error with the operation and the path as one string, "op path" (the
-# operation has no spaces). One argument, because the region analysis makes
-# a function that stores two of its Str parameters into one object keep both
-# alive for the whole program: that would leak on every I/O call.
+# Go's NewSyscallError(syscall, errno): "syscall: message".
+pub def new_syscall_error(syscall: Str, code: Int) -> FsError {
+  ferr(syscall, code)
+}
+
+# A LinkError: "op old new: message".
+pub def link_error(op: Str, old: Str, new: Str, code: Int) -> FsError {
+  ferr(op + " " + old + nul + new, code)
+}
+
+def nul -> Str { Str.from_bytes([0]) }
+
+# The FsError for `where` and the code. `where` is one string (the region
+# analysis makes a function that stores two of its Str parameters into one
+# object keep both alive for the whole program: that would leak on every I/O
+# call): "op path" (a PathError), "op old\0new" (a LinkError), "op" (no
+# space: a SyscallError) or "" (a plain error: just the message).
 def ferr(where: Str, code: Int) -> FsError {
   i = 0
   while i < where.size && where[i] != 32 {
     i += 1
   }
-  at = FsFailure.new(op: where[0...i], path: i < where.size ? where[i + 1...where.size] : "", code: code)
-  return FsError.NotExist(at) if code == c("ENOENT")
-  return FsError.Exist(at) if code == c("EEXIST")
+  kind = PATH_ERROR
+  kind = SYSCALL_ERROR if i == where.size
+  kind = PLAIN_ERROR if where.size == 0
+  rest = i < where.size ? where[i + 1...where.size] : ""
+  j = 0
+  while j < rest.size && rest[j] != 0 {
+    j += 1
+  }
+  new_path = ""
+  if j < rest.size {
+    kind = LINK_ERROR
+    new_path = rest[j + 1...rest.size]
+    rest = rest[0...j]
+  }
+  at = FsFailure.new(op: where[0...i], path: rest, new_path: new_path, code: code, kind: kind)
+  return FsError.NotExist(at) if code == c("ENOENT") || code == ERR_NOT_EXIST
+  return FsError.Exist(at) if code == c("EEXIST") || code == ERR_EXIST
   return FsError.Permission(at) if code == c("EACCES") || code == c("EPERM")
   return FsError.IsDir(at) if code == c("EISDIR")
   return FsError.NotDir(at) if code == c("ENOTDIR")
@@ -195,7 +428,8 @@ def ferr(where: Str, code: Int) -> FsError {
   FsError.Other(at)
 }
 
-# Go's os.IsNotExist: the file or directory doesn't exist.
+# Go's os.IsNotExist / errors.Is(err, ErrNotExist): the file or directory
+# doesn't exist.
 pub def is_not_exist(e: Error) -> Bool {
   case e {
     NotExist => true
@@ -203,6 +437,7 @@ pub def is_not_exist(e: Error) -> Bool {
   }
 }
 
+# Go's os.IsExist / errors.Is(err, ErrExist) (a non-empty directory too).
 pub def is_exist(e: Error) -> Bool {
   case e {
     Exist => true
@@ -211,12 +446,49 @@ pub def is_exist(e: Error) -> Bool {
   }
 }
 
+# Go's os.IsPermission / errors.Is(err, ErrPermission).
 pub def is_permission(e: Error) -> Bool {
   case e {
     Permission => true
     _ => false
   }
 }
+
+# Go's os.IsTimeout: never true here (files have no deadlines).
+pub def is_timeout(e: Error) -> Bool { false }
+
+# Go's errors.Is(err, ErrClosed): the File was already closed.
+pub def is_closed(e: Error) -> Bool { code_of(e) == ERR_CLOSED }
+
+# Go's errors.Is(err, ErrProcessDone).
+pub def is_process_done(e: Error) -> Bool { code_of(e) == ERR_PROCESS_DONE }
+
+# Go's errors.Is(err, ErrInvalid) (EINVAL too, as in Go's syscall.Errno.Is).
+pub def is_invalid(e: Error) -> Bool {
+  k = code_of(e)
+  k == ERR_INVALID || k == c("EINVAL")
+}
+
+# The FsError's code (0 for another error).
+def code_of(e: Error) -> Int {
+  case e {
+    NotExist(at) => at.code
+    Exist(at) => at.code
+    Permission(at) => at.code
+    IsDir(at) => at.code
+    NotDir(at) => at.code
+    NotEmpty(at) => at.code
+    Other(at) => at.code
+    _ => 0
+  }
+}
+
+# A NUL byte: no C path holds one (Go's syscall.ByteSliceFromString fails
+# with EINVAL).
+def nul?(s: Str) -> Bool { s.bytes.any? { |b| b == 0 } }
+
+# Go's os.IsPathSeparator.
+pub def is_path_separator(b: Byte) -> Bool { b == 47 }
 
 # ------------------------------------------------------------------- bytes in/out
 
@@ -229,6 +501,14 @@ def get64(b: [Byte], k: Int) -> Int {
     i -= 1
   }
   v
+}
+
+def put64(b: [Byte], k: Int, v: Int) {
+  i = 0
+  while i < 8 {
+    b[k * 8 + i] = ((v >> (8 * i)) & 255).as_u8
+    i += 1
+  }
 }
 
 # The C string in b (up to the first NUL).
@@ -245,576 +525,5 @@ def zeros(n: Int) -> [Byte] {
   b
 }
 
-# ----------------------------------------------------------------- file info
-
-# What stat(2) says about a file. `mode` is st_mode: the type bits
-# (MODE_TYPE) and the permission bits (MODE_PERM).
-pub struct FileInfo {
-  name: Str
-  size: Int
-  mode: Int
-  mod_time: Int
-  access_time: Int
-  ino: Int
-  nlink: Int
-
-  pub def perm -> Int { mode & 0o777 }
-  pub def is_dir -> Bool { (mode & 0o170000) == 0o040000 }
-  pub def is_regular -> Bool { (mode & 0o170000) == 0o100000 }
-  pub def is_symlink -> Bool { (mode & 0o170000) == 0o120000 }
-}
-
-def info_of(name: Str, st: [Byte]) -> FileInfo {
-  FileInfo.new(name: base_name(name), size: get64(st, 1), mode: get64(st, 0), mod_time: get64(st, 2), access_time: get64(st, 3), ino: get64(st, 4), nlink: get64(st, 5))
-}
-
-# The last element of a path ("/" for "/", "." for "").
-def base_name(p: Str) -> Str {
-  path.base(p)
-}
-
-# Information about the named file, following a final symlink.
-pub def stat(name: Str) -> ~FileInfo {
-  st = zeros(48)
-  r = alx_sys_stat(name, st, 1)
-  fail ferr("stat" + " " + name, -r.to_i) if r != 0
-  info_of(name, st)
-}
-
-# Like stat, but a final symlink is described rather than followed.
-pub def lstat(name: Str) -> ~FileInfo {
-  st = zeros(48)
-  r = alx_sys_stat(name, st, 0)
-  fail ferr("lstat" + " " + name, -r.to_i) if r != 0
-  info_of(name, st)
-}
-
-# ----------------------------------------------------------------------- File
-
-# An open file: its descriptor and the name it was opened with. The descriptor
-# lives in a one-element slice (GO-VS-RUBY D36), so copies of a File share it:
-# `close!` on one copy closes them all (a second close, on any copy, fails).
-pub struct File {
-  cell: [Int]
-  name: Str
-
-  # The descriptor; -1 once closed (or for a File made without one).
-  pub def fd -> Int { cell.size == 0 ? -1 : cell[0] }
-
-  # Reads up to p.size bytes; returns the count, 0 at the end of the file.
-  pub def read!(p: [Byte]) -> ~Int {
-    return 0 if p.size == 0
-    n = c_read(fd.to_i32, p, p.size)
-    while n < 0 {
-      code = C.errno
-      fail ferr("read" + " " + name, code) if code != c("EINTR")
-      n = c_read(fd.to_i32, p, p.size)
-    }
-    n
-  }
-
-  # Writes all of p; returns p.size.
-  pub def write!(p: [Byte]) -> ~Int {
-    off = 0
-    while off < p.size {
-      n = c_write(fd.to_i32, p[off...p.size], p.size - off)
-      while n < 0 {
-        code = C.errno
-        fail ferr("write" + " " + name, code) if code != c("EINTR")
-        n = c_write(fd.to_i32, p[off...p.size], p.size - off)
-      }
-      off += n
-    }
-    p.size
-  }
-
-  pub def write_string!(s: Str) -> ~Int {
-    self.~write!(s.bytes.to_a)
-  }
-
-  # Reads at offset `off` without moving the file offset.
-  pub def read_at(p: [Byte], off: Int) -> ~Int {
-    return 0 if p.size == 0
-    n = c_pread(fd.to_i32, p, p.size, off)
-    while n < 0 {
-      code = C.errno
-      fail ferr("read" + " " + name, code) if code != c("EINTR")
-      n = c_pread(fd.to_i32, p, p.size, off)
-    }
-    n
-  }
-
-  # Writes all of p at offset `off` without moving the file offset.
-  pub def write_at(p: [Byte], off: Int) -> ~Int {
-    done = 0
-    while done < p.size {
-      n = c_pwrite(fd.to_i32, p[done...p.size], p.size - done, off + done)
-      while n < 0 {
-        code = C.errno
-        fail ferr("write" + " " + name, code) if code != c("EINTR")
-        n = c_pwrite(fd.to_i32, p[done...p.size], p.size - done, off + done)
-      }
-      done += n
-    }
-    p.size
-  }
-
-  # Moves the offset (whence: 0 start, 1 current, 2 end); returns the new
-  # offset from the start.
-  pub def seek!(offset: Int, whence: Int) -> ~Int {
-    r = c_lseek(fd.to_i32, offset, whence.to_i32)
-    fail ferr("seek" + " " + name, C.errno) if r < 0
-    r
-  }
-
-  # Closes the descriptor. A second close fails.
-  pub def close! -> ~Unit {
-    fail ferr("close" + " " + name, c("EBADF")) if fd < 0
-    r = c_close(fd.to_i32)
-    code = C.errno
-    self.cell[0] = -1
-    fail ferr("close" + " " + name, code) if r != 0
-  }
-
-  # Flushes the file's data to the device.
-  pub def sync! -> ~Unit {
-    r = c_fsync(fd.to_i32)
-    fail ferr("sync" + " " + name, C.errno) if r != 0
-  }
-
-  pub def truncate!(size: Int) -> ~Unit {
-    r = c_ftruncate(fd.to_i32, size)
-    fail ferr("truncate" + " " + name, C.errno) if r != 0
-  }
-
-  pub def chmod!(mode: Int) -> ~Unit {
-    r = c_fchmod(fd.to_i32, mode.to_i32)
-    fail ferr("chmod" + " " + name, C.errno) if r != 0
-  }
-
-  pub def stat -> ~FileInfo {
-    st = zeros(48)
-    r = alx_sys_fstat(fd.to_i32, st)
-    fail ferr("stat" + " " + name, -r.to_i) if r != 0
-    info_of(name, st)
-  }
-
-  # Is this a terminal?
-  pub def is_terminal -> Bool { c_isatty(fd.to_i32) }
-}
-
-# A File over an existing descriptor.
-pub def new_file(fd: Int, name: Str) -> File {
-  cell: [Int] = [fd]
-  File.new(cell: cell, name: name)
-}
-
-pub def stdin -> File { new_file(0, "/dev/stdin") }
-pub def stdout -> File { new_file(1, "/dev/stdout") }
-pub def stderr -> File { new_file(2, "/dev/stderr") }
-
-# The platform's O_* value for the portable flags.
-def native_flags(flags: Int) -> Int {
-  v = flags & 3
-  v |= c("O_APPEND") if (flags & 8) != 0
-  v |= c("O_CREAT") if (flags & 16) != 0
-  v |= c("O_EXCL") if (flags & 32) != 0
-  v |= c("O_SYNC") if (flags & 64) != 0
-  v |= c("O_TRUNC") if (flags & 128) != 0
-  v | c("O_CLOEXEC")
-}
-
-# Opens the named file with the given O_* flags; a new file gets permissions
-# `perm` (before the umask).
-pub def open_file(name: Str, flags: Int, perm: Int) -> ~File {
-  fd = ~open_fd(name, flags, perm)
-  new_file(fd, Str.from_bytes(name.bytes.to_a))
-}
-
-def open_fd(name: Str, flags: Int, perm: Int) -> ~Int {
-  nf = native_flags(flags).to_i32
-  fd = alx_sys_open(name, nf, perm.to_i32)
-  while fd < 0 {
-    code = C.errno
-    fail ferr("open" + " " + name, code) if code != c("EINTR")
-    fd = alx_sys_open(name, nf, perm.to_i32)
-  }
-  fd.to_i
-}
-
-# Opens for reading. (open and create call open_fd, not open_file: a File,
-# whose descriptor is in a slice, returned through two fallible calls in a row
-# is corrupted by a compiler bug.)
-pub def open(name: Str) -> ~File {
-  fd = ~open_fd(name, O_RDONLY, 0)
-  new_file(fd, Str.from_bytes(name.bytes.to_a))
-}
-
-# Creates or truncates for reading and writing (permissions 0o666).
-pub def create(name: Str) -> ~File {
-  fd = ~open_fd(name, O_RDWR | O_CREATE | O_TRUNC, 0o666)
-  new_file(fd, Str.from_bytes(name.bytes.to_a))
-}
-
-# The whole content of a file.
-pub def read_file(name: Str) -> ~[Byte] {
-  f = ~open(name)
-  r = read_all_fd(f)
-  c_close(f.fd.to_i32)
-  ~r
-}
-
-def read_all_fd(f: File) -> ~[Byte] {
-  st = zeros(48)
-  hint = 0
-  if alx_sys_fstat(f.fd.to_i32, st) == 0 {
-    hint = get64(st, 1)
-    hint = 0 if hint < 0
-  }
-  buf = zeros(hint + 512)
-  len = 0
-  loop {
-    if len == buf.size {
-      bigger = zeros(buf.size * 2)
-      copy(bigger[0...len], buf[0...len])
-      buf = bigger
-    }
-    n = c_read(f.fd.to_i32, buf[len...buf.size], buf.size - len)
-    while n < 0 {
-      code = C.errno
-      fail ferr("read" + " " + f.name, code) if code != c("EINTR")
-      n = c_read(f.fd.to_i32, buf[len...buf.size], buf.size - len)
-    }
-    break if n == 0
-    len += n
-  }
-  buf[0...len]
-}
-
-# Writes data to the named file, creating it with `perm` or truncating it.
-pub def write_file(name: Str, data: [Byte], perm: Int) -> ~Unit {
-  f = ~open_file(name, O_WRONLY | O_CREATE | O_TRUNC, perm)
-  r = f.write!(data)
-  r2 = f.close!
-  ~r
-  ~r2
-}
-
-# The whole content of a file as a string.
-pub def read_file_string(name: Str) -> ~Str {
-  b = ~read_file(name)
-  Str.from_bytes(b)
-}
-
-# ---------------------------------------------------------------- directories
-
-# An entry of a directory listing. `kind` is 1 regular, 2 directory,
-# 3 symlink, 4 other.
-pub struct DirEntry {
-  name: Str
-  dir: Str
-  kind: Int
-
-  pub def is_dir -> Bool { kind == 2 }
-  pub def is_regular -> Bool { kind == 1 }
-  pub def is_symlink -> Bool { kind == 3 }
-  # The directory joined with the name.
-  pub def path -> Str { path.join([dir, name]) }
-  # The entry's FileInfo (not following a symlink).
-  pub def info -> ~FileInfo {
-    ~lstat(path.join([dir, name]))
-  }
-}
-
-def by_name(a: DirEntry, b: DirEntry) -> Int {
-  return -1 if a.name < b.name
-  return 1 if a.name > b.name
-  0
-}
-
-# The entries of a directory, sorted by name ("." and ".." left out).
-pub def read_dir(name: Str) -> ~[DirEntry] {
-  h = alx_sys_dir_open(name)
-  fail ferr("open" + " " + name, -h) if h < 0
-  out: [DirEntry] = []
-  kind = zeros(1)
-  loop {
-    p = alx_sys_dir_next(h, kind)
-    break if p.null?
-    en = Str.from_cstr(p)
-    k = kind[0].to_i
-    if k == 0 {
-      # The file system didn't say: ask.
-      st = zeros(48)
-      k = 4
-      if alx_sys_stat(path.join([name, en]), st, 0) == 0 {
-        t = get64(st, 0) & 0o170000
-        k = 1 if t == 0o100000
-        k = 2 if t == 0o040000
-        k = 3 if t == 0o120000
-      }
-    }
-    out << DirEntry.new(name: en, dir: name, kind: k)
-  }
-  alx_sys_dir_close(h)
-  slices.sort_func(out, by_name)
-  out
-}
-
-# Creates a directory; its parent must exist.
-pub def mkdir(name: Str, perm: Int) -> ~Unit {
-  r = c_mkdir(name, perm.to_i32)
-  fail ferr("mkdir" + " " + name, C.errno) if r != 0
-}
-
-# Creates a directory and any missing parents; nothing to do if it exists.
-pub def mkdir_all(name: Str, perm: Int) -> ~Unit {
-  s = stat(name)
-  if s.ok? {
-    fail ferr("mkdir" + " " + name, c("ENOTDIR")) if !s.unwrap.is_dir
-    return
-  }
-  # Missing ancestors, nearest first.
-  todo: [Str] = []
-  p = path.clean(name)
-  loop {
-    break if p == "/" || p == "." || p.size == 0
-    st = stat(p)
-    break if st.ok?
-    todo << p
-    p = path.dir(p)
-  }
-  i = todo.size - 1
-  while i >= 0 {
-    r = c_mkdir(todo[i], perm.to_i32)
-    if r != 0 {
-      code = C.errno
-      # Lost a race to another creator: fine if it is a directory now.
-      ok = false
-      if code == c("EEXIST") {
-        st = stat(todo[i])
-        ok = st.ok? && st.unwrap.is_dir
-      }
-      fail ferr("mkdir" + " " + todo[i], code) if !ok
-    }
-    i -= 1
-  }
-}
-
-# Removes a file or an empty directory.
-pub def remove(name: Str) -> ~Unit {
-  return if c_unlink(name) == 0
-  e1 = C.errno
-  return if c_rmdir(name) == 0
-  e2 = C.errno
-  code = e1
-  code = e2 if e2 != c("ENOTDIR")
-  fail ferr("remove" + " " + name, code)
-}
-
-# Removes the path and everything below it; not an error if it doesn't exist.
-pub def remove_all(name: Str) -> ~Unit {
-  st = lstat(name)
-  if st.err? {
-    e = st.err.unwrap
-    return if is_not_exist(e)
-    fail e
-  }
-  if st.unwrap.is_dir {
-    entries = ~read_dir(name)
-    for en in entries {
-      ~remove_all(path.join([name, en.name]))
-    }
-  }
-  ~remove(name)
-}
-
-# Moves (renames) old to new, replacing a file at new.
-pub def rename(old: Str, new: Str) -> ~Unit {
-  r = c_rename(old, new)
-  fail ferr("rename" + " " + old + " " + new, C.errno) if r != 0
-}
-
-pub def chmod(name: Str, mode: Int) -> ~Unit {
-  r = c_chmod(name, mode.to_i32)
-  fail ferr("chmod" + " " + name, C.errno) if r != 0
-}
-
-pub def truncate(name: Str, size: Int) -> ~Unit {
-  r = c_truncate(name, size)
-  fail ferr("truncate" + " " + name, C.errno) if r != 0
-}
-
-# A hard link `new` to `old`.
-pub def link(old: Str, new: Str) -> ~Unit {
-  r = c_link(old, new)
-  fail ferr("link" + " " + old + " " + new, C.errno) if r != 0
-}
-
-# A symbolic link at `new` pointing to `old`.
-pub def symlink(old: Str, new: Str) -> ~Unit {
-  r = c_symlink(old, new)
-  fail ferr("symlink" + " " + old + " " + new, C.errno) if r != 0
-}
-
-# The target of a symbolic link.
-pub def readlink(name: Str) -> ~Str {
-  buf = zeros(4096)
-  n = c_readlink(name, buf, 4096)
-  fail ferr("readlink" + " " + name, C.errno) if n < 0
-  Str.from_bytes(buf[0...n])
-}
-
-# A new directory in `dir` (the temp dir if ""), named pattern with its last
-# `*` replaced by a random string (or the string appended). Returns its path.
-pub def mkdir_temp(dir: Str, pattern: Str) -> ~Str {
-  fail ferr("mkdirtemp " + pattern, ERR_PATTERN_SEP) if pattern.bytes.any? { |b| b == 47 }
-  base = dir
-  base = temp_dir if base.size == 0
-  i = 0
-  while i < 10000 {
-    name = temp_name(base, pattern, i)
-    r = c_mkdir(name, 0o700)
-    return name if r == 0
-    code = C.errno
-    # A missing directory is reported for the directory (Go).
-    fail ferr("mkdirtemp " + base, code) if code == c("ENOENT") && stat(base).err != none
-    fail ferr("mkdir" + " " + name, code) if code != c("EEXIST")
-    i += 1
-  }
-  fail ferr("mkdir" + " " + base, c("EEXIST"))
-}
-
-# Creates and opens (read-write) a new file the same way; see mkdir_temp.
-pub def create_temp(dir: Str, pattern: Str) -> ~File {
-  fail ferr("createtemp " + pattern, ERR_PATTERN_SEP) if pattern.bytes.any? { |b| b == 47 }
-  base = dir
-  base = temp_dir if base.size == 0
-  i = 0
-  while i < 10000 {
-    name = temp_name(base, pattern, i)
-    fd = alx_sys_open(name, native_flags(O_RDWR | O_CREATE | O_EXCL).to_i32, 0o600)
-    return new_file(fd.to_i, name) if fd >= 0
-    code = C.errno
-    fail ferr("open" + " " + name, code) if code != c("EEXIST")
-    i += 1
-  }
-  fail ferr("open" + " " + base, c("EEXIST"))
-}
-
-def temp_name(base: Str, pattern: Str, attempt: Int) -> Str {
-  t = alx_mono_ns
-  r = ((t ^ (getpid << 20) ^ (attempt * 2654435761)) & 0x7fffffff).to_s
-  star = -1
-  i = pattern.size - 1
-  while i >= 0 && star < 0 {
-    star = i if pattern[i] == 42
-    i -= 1
-  }
-  name = pattern + r
-  name = pattern[0...star] + r + pattern[star + 1...pattern.size] if star >= 0
-  path.join([base, name])
-}
-
-# ---------------------------------------------------------------- environment
-
-# The program's arguments; args[0] is the program (under `alx run`, the .alx
-# file).
-pub def args -> [Str] {
-  out: [Str] = []
-  n = alx_argc
-  i = 0
-  while i < n {
-    out << Str.from_cstr(alx_argv(i))
-    i += 1
-  }
-  out
-}
-
-# The value of an environment variable, or none if it isn't set (Go's
-# LookupEnv). `getenv("X") || ""` is Go's Getenv.
-pub def getenv(key: Str) -> Str? {
-  p = c_getenv(key)
-  return none if p.null?
-  Str.from_cstr(p)
-}
-
-pub def setenv(key: Str, value: Str) -> ~Unit {
-  r = c_setenv(key, value, 1)
-  fail ferr("setenv" + " " + key, C.errno) if r != 0
-}
-
-pub def unsetenv(key: Str) -> ~Unit {
-  r = c_unsetenv(key)
-  fail ferr("unsetenv" + " " + key, C.errno) if r != 0
-}
-
-# The environment as "KEY=value" strings.
-pub def environ -> [Str] {
-  out: [Str] = []
-  i = 0
-  loop {
-    p = alx_environ(i)
-    break if p.null?
-    out << Str.from_cstr(p)
-    i += 1
-  }
-  out
-}
-
-# Ends the program at once with this status (deferred calls don't run).
-pub def exit(code: Int) {
-  c_exit(code.to_i32)
-}
-
-pub def getpid -> Int { c_getpid.to_i }
-pub def getppid -> Int { c_getppid.to_i }
-pub def getuid -> Int { c_getuid.to_i }
-pub def getgid -> Int { c_getgid.to_i }
-
-pub def hostname -> ~Str {
-  buf = zeros(256)
-  r = c_gethostname(buf, 255)
-  fail ferr("hostname" + " " + "", C.errno) if r != 0
-  cstr_of(buf)
-}
-
-# The current working directory.
-pub def getwd -> ~Str {
-  buf = zeros(4096)
-  p = c_getcwd(buf, 4096)
-  fail ferr("getwd" + " " + "", C.errno) if p.null?
-  cstr_of(buf)
-}
-
-pub def chdir(dir: Str) -> ~Unit {
-  r = c_chdir(dir)
-  fail ferr("chdir" + " " + dir, C.errno) if r != 0
-}
-
-# The directory for temporary files: $TMPDIR, else /tmp.
-pub def temp_dir -> Str {
-  d = getenv("TMPDIR") || ""
-  return "/tmp" if d.size == 0
-  d
-}
-
-pub def user_home_dir -> ~Str {
-  d = getenv("HOME") || ""
-  fail ferr("home" + " " + "$HOME", c("ENOENT")) if d.size == 0
-  d
-}
-
-pub def user_config_dir -> ~Str {
-  d = getenv("XDG_CONFIG_HOME") || ""
-  return d if d.size > 0
-  h = ~user_home_dir
-  h + "/.config"
-}
-
-pub def user_cache_dir -> ~Str {
-  d = getenv("XDG_CACHE_HOME") || ""
-  return d if d.size > 0
-  h = ~user_home_dir
-  h + "/.cache"
-}
+# The stat buffer's size: ALX_STAT_FIELDS Ints.
+STAT_SIZE = 88

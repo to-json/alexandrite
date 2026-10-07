@@ -1,0 +1,406 @@
+#![test(external)]
+# Go's stream_test.go (go1.27, the jsonv2-backed build), translated.
+#
+# A json.Value stands for Go's `any`; it keeps an object's members in their
+# order (Go's map[string]any is written sorted), so the stream's object is
+# given in Go's sorted order.
+#
+# Not translated, and why:
+#   TestEncoderErrorAndReuseEncodeState's first half: a cyclic value (alx
+#     values can't refer to themselves).
+#   TestDecoderMaxBytesError: http.MaxBytesReader isn't ported.
+
+import "bytes"
+import "encoding/json"
+import "io"
+import "net/http"
+import "net/http/httptest"
+import "strings"
+
+STREAM_TEST = ["0.1", "\"hello\"", "null", "true", "false", "[\"a\",\"b\",\"c\"]", "{\"ß\":\"long s\",\"K\":\"Kelvin\"}", "3.14"]
+
+STREAM_ENCODED = "0.1\n\"hello\"\nnull\ntrue\nfalse\n[\"a\",\"b\",\"c\"]\n{\"ß\":\"long s\",\"K\":\"Kelvin\"}\n3.14\n"
+
+def stream_values -> [json.Value] { STREAM_TEST.map { json.parse(it).unwrap } }
+
+def nlines(s: Str, n: Int) -> Str {
+  return "" if n <= 0
+  k = n
+  i = 0
+  while i < s.size {
+    if s[i] == 10 {
+      k -= 1
+      return s[0...(i + 1)] if k == 0
+    }
+    i += 1
+  }
+  s
+}
+
+test "TestEncoder" {
+  vs = stream_values()
+  i = 0
+  while i <= vs.size {
+    buf = bytes.new_buffer([])
+    enc = json.new_encoder(buf)
+    # Check that enc.set_indent!("", "") turns off indentation.
+    enc.set_indent!(">", ".")
+    enc.set_indent!("", "")
+    for v in vs[0...i] {
+      enc.~encode!(v)
+    }
+    assert_eq buf.string, nlines(STREAM_ENCODED, i)
+    i += 1
+  }
+}
+
+#[derive(Json)]
+struct Data2 {
+  #[json("A")] a: Str
+  #[json("I")] i: Int
+}
+
+test "TestEncoderErrorAndReuseEncodeState" {
+  buf = bytes.new_buffer([])
+  enc = json.new_encoder(buf)
+  # (Go's cyclic value: see the header; an unsupported value fails instead)
+  assert enc.encode!(0.0 / zero_f()).err?
+  want = Data2.new(a: "a", i: 1)
+  enc.~encode!(want)
+  got = json.~unmarshal_into(buf.string, Data2.json_zero)
+  assert_eq got.a, want.a
+  assert_eq got.i, want.i
+}
+
+def zero_f -> Float { 0.0 }
+
+STREAM_ENCODED_INDENT = "0.1\n\"hello\"\nnull\ntrue\nfalse\n[\n>.\"a\",\n>.\"b\",\n>.\"c\"\n>]\n{\n>.\"ß\": \"long s\",\n>.\"K\": \"Kelvin\"\n>}\n3.14\n"
+
+test "TestEncoderIndent" {
+  buf = bytes.new_buffer([])
+  enc = json.new_encoder(buf)
+  enc.set_indent!(">", ".")
+  for v in stream_values() {
+    enc.~encode!(v)
+  }
+  assert_eq buf.string, STREAM_ENCODED_INDENT
+}
+
+struct StrMarshaler {
+  s: Str
+  def marshal_json -> ~[Byte] { s.bytes }
+}
+
+#[derive(Json)]
+struct TagStruct {
+  #[json("<>&#! ")] valid: Int
+  # Go ignores a tag that isn't a valid name; alx accepts any name
+  #[json("Invalid")] invalid: Int
+}
+
+#[derive(Json)]
+struct MarshalerStruct {
+  #[json("NonPtr")] non_ptr: StrMarshaler
+  #[json("Ptr")] ptr: StrMarshaler
+}
+
+#[derive(Json)]
+struct StringOption {
+  #[field(json: "bar,string")] bar: Str
+}
+
+def encode_both[X](v: X) -> (Str, Str) {
+  buf = bytes.new_buffer([])
+  enc = json.new_encoder(buf)
+  enc.encode!(v).unwrap
+  a = strings.trim_space(buf.string)
+  buf.reset!
+  enc.set_escape_html!(false)
+  enc.encode!(v).unwrap
+  (a, strings.trim_space(buf.string))
+}
+
+test "TestEncoderSetEscapeHTML" {
+  assert_eq encode_both(CMarshal.new), ("\"\\u003c\\u0026\\u003e\"", "\"<&>\"")
+  assert_eq encode_both(CText.new), ("\"\\\"\\u003c\\u0026\\u003e\\\"\"", "\"\\\"<&>\\\"\"")
+  assert_eq encode_both("<&>"), ("\"\\u003c\\u0026\\u003e\"", "\"<&>\"")
+  assert_eq encode_both(TagStruct.new), ("{\"\\u003c\\u003e\\u0026#! \":0,\"Invalid\":0}", "{\"<>&#! \":0,\"Invalid\":0}")
+  ms = MarshalerStruct.new(non_ptr: StrMarshaler.new(s: "\"<str>\""), ptr: StrMarshaler.new(s: "\"<str>\""))
+  assert_eq encode_both(ms), ("{\"NonPtr\":\"\\u003cstr\\u003e\",\"Ptr\":\"\\u003cstr\\u003e\"}", "{\"NonPtr\":\"<str>\",\"Ptr\":\"<str>\"}")
+  # https://golang.org/issue/34154
+  so = StringOption.new(bar: "<html>foobar</html>")
+  assert_eq encode_both(so), ("{\"bar\":\"\\\"\\\\u003chtml\\\\u003efoobar\\\\u003c/html\\\\u003e\\\"\"}", "{\"bar\":\"\\\"<html>foobar</html>\\\"\"}")
+}
+
+test "TestDecoder" {
+  i = 0
+  while i <= STREAM_TEST.size {
+    # The stream without newlines.
+    text = strings.replace_all(nlines(STREAM_ENCODED, i), "\n", "")
+    dec = json.new_decoder(bytes.new_reader(text.bytes))
+    j = 0
+    while j < i {
+      v = dec.~decode!(json.Value.json_zero)
+      assert_eq v.unwrap.to_s, STREAM_TEST[j]
+      j += 1
+    }
+    i += 1
+  }
+}
+
+#[derive(Json)]
+struct NameS {
+  #[json("Name")] name: Str
+}
+
+test "TestDecoderBuffered" {
+  d = json.new_decoder(bytes.new_reader("{\"Name\": \"Gopher\"} extra ".bytes))
+  m = d.~decode!(NameS.json_zero)
+  assert_eq m.unwrap.name, "Gopher"
+  rest = io.~read_all(d.buffered)
+  assert_eq Str.from_bytes(rest), " extra "
+}
+
+#[derive(Json)]
+struct RawData {
+  #[json("X")] x: Float
+  #[json("Id")] id: json.RawMessage
+  #[json("Y")] y: Float
+}
+
+test "TestRawMessage" {
+  raw = "[\"\\u0056\",null]"
+  want = "{\"X\":0.1,\"Id\":[\"\\u0056\",null],\"Y\":0.2}"
+  data = json.~unmarshal_into(want, RawData.json_zero)
+  assert_eq data.id.to_s, raw
+  assert_eq json.~marshal(data), want
+}
+
+#[derive(Json)]
+struct NullRawData {
+  #[json("X")] x: Float
+  #[json("Id")] id: json.RawMessage
+  #[json("IdPtr")] id_ptr: json.RawMessage?
+  #[json("Y")] y: Float
+}
+
+test "TestNullRawMessage" {
+  want = "{\"X\":0.1,\"Id\":null,\"IdPtr\":null,\"Y\":0.2}"
+  data = json.~unmarshal_into(want, NullRawData.json_zero)
+  assert_eq data.id.to_s, "null"
+  assert data.id_ptr.none?, "pointer mismatch: got non-nil, want nil"
+  assert_eq json.~marshal(data), want
+}
+
+# Go writes into a net.Pipe and leaves it open: a read past the value would
+# block. Here the reader gives the value once and fails the test if it is
+# read again.
+struct OnceReader {
+  data: [Byte]
+  reads: [Int]
+
+  def read!(b: [Byte]) -> ~Int {
+    self.reads[0] += 1
+    assert self.reads[0] == 1, "Decode read past the value"
+    copy(b, data)
+    data.size
+  }
+}
+
+test "TestBlocking" {
+  for s in ["{\"x\": 1}", "[1, 2, 3]"] {
+    dec = json.new_decoder(OnceReader.new(data: s.bytes, reads: [0]))
+    v = dec.~decode!(json.Value.json_zero)
+    assert_eq v.unwrap.to_s, json.~compact(s)
+  }
+}
+
+# Expected tokens: Go's Delim('['), float64(10), "b", false, ... as text;
+# "D:" + a decode into an `any` (its JSON, or the error).
+def tok_text(t: json.Token) -> Str {
+  case t {
+    json.Token.Delim(r) => "Delim(" + json.delim_text(r) + ")"
+    json.Token.Bool(v) => v ? "true" : "false"
+    json.Token.Float(v) => "float64(#{json.marshal(v).unwrap})"
+    json.Token.Num(v) => "Number(#{v})"
+    json.Token.String(v) => json.quote(v)
+    json.Token.Null => "nil"
+  }
+}
+
+def syntax_text(e: Error) -> Str {
+  case e {
+    json.JsonError.Syntax(m, o) => "SyntaxError(#{m} @#{o})"
+    _ => "error: " + e.message
+  }
+}
+
+test "TestDecodeInStream" {
+  a513 = "a" * 513
+  tests = [
+    # streaming token cases
+    ("10", ["float64(10)"]),
+    (" [10] ", ["Delim([)", "float64(10)", "Delim(])"]),
+    (" [false,10,\"b\"] ", ["Delim([)", "false", "float64(10)", "\"b\"", "Delim(])"]),
+    ("{ \"a\": 1 }", ["Delim({)", "\"a\"", "float64(1)", "Delim(})"]),
+    ("{\"a\": 1, \"b\":\"3\"}", ["Delim({)", "\"a\"", "float64(1)", "\"b\"", "\"3\"", "Delim(})"]),
+    (" [{\"a\": 1},{\"a\": 2}] ", ["Delim([)", "Delim({)", "\"a\"", "float64(1)", "Delim(})", "Delim({)", "\"a\"", "float64(2)", "Delim(})", "Delim(])"]),
+    ("{\"obj\": {\"a\": 1}}", ["Delim({)", "\"obj\"", "Delim({)", "\"a\"", "float64(1)", "Delim(})", "Delim(})"]),
+    ("{\"obj\": [{\"a\": 1}]}", ["Delim({)", "\"obj\"", "Delim([)", "Delim({)", "\"a\"", "float64(1)", "Delim(})", "Delim(])", "Delim(})"]),
+    # streaming tokens with intermittent Decode()
+    ("{ \"a\": 1 }", ["Delim({)", "\"a\"", "D:1", "Delim(})"]),
+    (" [ { \"a\" : 1 } ] ", ["Delim([)", "D:{\"a\":1}", "Delim(])"]),
+    (" [{\"a\": 1},{\"a\": 2}] ", ["Delim([)", "D:{\"a\":1}", "D:{\"a\":2}", "Delim(])"]),
+    ("{ \"obj\" : [ { \"a\" : 1 } ] }", ["Delim({)", "\"obj\"", "Delim([)", "D:{\"a\":1}", "Delim(])", "Delim(})"]),
+    ("{\"obj\": {\"a\": 1}}", ["Delim({)", "\"obj\"", "D:{\"a\":1}", "Delim(})"]),
+    ("{\"obj\": [{\"a\": 1}]}", ["Delim({)", "\"obj\"", "D:[{\"a\":1}]", "Delim(})"]),
+    (" [{\"a\": 1} {\"a\": 2}] ", ["Delim([)", "D:{\"a\":1}", "D:SyntaxError(invalid character '{' after array element @#{" [{\"a\": 1} {".size})"]),
+    ("{ \"" + a513 + "\" 1 }", ["Delim({)", json.quote(a513), "D:SyntaxError(invalid character '1' after object key @#{"{ \"".size + 513 + "\" 1".size})"]),
+    ("{ \"\\a\" }", ["Delim({)", "SyntaxError(invalid escape sequence `\\a` in string @#{"{ \"\\a".size})"]),
+    (" \\a", ["SyntaxError(invalid character '\\\\' looking for beginning of value @#{" \\".size})"]),
+    (",", ["SyntaxError(invalid character ',' looking for beginning of value @1)"]),
+  ]
+  for t in tests {
+    input, exp = t
+    dec = json.new_decoder(bytes.new_reader(input.bytes))
+    for want in exp {
+      want_more = want != "Delim(])" && want != "Delim(})"
+      assert dec.has_more! == want_more, "#{input}: has_more! before #{want}"
+      got = ""
+      if want.start_with?("D:") {
+        v, err = dec.decode_partial!(json.Value.json_zero)
+        got = err.some? ? "D:" + syntax_text(err.unwrap) : "D:" + v.unwrap.to_s
+      } else {
+        r = dec.token!
+        if e = r.err {
+          got = syntax_text(e)
+        } else {
+          got = tok_text(r.unwrap.unwrap)
+        }
+      }
+      assert_eq got, want
+      break if want.include?("SyntaxError")
+    }
+  }
+}
+
+#[derive(Json)]
+struct FooS {
+  #[json("Foo")] foo: Str
+}
+
+def serve_raw(w: http.ResponseWriter, _r: http.Request) {
+  ww = w
+  ww.write!("{ \"foo\": \"bar\" }".bytes).unwrap
+}
+
+# Test from golang.org/issue/11893
+test "TestHTTPDecoding" {
+  ts = httptest.new_server_func(->(w: http.ResponseWriter, r: http.Request) { serve_raw(w, r) })
+  res = http.~get(ts.url)
+  d = json.new_decoder(bytes.new_reader(res.body))
+  foo = d.~decode!(FooS.json_zero)
+  assert_eq foo.unwrap.foo, "bar"
+  # make sure we get the EOF the second time (none)
+  assert d.~decode!(FooS.json_zero).none?
+  ts.close
+}
+
+# A reader that fails with `fail_with` (instead of ending) at the end.
+struct FailingReader {
+  r: bytes.Reader
+  fail_at_end: Bool
+
+  def read!(b: [Byte]) -> ~Int {
+    n = r.~read!(b)
+    fail io.StreamError.UnexpectedEof if n == 0 && fail_at_end
+    n
+  }
+}
+
+test "TestTokenError" {
+  tests = [
+    ("", false, "EOF"),
+    ("{", false, "EOF"),
+    ("{\"", false, "error: unexpected EOF"),
+    ("{\"k\"", false, "EOF"),
+    ("{\"k\":", false, "EOF"),
+    ("{\"k\",", false, "SyntaxError(invalid character ',' after object key @5)"),
+    ("{\"k\"}", false, "SyntaxError(invalid character '}' after object key @5)"),
+    (" [0", false, "EOF"),
+    ("[0.", false, "error: unexpected EOF"),
+    ("[0. ", false, "SyntaxError(invalid character ' ' in numeric literal @4)"),
+    ("[0,", false, "EOF"),
+    ("[0:", false, "SyntaxError(invalid character ':' after array element @3)"),
+    ("n", false, "error: unexpected EOF"),
+    ("nul", false, "error: unexpected EOF"),
+    ("fal ", false, "SyntaxError(invalid character ' ' in literal false (expecting 's') @4)"),
+    ("false", false, "EOF"),
+    ("  1e1000", false, "error: json: cannot unmarshal number 1e1000 into Go value of type Float"),
+    ("{\"foo\":1}{\"bar\":2}", false, "EOF"),
+    ("{\"foo\":1}{\"bar\":2}", true, "error: unexpected EOF"),
+  ]
+  for t in tests {
+    input, fails, want = t
+    d = json.new_decoder(FailingReader.new(r: bytes.new_reader(input.bytes), fail_at_end: fails))
+    got = ""
+    loop {
+      r = d.token!
+      if e = r.err {
+        got = syntax_text(e)
+        break
+      }
+      if r.unwrap.none? {
+        got = "EOF"
+        break
+      }
+    }
+    assert_eq got, want
+  }
+}
+
+test "TestDecoderInputOffset" {
+  input = " [\n\t\t[ ] , [ \"one\" ] , [ \"one\" , \"two\" ] ,\n\t\t{ } , { \"alpha\" : \"bravo\" } , { \"alpha\" : \"bravo\" , \"fizz\" : \"buzz\" }\n\t] "
+  want_offsets = [0, 1, 2, 5, 6, 7, 8, 9, 12, 13, 18, 19, 20, 21, 24, 25, 30, 31, 38, 39, 40, 41, 46, 47, 48, 49, 52, 53, 60, 61, 70, 71, 72, 73, 76, 77, 84, 85, 94, 95, 103, 104, 112, 113, 114, 116, 117, 117, 117, 117]
+  want_mores = [true, true, false, true, true, false, true, true, true, false, true, false, true, true, true, false, true, true, true, true, true, false, false, false, false]
+  d = json.new_decoder(bytes.new_reader(input.bytes))
+  oi = 0
+  mi = 0
+  assert_eq d.input_offset, want_offsets[oi]
+  oi += 1
+  assert_eq d.has_more!, want_mores[mi]
+  mi += 1
+  assert_eq d.input_offset, want_offsets[oi]
+  oi += 1
+  loop {
+    r = d.~token!
+    break if r.none?
+    assert_eq d.input_offset, want_offsets[oi]
+    oi += 1
+    assert_eq d.has_more!, want_mores[mi]
+    mi += 1
+    assert_eq d.input_offset, want_offsets[oi]
+    oi += 1
+  }
+  assert_eq d.input_offset, want_offsets[oi]
+  oi += 1
+  assert_eq d.has_more!, want_mores[mi]
+  mi += 1
+  assert_eq d.input_offset, want_offsets[oi]
+  oi += 1
+  assert_eq oi, want_offsets.size
+  assert_eq mi, want_mores.size
+
+  # ArrayEOF
+  d = json.new_decoder(bytes.new_reader(" [ \"fizz\" , ".bytes))
+  loop {
+    break if d.~token!.none?
+  }
+  assert_eq d.input_offset, " [ \"fizz\" ,".size
+  # ObjectEOF
+  d = json.new_decoder(bytes.new_reader(" { \"fizz\" : ".bytes))
+  loop {
+    break if d.~token!.none?
+  }
+  assert_eq d.input_offset, " { \"fizz\" :".size
+}

@@ -486,8 +486,20 @@ mod rt {
     }
     fn stat_fill(m: &std::fs::Metadata, out: *mut u8) {
         use std::os::unix::fs::MetadataExt;
-        let v: [i64; 6] = [m.mode() as i64, m.size() as i64, m.mtime() * 1_000_000_000 + m.mtime_nsec(), m.atime() * 1_000_000_000 + m.atime_nsec(), m.ino() as i64, m.nlink() as i64];
-        unsafe { std::ptr::copy_nonoverlapping(v.as_ptr() as *const u8, out, 48) };
+        let v: [i64; 11] = [
+            m.mode() as i64,
+            m.size() as i64,
+            m.mtime() * 1_000_000_000 + m.mtime_nsec(),
+            m.atime() * 1_000_000_000 + m.atime_nsec(),
+            m.ino() as i64,
+            m.nlink() as i64,
+            m.dev() as i64,
+            m.uid() as i64,
+            m.gid() as i64,
+            m.rdev() as i64,
+            m.ctime() * 1_000_000_000 + m.ctime_nsec(),
+        ];
+        unsafe { std::ptr::copy_nonoverlapping(v.as_ptr() as *const u8, out, 88) };
     }
     fn neg_errno(e: &std::io::Error) -> i64 {
         -(e.raw_os_error().unwrap_or(5) as i64)
@@ -517,6 +529,31 @@ mod rt {
     struct DirH {
         it: std::fs::ReadDir,
         cur: std::ffi::CString,
+    }
+    pub unsafe fn shim_alx_sys_dir_fdopen(fd: i64) -> i64 {
+        use std::os::fd::FromRawFd;
+        let f = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd as i32) });
+        match f.metadata() {
+            Ok(m) if !m.is_dir() => return -sysc("ENOTDIR") as i64,
+            Err(e) => return neg_errno(&e),
+            _ => {}
+        }
+        // The directory's path: F_GETPATH on macOS, /proc elsewhere.
+        let p: std::path::PathBuf = if cfg!(target_os = "macos") {
+            let mut buf = [0u8; 1024];
+            if unsafe { libc_fcntl(fd as i32, 50, buf.as_mut_ptr()) } < 0 {
+                return neg_errno(&std::io::Error::last_os_error());
+            }
+            let n = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            use std::os::unix::ffi::OsStrExt;
+            std::ffi::OsStr::from_bytes(&buf[..n]).into()
+        } else {
+            format!("/proc/self/fd/{fd}").into()
+        };
+        match std::fs::read_dir(p) {
+            Ok(it) => Box::into_raw(Box::new(DirH { it, cur: std::ffi::CString::default() })) as usize as i64,
+            Err(e) => neg_errno(&e),
+        }
     }
     pub unsafe fn shim_alx_sys_dir_open(path: *const std::ffi::c_char) -> i64 {
         match std::fs::read_dir(cpath(path)) {
@@ -654,6 +691,69 @@ mod rt {
         unsafe { std::ptr::copy_nonoverlapping(v.as_ptr() as *const u8, out, 40) };
         0
     }
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn shim_alx_sys_spawn2(path: *const std::ffi::c_char, argv: *mut u8, argc: i64, env: *mut u8, envc: i64, dir: *const std::ffi::c_char, fdblob: *mut u8, nfds: i64) -> i64 {
+        use std::os::unix::process::CommandExt;
+        let av = unsafe { nul_list(argv, argc) };
+        let mut cmd = std::process::Command::new(cpath(path));
+        if let Some(a0) = av.first() {
+            cmd.arg0(a0);
+        }
+        if av.len() > 1 {
+            cmd.args(&av[1..]);
+        }
+        if envc >= 0 {
+            cmd.env_clear();
+            for kv in unsafe { nul_list(env, envc) } {
+                let kv = kv.to_string_lossy().into_owned();
+                let (k, v) = kv.split_once('=').unwrap_or((&kv, ""));
+                cmd.env(k, v);
+            }
+        }
+        let d = cpath(dir);
+        if !d.as_os_str().is_empty() {
+            cmd.current_dir(d);
+        }
+        let mut fds = vec![0i64; nfds.max(0) as usize];
+        unsafe { std::ptr::copy_nonoverlapping(fdblob, fds.as_mut_ptr() as *mut u8, fds.len() * 8) };
+        let get = |i: usize| fds.get(i).copied().unwrap_or(-1);
+        let (i0, i1, i2) = match (child_stdio(get(0)), child_stdio(get(1)), child_stdio(get(2))) {
+            (Ok(a), Ok(b), Ok(c)) => (a, b, c),
+            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => return e,
+        };
+        cmd.stdin(i0).stdout(i1).stderr(i2);
+        // Descriptors 3 and up: duplicates above every target, moved into place
+        // in the child.
+        let mut extra: Vec<(i32, i32)> = vec![];
+        for (i, &fd) in fds.iter().enumerate().skip(3) {
+            if fd >= 0 {
+                let d = unsafe { libc_fcntl(fd as i32, sysc("F_DUPFD_CLOEXEC"), (nfds + 3) as i32) };
+                if d < 0 {
+                    return neg_errno(&std::io::Error::last_os_error());
+                }
+                extra.push((d, i as i32));
+            }
+        }
+        let moves = extra.clone();
+        unsafe {
+            cmd.pre_exec(move || {
+                for &(d, i) in &moves {
+                    if dup2(d, i) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+        let r = match cmd.spawn() {
+            Ok(c) => c.id() as i64,
+            Err(e) => neg_errno(&e),
+        };
+        for (d, _) in extra {
+            unsafe { close(d) };
+        }
+        r
+    }
     pub unsafe fn shim_alx_sys_exec(argv: *mut u8, argc: i64, env: *mut u8, envc: i64, dir: *const std::ffi::c_char, fd0: i64, fd1: i64, fd2: i64) -> i64 {
         use std::os::unix::process::CommandExt;
         let av = unsafe { nul_list(argv, argc) };
@@ -710,6 +810,22 @@ mod rt {
         }
         0
     }
+    pub unsafe fn shim_alx_sys_polln(blob: *mut u8, n: i64) -> i64 {
+        let mut fds: Vec<PollFd> = (0..n.max(0) as usize)
+            .map(|i| {
+                let mut v = [0i64; 2];
+                unsafe { std::ptr::copy_nonoverlapping(blob.add(16 * i), v.as_mut_ptr() as *mut u8, 16) };
+                PollFd { fd: v[0] as i32, events: if v[1] == 1 { 1 } else { 4 }, revents: 0 }
+            })
+            .collect();
+        while unsafe { poll(fds.as_mut_ptr(), fds.len() as std::ffi::c_ulong, -1) } < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::Interrupted {
+                return neg_errno(&e);
+            }
+        }
+        0
+    }
     pub unsafe fn shim_alx_fd_wait(fd: i64, mode: i64) -> i64 {
         // In slices: closing a descriptor in another thread doesn't wake a
         // poll on it (macOS), so check now and then that it's still open.
@@ -733,6 +849,66 @@ mod rt {
     }
     pub unsafe fn shim_alx_fd_close(fd: i64) -> i64 {
         if unsafe { close(fd as i32) } == 0 { 0 } else { neg_errno(&std::io::Error::last_os_error()) }
+    }
+    unsafe extern "C" {
+        fn read(fd: i32, buf: *mut u8, n: usize) -> isize;
+    }
+    // Blocking reads and writes (port-issues #166): tasks are OS threads
+    // here, so blocking is fine; EAGAIN on a non-blocking fd waits.
+    pub unsafe fn shim_alx_sys_read(fd: i64, buf: *mut u8, n: i64) -> i64 {
+        loop {
+            let r = unsafe { read(fd as i32, buf, n.max(0) as usize) };
+            if r >= 0 {
+                return r as i64;
+            }
+            let e = std::io::Error::last_os_error();
+            match e.kind() {
+                std::io::ErrorKind::Interrupted => {}
+                std::io::ErrorKind::WouldBlock => {
+                    let w = unsafe { shim_alx_fd_wait(fd, 1) };
+                    if w < 0 {
+                        return w;
+                    }
+                }
+                _ => return neg_errno(&e),
+            }
+        }
+    }
+    pub unsafe fn shim_alx_sys_executable(out: *mut u8, n: i64) -> i64 {
+        use std::os::unix::ffi::OsStrExt;
+        match std::env::current_exe() {
+            Ok(p) => {
+                let b = p.as_os_str().as_bytes();
+                if b.len() as i64 >= n {
+                    return -sysc("ENAMETOOLONG") as i64;
+                }
+                unsafe {
+                    std::ptr::copy_nonoverlapping(b.as_ptr(), out, b.len());
+                    *out.add(b.len()) = 0;
+                }
+                b.len() as i64
+            }
+            Err(e) => neg_errno(&e),
+        }
+    }
+    pub unsafe fn shim_alx_sys_write(fd: i64, buf: *mut u8, n: i64) -> i64 {
+        loop {
+            let r = unsafe { write(fd as i32, buf, n.max(0) as usize) };
+            if r >= 0 {
+                return r as i64;
+            }
+            let e = std::io::Error::last_os_error();
+            match e.kind() {
+                std::io::ErrorKind::Interrupted => {}
+                std::io::ErrorKind::WouldBlock => {
+                    let w = unsafe { shim_alx_fd_wait(fd, 2) };
+                    if w < 0 {
+                        return w;
+                    }
+                }
+                _ => return neg_errno(&e),
+            }
+        }
     }
     fn net_err(e: &std::io::Error) -> i64 {
         match e.raw_os_error() {
@@ -940,6 +1116,379 @@ mod rt {
             len += s.len() + 1;
         }
         len as i64
+    }
+
+    // The general socket layer (alx_net_* in alx.c): raw libc calls, with
+    // addresses in the runtime's 128-byte canonical form. Constants come from
+    // the C runtime's table (sysc). Ancillary data (recvmsg / sendmsg / unix
+    // rights), multicast membership, interface listing and reverse / canonical
+    // name lookups aren't in the oracle: they fail with ENOSYS.
+    unsafe extern "C" {
+        #[link_name = "socket"]
+        fn c_socket(d: i32, t: i32, p: i32) -> i32;
+        #[link_name = "bind"]
+        fn c_bind(fd: i32, a: *const u8, l: u32) -> i32;
+        #[link_name = "connect"]
+        fn c_connect(fd: i32, a: *const u8, l: u32) -> i32;
+        #[link_name = "listen"]
+        fn c_listen(fd: i32, b: i32) -> i32;
+        #[link_name = "accept"]
+        fn c_accept(fd: i32, a: *mut u8, l: *mut u32) -> i32;
+        #[link_name = "getsockname"]
+        fn c_getsockname(fd: i32, a: *mut u8, l: *mut u32) -> i32;
+        #[link_name = "getpeername"]
+        fn c_getpeername(fd: i32, a: *mut u8, l: *mut u32) -> i32;
+        #[link_name = "recvfrom"]
+        fn c_recvfrom(fd: i32, b: *mut u8, n: usize, f: i32, a: *mut u8, l: *mut u32) -> isize;
+        #[link_name = "sendto"]
+        fn c_sendto(fd: i32, b: *const u8, n: usize, f: i32, a: *const u8, l: u32) -> isize;
+        #[link_name = "setsockopt"]
+        fn c_setsockopt(fd: i32, level: i32, name: i32, v: *const u8, l: u32) -> i32;
+        #[link_name = "getsockopt"]
+        fn c_getsockopt(fd: i32, level: i32, name: i32, v: *mut u8, l: *mut u32) -> i32;
+        #[link_name = "socketpair"]
+        fn c_socketpair(d: i32, t: i32, p: i32, fds: *mut i32) -> i32;
+    }
+    static NET_WAKES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn last_neg() -> i64 {
+        neg_errno(&std::io::Error::last_os_error())
+    }
+    fn net_prep(fd: i32) {
+        unsafe {
+            let fl = libc_fcntl(fd, sysc("F_GETFL"));
+            libc_fcntl(fd, sysc("F_SETFL"), fl | sysc("O_NONBLOCK"));
+            libc_fcntl(fd, sysc("F_SETFD"), sysc("FD_CLOEXEC"));
+            if sysc("SO_NOSIGPIPE") >= 0 {
+                let one: i32 = 1;
+                c_setsockopt(fd, sysc("SOL_SOCKET"), sysc("SO_NOSIGPIPE"), &one as *const i32 as *const u8, 4);
+            }
+            signal(sysc("SIGPIPE"), 1); // SIG_IGN
+        }
+    }
+    // sockaddr's family field: a byte after sa_len on macOS, a u16 elsewhere.
+    fn sa_put_family(b: &mut [u8], fam: i32, len: usize) {
+        if cfg!(target_os = "macos") {
+            b[0] = len as u8;
+            b[1] = fam as u8;
+        } else {
+            b[0..2].copy_from_slice(&(fam as u16).to_ne_bytes());
+        }
+    }
+    fn sa_family(b: &[u8]) -> i32 {
+        if cfg!(target_os = "macos") { b[1] as i32 } else { u16::from_ne_bytes([b[0], b[1]]) as i32 }
+    }
+    // The canonical form into a sockaddr (in b): its length, or -errno.
+    fn sa_from(c: &[u8], b: &mut [u8; 128]) -> i64 {
+        *b = [0; 128];
+        match c[0] {
+            4 => {
+                sa_put_family(b, sysc("AF_INET"), 16);
+                b[2] = c[1];
+                b[3] = c[2];
+                b[4..8].copy_from_slice(&c[8..12]);
+                16
+            }
+            6 => {
+                sa_put_family(b, sysc("AF_INET6"), 28);
+                b[2] = c[1];
+                b[3] = c[2];
+                b[8..24].copy_from_slice(&c[8..24]);
+                let z = u32::from_be_bytes([c[4], c[5], c[6], c[7]]);
+                b[24..28].copy_from_slice(&z.to_ne_bytes());
+                28
+            }
+            1 => {
+                let n = (c[6] as usize) << 8 | c[7] as usize;
+                if n > 104 {
+                    return -(sysc("EINVAL") as i64);
+                }
+                b[2..2 + n].copy_from_slice(&c[8..8 + n]);
+                let mut l = 2 + n;
+                if n > 0 && c[8] != 0 && n < 104 {
+                    l += 1;
+                }
+                sa_put_family(b, sysc("AF_UNIX"), l);
+                l as i64
+            }
+            _ => -(sysc("EAFNOSUPPORT") as i64),
+        }
+    }
+    fn sa_to(b: &[u8; 128], len: u32, out: *mut u8) {
+        let o = unsafe { std::slice::from_raw_parts_mut(out, 128) };
+        o.fill(0);
+        if len == 0 {
+            return;
+        }
+        let f = sa_family(b);
+        if f == sysc("AF_INET") {
+            o[0] = 4;
+            o[1] = b[2];
+            o[2] = b[3];
+            o[8..12].copy_from_slice(&b[4..8]);
+        } else if f == sysc("AF_INET6") {
+            o[0] = 6;
+            o[1] = b[2];
+            o[2] = b[3];
+            o[8..24].copy_from_slice(&b[8..24]);
+            let z = u32::from_ne_bytes([b[24], b[25], b[26], b[27]]);
+            o[4..8].copy_from_slice(&z.to_be_bytes());
+        } else if f == sysc("AF_UNIX") {
+            let mut n = (len as usize).saturating_sub(2).min(104).min(120);
+            if n > 0 && (b[2] != 0 || !cfg!(target_os = "linux")) {
+                n = b[2..2 + n].iter().position(|&x| x == 0).unwrap_or(n);
+            }
+            o[0] = 1;
+            o[6] = (n >> 8) as u8;
+            o[7] = n as u8;
+            o[8..8 + n].copy_from_slice(&b[2..2 + n]);
+        }
+    }
+    fn canon(p: *const u8) -> [u8; 128] {
+        let mut c = [0u8; 128];
+        c.copy_from_slice(unsafe { std::slice::from_raw_parts(p, 128) });
+        c
+    }
+    pub unsafe fn shim_alx_fd_wait_until(fd: i64, mode: i64, until: i64) -> i64 {
+        let wake_gen = NET_WAKES.load(std::sync::atomic::Ordering::SeqCst);
+        loop {
+            if until > 0 && unsafe { shim_alx_mono_ns() } >= until {
+                return -(sysc("ETIMEDOUT") as i64);
+            }
+            let mut p = PollFd { fd: fd as i32, events: if mode == 1 { 1 } else { 4 }, revents: 0 };
+            let r = unsafe { poll(&mut p, 1, 20) };
+            if r > 0 {
+                return 0;
+            }
+            if r < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.raw_os_error() != Some(4) {
+                    return neg_errno(&e);
+                }
+            }
+            if unsafe { libc_fcntl(fd as i32, 1) } < 0 || NET_WAKES.load(std::sync::atomic::Ordering::SeqCst) != wake_gen {
+                return 0;
+            }
+        }
+    }
+    pub unsafe fn shim_alx_task_yield() {
+        std::thread::yield_now();
+    }
+    pub unsafe fn shim_alx_fd_wake(_fd: i64) -> i64 {
+        NET_WAKES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        0
+    }
+    pub unsafe fn shim_alx_net_socket(family: i64, sotype: i64, proto: i64) -> i64 {
+        let d = match family {
+            1 => sysc("AF_UNIX"),
+            6 => sysc("AF_INET6"),
+            _ => sysc("AF_INET"),
+        };
+        let t = match sotype {
+            1 => sysc("SOCK_STREAM"),
+            2 => sysc("SOCK_DGRAM"),
+            3 => sysc("SOCK_RAW"),
+            _ => sysc("SOCK_SEQPACKET"),
+        };
+        let fd = unsafe { c_socket(d, t, proto as i32) };
+        if fd < 0 {
+            return last_neg();
+        }
+        net_prep(fd);
+        fd as i64
+    }
+    pub unsafe fn shim_alx_net_bind(fd: i64, sa: *const u8) -> i64 {
+        let mut b = [0u8; 128];
+        let l = sa_from(&canon(sa), &mut b);
+        if l < 0 {
+            return l;
+        }
+        if unsafe { c_bind(fd as i32, b.as_ptr(), l as u32) } < 0 { last_neg() } else { 0 }
+    }
+    pub unsafe fn shim_alx_net_connect(fd: i64, sa: *const u8) -> i64 {
+        let mut b = [0u8; 128];
+        let l = sa_from(&canon(sa), &mut b);
+        if l < 0 {
+            return l;
+        }
+        if unsafe { c_connect(fd as i32, b.as_ptr(), l as u32) } < 0 { last_neg() } else { 0 }
+    }
+    pub unsafe fn shim_alx_net_listen(fd: i64, backlog: i64) -> i64 {
+        if unsafe { c_listen(fd as i32, backlog as i32) } < 0 { last_neg() } else { 0 }
+    }
+    pub unsafe fn shim_alx_net_accept(fd: i64, out: *mut u8) -> i64 {
+        let mut b = [0u8; 128];
+        let mut l: u32 = 128;
+        let c = unsafe { c_accept(fd as i32, b.as_mut_ptr(), &mut l) };
+        if c < 0 {
+            return last_neg();
+        }
+        net_prep(c);
+        sa_to(&b, l, out);
+        c as i64
+    }
+    pub unsafe fn shim_alx_net_sockname(fd: i64, out: *mut u8, peer: i64) -> i64 {
+        let mut b = [0u8; 128];
+        let mut l: u32 = 128;
+        let r = unsafe { if peer != 0 { c_getpeername(fd as i32, b.as_mut_ptr(), &mut l) } else { c_getsockname(fd as i32, b.as_mut_ptr(), &mut l) } };
+        if r < 0 {
+            return last_neg();
+        }
+        sa_to(&b, l, out);
+        0
+    }
+    pub unsafe fn shim_alx_net_recvfrom(fd: i64, buf: *mut u8, n: i64, flags: i64, out: *mut u8) -> i64 {
+        let mut b = [0u8; 128];
+        let mut l: u32 = 128;
+        let f = if flags & 1 != 0 { sysc("MSG_PEEK") } else { 0 } | if flags & 2 != 0 { sysc("MSG_OOB") } else { 0 };
+        let r = unsafe { c_recvfrom(fd as i32, buf, n as usize, f, b.as_mut_ptr(), &mut l) };
+        if r < 0 {
+            return last_neg();
+        }
+        sa_to(&b, l, out);
+        r as i64
+    }
+    pub unsafe fn shim_alx_net_sendto(fd: i64, buf: *const u8, n: i64, sa: *const u8) -> i64 {
+        let c = canon(sa);
+        let r = if c[0] == 0 {
+            unsafe { c_sendto(fd as i32, buf, n as usize, 0, std::ptr::null(), 0) }
+        } else {
+            let mut b = [0u8; 128];
+            let l = sa_from(&c, &mut b);
+            if l < 0 {
+                return l;
+            }
+            unsafe { c_sendto(fd as i32, buf, n as usize, 0, b.as_ptr(), l as u32) }
+        };
+        if r < 0 { last_neg() } else { r as i64 }
+    }
+    fn enosys() -> i64 {
+        -(sysc("ENOSYS") as i64)
+    }
+    pub unsafe fn shim_alx_net_recvmsg(_fd: i64, _buf: *mut u8, _n: i64, _oob: *mut u8, _oobn: i64, _out: *mut u8, _info: *mut u8) -> i64 {
+        enosys()
+    }
+    pub unsafe fn shim_alx_net_sendmsg(_fd: i64, _buf: *const u8, _n: i64, _oob: *const u8, _oobn: i64, _sa: *const u8) -> i64 {
+        enosys()
+    }
+    pub unsafe fn shim_alx_net_unix_rights(_fds: *const u8, _n: i64, _out: *mut u8, _room: i64) -> i64 {
+        enosys()
+    }
+    pub unsafe fn shim_alx_net_parse_rights(_oob: *mut u8, _n: i64, _fds: *mut u8, _room: i64) -> i64 {
+        enosys()
+    }
+    fn sockopt_of(name: *const std::ffi::c_char) -> Option<(i32, i32)> {
+        let n = host_str(name);
+        let level = match n.as_str() {
+            "TCP_NODELAY" | "TCP_KEEPIDLE" | "TCP_KEEPINTVL" | "TCP_KEEPCNT" => sysc("IPPROTO_TCP"),
+            s if s.starts_with("IPV6_") => sysc("IPPROTO_IPV6"),
+            s if s.starts_with("IP_") => sysc("IPPROTO_IP"),
+            _ => sysc("SOL_SOCKET"),
+        };
+        let opt = sysc(&n);
+        if opt < 0 { None } else { Some((level, opt)) }
+    }
+    pub unsafe fn shim_alx_net_setsockopt(fd: i64, name: *const std::ffi::c_char, v: i64) -> i64 {
+        let Some((level, opt)) = sockopt_of(name) else { return -(sysc("ENOPROTOOPT") as i64) };
+        let r = if level == sysc("SOL_SOCKET") && opt == sysc("SO_LINGER") {
+            let l: [i32; 2] = [(v >= 0) as i32, if v >= 0 { v as i32 } else { 0 }];
+            unsafe { c_setsockopt(fd as i32, level, opt, l.as_ptr() as *const u8, 8) }
+        } else if cfg!(target_os = "macos") && level == sysc("IPPROTO_IP") && (opt == sysc("IP_MULTICAST_TTL") || opt == sysc("IP_MULTICAST_LOOP")) {
+            let b = v as u8;
+            unsafe { c_setsockopt(fd as i32, level, opt, &b, 1) }
+        } else {
+            let iv = v as i32;
+            unsafe { c_setsockopt(fd as i32, level, opt, &iv as *const i32 as *const u8, 4) }
+        };
+        if r < 0 { last_neg() } else { 0 }
+    }
+    pub unsafe fn shim_alx_net_getsockopt(fd: i64, name: *const std::ffi::c_char) -> i64 {
+        let Some((level, opt)) = sockopt_of(name) else { return -(sysc("ENOPROTOOPT") as i64) };
+        let mut b = [0u8; 8];
+        let mut l: u32 = if level == sysc("SOL_SOCKET") && opt == sysc("SO_LINGER") { 8 } else { 4 };
+        if unsafe { c_getsockopt(fd as i32, level, opt, b.as_mut_ptr(), &mut l) } < 0 {
+            return last_neg();
+        }
+        if level == sysc("SOL_SOCKET") && opt == sysc("SO_LINGER") {
+            let on = i32::from_ne_bytes([b[0], b[1], b[2], b[3]]);
+            let secs = i32::from_ne_bytes([b[4], b[5], b[6], b[7]]);
+            return if on != 0 { secs as i64 } else { 0 };
+        }
+        if l == 1 {
+            return b[0] as i64;
+        }
+        i32::from_ne_bytes([b[0], b[1], b[2], b[3]]) as i64
+    }
+    pub unsafe fn shim_alx_net_mcast(_fd: i64, _family: i64, _ip: *const u8, _ifindex: i64, _ifaddr: *const u8, _join: i64) -> i64 {
+        enosys()
+    }
+    pub unsafe fn shim_alx_net_mcast_if4(_fd: i64, _ifaddr: *const u8) -> i64 {
+        enosys()
+    }
+    pub unsafe fn shim_alx_net_getaddrinfo(host: *const std::ffi::c_char, family: i64, out: *mut u8, n: i64) -> i64 {
+        use std::net::ToSocketAddrs;
+        let h = host_str(host);
+        let Ok(addrs) = (h.as_str(), 0u16).to_socket_addrs() else { return -100000 };
+        let mut len = 0usize;
+        for a in addrs {
+            if (family == 4 && !a.is_ipv4()) || (family == 6 && !a.is_ipv6()) {
+                continue;
+            }
+            let s = match a {
+                std::net::SocketAddr::V6(v) if v.scope_id() != 0 => format!("{}%{}", v.ip(), v.scope_id()),
+                _ => a.ip().to_string(),
+            };
+            if len + s.len() + 1 > n as usize {
+                break;
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(s.as_ptr(), out.add(len), s.len());
+                *out.add(len + s.len()) = b'\n';
+            }
+            len += s.len() + 1;
+        }
+        len as i64
+    }
+    pub unsafe fn shim_alx_net_canonname(_host: *const std::ffi::c_char, _out: *mut u8, _n: i64) -> i64 {
+        -100001
+    }
+    pub unsafe fn shim_alx_net_getnameinfo(_sa: *const u8, _out: *mut u8, _n: i64) -> i64 {
+        -100001
+    }
+    pub unsafe fn shim_alx_net_interfaces(_out: *mut u8, _n: i64) -> i64 {
+        enosys()
+    }
+    pub unsafe fn shim_alx_net_multicast_addrs(_out: *mut u8, _n: i64) -> i64 {
+        enosys()
+    }
+    pub unsafe fn shim_alx_net_socketpair(sotype: i64, fds: *mut u8) -> i64 {
+        let t = match sotype {
+            1 => sysc("SOCK_STREAM"),
+            2 => sysc("SOCK_DGRAM"),
+            _ => sysc("SOCK_SEQPACKET"),
+        };
+        let mut p = [0i32; 2];
+        if unsafe { c_socketpair(sysc("AF_UNIX"), t, 0, p.as_mut_ptr()) } < 0 {
+            return last_neg();
+        }
+        net_prep(p[0]);
+        net_prep(p[1]);
+        unsafe {
+            std::ptr::copy_nonoverlapping((p[0] as i64).to_ne_bytes().as_ptr(), fds, 8);
+            std::ptr::copy_nonoverlapping((p[1] as i64).to_ne_bytes().as_ptr(), fds.add(8), 8);
+        }
+        0
+    }
+    pub unsafe fn shim_alx_net_dup(fd: i64, nonblock: i64) -> i64 {
+        let c = unsafe { libc_fcntl(fd as i32, sysc("F_DUPFD_CLOEXEC"), 0) };
+        if c < 0 {
+            return last_neg();
+        }
+        unsafe {
+            let fl = libc_fcntl(c, sysc("F_GETFL"));
+            let o = sysc("O_NONBLOCK");
+            libc_fcntl(c, sysc("F_SETFL"), if nonblock != 0 { fl | o } else { fl & !o });
+        }
+        c as i64
     }
 
     // Signals (std os/signal): the C runtime's self-pipe watchers (alx.c).
@@ -1635,6 +2184,14 @@ mod rt {
     /// An atomic cell handle.
     #[derive(Clone, Default)]
     pub struct AlxAtomic(Arc<std::sync::atomic::AtomicI64>);
+    // `==` on a value holding an Atomic (an os.File, a Timer) compares the
+    // handle: copies of one are equal, as in the C backend.
+    impl PartialEq for AlxAtomic {
+        fn eq(&self, o: &Self) -> bool {
+            Arc::ptr_eq(&self.0, &o.0)
+        }
+    }
+    impl Eq for AlxAtomic {}
     impl AlxAtomic {
         pub fn new(v: i64) -> Self {
             AlxAtomic(Arc::new(std::sync::atomic::AtomicI64::new(v)))

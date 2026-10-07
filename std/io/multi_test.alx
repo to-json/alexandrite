@@ -1,0 +1,164 @@
+#![test(external)]
+# Go's io/multi_test.go, translated (package io_test).
+#
+# Not translated:
+#  - TestMultiWriter_WriteStringSingleAlloc (testing.AllocsPerRun),
+#    TestMultiWriterSingleChainFlatten / TestMultiReaderFlatten
+#    (runtime.Callers call depths; alx's MultiReader / MultiWriter don't
+#    flatten), TestMultiReaderFreesExhaustedReaders (runtime.GC and
+#    AddCleanup).
+#  - TestMultiReaderSingleByteWithEOF / TestMultiReaderFinalEOF: a reader
+#    can't return a byte together with EOF in alx; they read the byte, then 0.
+
+import "bytes"
+import "crypto/sha1"
+import "encoding/hex"
+import "io"
+
+def foo_bar -> io.MultiReader[bytes.Reader] {
+  io.multi_reader([sr("foo "), sr(""), sr("bar")])
+}
+
+def expect_read(mr: io.MultiReader[bytes.Reader], size: Int, want: Str) {
+  r = mr
+  buf: [Byte] = [0; size]
+  n = r.read!(buf).unwrap
+  assert_eq Str.from_bytes(buf[0...n]), want
+}
+
+test "TestMultiReader" {
+  mr = foo_bar
+  expect_read(mr, 2, "fo")
+  expect_read(mr, 5, "o ")
+  expect_read(mr, 5, "bar")
+  expect_read(mr, 5, "")
+  mr = foo_bar
+  expect_read(mr, 4, "foo ")
+  expect_read(mr, 1, "b")
+  expect_read(mr, 3, "ar")
+  expect_read(mr, 1, "")
+  mr = foo_bar
+  expect_read(mr, 5, "foo ")
+}
+
+test "TestMultiReaderAsWriterTo" {
+  inner = io.multi_reader([sr(""), sr("bar")])
+  rs: [io.Reader] = [sr("foo "), inner]
+  mr = io.multi_reader(rs)
+  sink = bytes.new_buffer_string("")
+  assert_eq mr.write_to!(sink).unwrap, 7
+  assert_eq sink.to_s, "foo bar"
+}
+
+# A Writer without write_string! (Go hides bytes.Buffer's WriteString).
+struct PlainWriter {
+  b: bytes.Buffer
+  pub def write!(p: [Byte]) -> ~Int { self.b.write!(p) }
+}
+
+def check_multi_writer[W](sink: W) -> Str {
+  h = sha1.new
+  ws: [io.Writer] = [h, sink]
+  mw = io.multi_writer(ws)
+  src = "My input text."
+  written = io.copy(mw, sr(src)).unwrap
+  assert_eq written, src.size
+  assert_eq hex.encode_to_string(h.sum([])), "01cb303fa8c30a64123067c5aa6284ba7ec2d31b"
+  src
+}
+
+test "TestMultiWriter" {
+  b = bytes.new_buffer_string("")
+  src = check_multi_writer(PlainWriter.new(b: b))
+  assert_eq b.to_s, src
+}
+
+test "TestMultiWriter_String" {
+  b = bytes.new_buffer_string("")
+  src = check_multi_writer(b)
+  assert_eq b.to_s, src
+}
+
+struct WriteStringChecker {
+  called: [Bool]
+  pub def write_string!(s: Str) -> ~Int {
+    self.called[0] = true
+    s.size
+  }
+  pub def write!(p: [Byte]) -> ~Int { p.size }
+}
+
+test "TestMultiWriter_StringCheckCall" {
+  c = WriteStringChecker.new(called: [false])
+  mw = io.multi_writer([c])
+  io.write_string(mw, "foo").unwrap
+  assert c.called[0], "did not see write_string! call to WriteStringChecker"
+}
+
+struct HalfWriter {
+  pub def write!(p: [Byte]) -> ~Int { p.size / 2 }
+}
+
+struct MustNotWrite {
+  pub def write!(p: [Byte]) -> ~Int { fail "MultiWriter called f2.Write" }
+}
+
+test "TestMultiWriterError" {
+  ws: [io.Writer] = [HalfWriter.new, MustNotWrite.new]
+  w = io.multi_writer(ws)
+  buf: [Byte] = [0; 100]
+  r = w.write!(buf)
+  assert_eq r.err.unwrap.message, "short write"
+}
+
+test "TestMultiReaderCopy" {
+  slice = [sr("hello world")]
+  r = io.multi_reader(slice)
+  slice[0] = sr("")
+  assert_eq Str.from_bytes(io.read_all(r).unwrap), "hello world"
+}
+
+test "TestMultiWriterCopy" {
+  buf = bytes.new_buffer_string("")
+  slice = [buf]
+  w = io.multi_writer(slice)
+  slice[0] = bytes.new_buffer_string("")
+  assert_eq w.write!("hello world".bytes.to_a).unwrap, 11
+  assert_eq buf.to_s, "hello world"
+}
+
+# Go's byteAndEOFReader, alx-style: one byte, then the end.
+struct OneByte {
+  st: [Int]
+  pub def read!(p: [Byte]) -> ~Int {
+    panic "unexpected call" if p.size == 0
+    return 0 if st[0] < 0
+    p[0] = st[0].as_u8
+    self.st[0] = -1
+    1
+  }
+}
+
+test "TestMultiReaderSingleByteWithEOF" {
+  mr = io.multi_reader([OneByte.new(st: [97]), OneByte.new(st: [98])])
+  got = io.read_all(io.limit_reader(mr, 10)).unwrap
+  assert_eq Str.from_bytes(got), "ab"
+}
+
+test "TestMultiReaderFinalEOF" {
+  rs: [io.Reader] = [sr(""), OneByte.new(st: [97])]
+  r = io.multi_reader(rs)
+  buf: [Byte] = [0; 2]
+  assert_eq r.read!(buf).unwrap, 1
+  assert_eq r.read!(buf).unwrap, 0
+}
+
+test "TestInterleavedMultiReader" {
+  mr1 = io.multi_reader([sr("123"), sr("45678")])
+  mr2 = io.multi_reader([mr1])
+  buf: [Byte] = [0; 4]
+  io.read_exact(mr2, buf).unwrap
+  assert_eq Str.from_bytes(buf), "1234"
+  io.read_exact(mr1, buf).unwrap
+  assert_eq Str.from_bytes(buf), "5678"
+}

@@ -1,0 +1,807 @@
+#![test(external)]
+# Go's context/x_test.go (package context_test), translated. Waits that Go
+# bounds by the test deadline (quiescent) wait at most 5 s here.
+#
+# Not translated:
+#  - TestAllocs: allocation counts (testing.AllocsPerRun) are Go runtime
+#    behaviour.
+#  - TestWithValueChecksKey, TestInvalidDerivedFail: nil keys and parents
+#    don't exist, and a key type without `==` is refused at compile time.
+#  - TestParentFinishesChild, TestChildFinishesFirst, TestCancelRemoves,
+#    TestCustomContextGoroutines call context_test.go's XTest functions,
+#    which use unexported types: they are in context_test.alx.
+
+import "context"
+import "errors"
+import "math/rand"
+import "sync"
+import "time"
+
+def short_duration -> time.Duration { time.millisecond }
+
+def very_long_duration -> time.Duration { time.hour * 1000 }
+
+def quiescent -> time.Duration { time.second * 5 }
+
+# Go's otherContext: a Context that isn't one of the package's own types
+# (Go embeds the wrapped Context; this delegates).
+struct OtherContext {
+  c: context.Context
+
+  def deadline -> time.Time? { c.deadline }
+  def done -> Chan[Bool] { c.done }
+  def err -> Error? { c.err }
+  def value(key: context.Key) -> context.Any? { c.value(key) }
+  def cancelable? -> Bool { c.cancelable? }
+}
+
+def other(c: context.Context) -> context.Context {
+  OtherContext.new(c: c)
+}
+
+# Whether `ch` is closed now (a receive doesn't block).
+def closed?(ch: Chan[Bool]) -> Bool {
+  r = false
+  select {
+    when _ = ch.recv => r = true
+    else => r = false
+  }
+  r
+}
+
+test "Background" {
+  c = context.background
+  assert !closed?(c.done), "<-c.Done() should block"
+  assert !c.cancelable?
+  assert_eq "#{c}", "context.Background"
+}
+
+test "TODO" {
+  c = context.todo
+  assert !closed?(c.done), "<-c.Done() should block"
+  assert !c.cancelable?
+  assert_eq "#{c}", "context.TODO"
+}
+
+test "WithCancel" {
+  c1, cancel = context.with_cancel(context.background)
+  assert_eq "#{c1}", "context.Background.WithCancel"
+  o = other(c1)
+  c2, _ = context.with_cancel(o)
+  contexts = [c1, o, c2]
+  for i in 0...contexts.size {
+    c = contexts[i]
+    assert c.cancelable?, "c[#{i}].Done() == nil want non-nil"
+    assert c.err == none, "c[#{i}].Err() want nil"
+    assert !closed?(c.done), "<-c[#{i}].Done() should block"
+  }
+  cancel()
+  for i in 0...contexts.size {
+    c = contexts[i]
+    assert closed?(c.done), "<-c[#{i}].Done() blocked, but shouldn't have"
+    assert c.err == context.ContextError.Canceled, "c[#{i}].Err() == #{c.err} want context canceled"
+  }
+}
+
+def check_deadline(c: context.Context, name: Str) {
+  timer = time.after(quiescent)
+  d = c.done
+  timed_out = false
+  select {
+    when _ = timer.recv => timed_out = true
+    when _ = d.recv => timed_out = false
+  }
+  assert !timed_out, "#{name}: context not timed out after #{quiescent}"
+  assert c.err == context.ContextError.DeadlineExceeded, "#{name}: c.Err() == #{c.err}; want context deadline exceeded"
+}
+
+test "Deadline" {
+  c, _ = context.with_deadline(context.background, time.now.add(short_duration))
+  assert "#{c}".start_with?("context.Background.WithDeadline("), "c.String() = #{c}"
+  check_deadline(c, "WithDeadline")
+
+  c, _ = context.with_deadline(context.background, time.now.add(short_duration))
+  o = other(c)
+  check_deadline(o, "WithDeadline+otherContext")
+
+  c, _ = context.with_deadline(context.background, time.now.add(short_duration))
+  o = other(c)
+  c, _ = context.with_deadline(o, time.now.add(very_long_duration))
+  check_deadline(c, "WithDeadline+otherContext+WithDeadline")
+
+  c, _ = context.with_deadline(context.background, time.now.add(time.duration(0) - short_duration))
+  check_deadline(c, "WithDeadline+inthepast")
+
+  c, _ = context.with_deadline(context.background, time.now)
+  check_deadline(c, "WithDeadline+now")
+}
+
+test "Timeout" {
+  c, _ = context.with_timeout(context.background, short_duration)
+  assert "#{c}".start_with?("context.Background.WithDeadline("), "c.String() = #{c}"
+  check_deadline(c, "WithTimeout")
+
+  c, _ = context.with_timeout(context.background, short_duration)
+  o = other(c)
+  check_deadline(o, "WithTimeout+otherContext")
+
+  c, _ = context.with_timeout(context.background, short_duration)
+  o = other(c)
+  c, _ = context.with_timeout(o, very_long_duration)
+  check_deadline(c, "WithTimeout+otherContext+WithTimeout")
+}
+
+test "CanceledTimeout" {
+  c, _ = context.with_timeout(context.background, time.second)
+  o = other(c)
+  c, cancel = context.with_timeout(o, very_long_duration)
+  cancel()
+  assert closed?(c.done), "<-c.Done() blocked, but shouldn't have"
+  assert c.err == context.ContextError.Canceled, "c.Err() == #{c.err} want context canceled"
+}
+
+# Go's key1 (an int type without String) and key2 (with String).
+struct Key1 {
+  n: Int
+}
+
+struct Key2 {
+  n: Int
+
+  pub def to_s -> Str { "context_test.key2(#{n})" }
+}
+
+def k1 -> Key1 { Key1.new(n: 1) }
+
+def k2 -> Key2 { Key2.new(n: 1) }
+
+def k3 -> Key2 { Key2.new(n: 3) }
+
+#[track_caller]
+def check_values(c: context.Context, nm: Str, v1: Str, v2: Str, v3: Str) {
+  a: Str? = context.value(c, k1)
+  b: Str? = context.value(c, k2)
+  d: Str? = context.value(c, k3)
+  at = caller_location
+  assert (a || "") == v1 && (a != none) == (v1.size != 0), "#{nm}.Value(k1) = #{a} want #{v1} (#{at})"
+  assert (b || "") == v2 && (b != none) == (v2.size != 0), "#{nm}.Value(k2) = #{b} want #{v2} (#{at})"
+  assert (d || "") == v3 && (d != none) == (v3.size != 0), "#{nm}.Value(k3) = #{d} want #{v3} (#{at})"
+}
+
+test "Values" {
+  nil_str: Str? = none
+  c0 = context.background
+  check_values(c0, "c0", "", "", "")
+
+  c1 = context.with_value(context.background, k1, "c1k1")
+  check_values(c1, "c1", "c1k1", "", "")
+  # Go prints a key type without String by its type name
+  # (context_test.key1); alx prints the value.
+  assert_eq "#{c1}", "context.Background.WithValue(#{k1}, c1k1)"
+
+  c2 = context.with_value(c1, k2, "c2k2")
+  check_values(c2, "c2", "c1k1", "c2k2", "")
+  assert_eq "#{c2}", "context.Background.WithValue(#{k1}, c1k1).WithValue(context_test.key2(1), c2k2)"
+
+  c3 = context.with_value(c2, k3, "c3k3")
+  check_values(c3, "c2", "c1k1", "c2k2", "c3k3")
+
+  c4 = context.with_value(c3, k1, nil_str)
+  check_values(c4, "c4", "", "c2k2", "c3k3")
+  # Go: "<nil>" for the nil value.
+  assert_eq "#{c4}", "context.Background.WithValue(#{k1}, c1k1).WithValue(context_test.key2(1), c2k2).WithValue(context_test.key2(3), c3k3).WithValue(#{k1}, none)"
+
+  o0 = other(context.background)
+  check_values(o0, "o0", "", "", "")
+
+  o1 = other(context.with_value(context.background, k1, "c1k1"))
+  check_values(o1, "o1", "c1k1", "", "")
+
+  o2 = context.with_value(o1, k2, "o2k2")
+  check_values(o2, "o2", "c1k1", "o2k2", "")
+
+  o3 = other(c4)
+  check_values(o3, "o3", "", "c2k2", "c3k3")
+
+  o4 = context.with_value(o3, k3, nil_str)
+  check_values(o4, "o4", "", "c2k2", "")
+}
+
+test "SimultaneousCancels" {
+  root, cancel = context.with_cancel(context.background)
+  ctxs = [root]
+  cancels = [cancel]
+  q = [root]
+  # Create a tree of contexts.
+  while q.size != 0 && ctxs.size < 100 {
+    parent = q[0]
+    q = q[1...q.size]
+    for _i in 0...4 {
+      ctx, c = context.with_cancel(parent)
+      ctxs << ctx
+      cancels << c
+      q << ctx
+    }
+  }
+  # Start all the cancels in a random order.
+  r = rand.new(rand.new_source(1))
+  order = r.perm!(cancels.size)
+  wg = sync.new_wait_group
+  wg.add(cancels.size)
+  for i in order {
+    c = cancels[i].dup
+    w = wg
+    _ = spawn {
+      c()
+      w.done
+    }
+  }
+  # Wait on all the contexts in a random order.
+  stuck = time.after(quiescent)
+  for i in r.perm!(ctxs.size) {
+    d = ctxs[i].done
+    ok = true
+    select {
+      when _ = d.recv => ok = true
+      when _ = stuck.recv => ok = false
+    }
+    assert ok, "timed out waiting for <-ctx.Done()"
+  }
+  # Wait for all the cancel functions to return.
+  done = Chan[Bool].new
+  w2 = wg
+  _ = spawn {
+    w2.wait
+    done.close
+  }
+  ok = true
+  select {
+    when _ = done.recv => ok = true
+    when _ = stuck.recv => ok = false
+  }
+  assert ok, "timed out waiting for cancel functions"
+}
+
+test "InterlockedCancels" {
+  parent, cancel_parent = context.with_cancel(context.background)
+  child, cancel_child = context.with_cancel(parent)
+  pd = parent.done
+  cc = cancel_child.dup
+  _ = spawn {
+    pd.recv
+    cc()
+  }
+  cancel_parent()
+  timer = time.after(quiescent)
+  d = child.done
+  ok = true
+  select {
+    when _ = d.recv => ok = true
+    when _ = timer.recv => ok = false
+  }
+  assert ok, "timed out waiting for child.Done()"
+}
+
+# Go's `type value int` behind a pointer: each one is a distinct key.
+struct LayerVal {
+  id: Int
+}
+
+def check_layers(seed: Int, timeout: Bool) {
+  r = rand.new(rand.new_source(seed))
+  min_layers = 30
+  vals: [LayerVal] = []
+  cancels: [() -> Unit] = []
+  num_timers = 0
+  ctx = context.background
+  i = 0
+  while i < min_layers || num_timers == 0 || cancels.size == 0 || vals.size == 0 {
+    case r.intn!(3) {
+      0 => {
+        v = LayerVal.new(id: i)
+        ctx = context.with_value(ctx, v, v)
+        vals << v
+      }
+      1 => {
+        c, cancel = context.with_cancel(ctx)
+        ctx = c
+        cancels << cancel
+      }
+      _ => {
+        d = timeout ? short_duration : very_long_duration
+        c, cancel = context.with_timeout(ctx, d)
+        ctx = c
+        cancels << cancel
+        num_timers += 1
+      }
+    }
+    i += 1
+  }
+  check = ->(c: context.Context, xs: [LayerVal], w: Str) {
+    for key in xs {
+      got: LayerVal? = context.value(c, key)
+      assert got == key, "seed=#{seed} #{w}: ctx.Value(#{key.id}) = #{got} want #{key.id}"
+    }
+  }
+  if !timeout {
+    assert !closed?(ctx.done), "seed=#{seed} ctx should not be canceled yet"
+  }
+  assert "#{ctx}".start_with?("context.Background."), "ctx.String() = #{ctx}"
+  check.call(ctx, vals, "before cancel")
+  if timeout {
+    timer = time.after(quiescent)
+    d = ctx.done
+    ok = true
+    select {
+      when _ = d.recv => ok = true
+      when _ = timer.recv => ok = false
+    }
+    assert ok, "seed=#{seed} ctx should have timed out"
+    check.call(ctx, vals, "after timeout")
+  } else {
+    cancel = cancels[r.intn!(cancels.size)]
+    cancel()
+    assert closed?(ctx.done), "seed=#{seed} ctx should be canceled"
+    check.call(ctx, vals, "after cancel")
+  }
+}
+
+test "LayersCancel" {
+  check_layers(time.now.unix_nano, false)
+}
+
+test "LayersTimeout" {
+  check_layers(time.now.unix_nano, true)
+}
+
+test "WithCancelCanceledParent" {
+  parent, pcancel = context.with_cancel_cause(context.background)
+  why = errors.new("Because!")
+  pcancel(why)
+  c, _ = context.with_cancel(parent)
+  assert closed?(c.done), "child not done immediately upon construction"
+  assert c.err == context.ContextError.Canceled, "child not canceled; got = #{c.err}"
+  assert context.cause(c) == why, "child has wrong cause; got = #{context.cause(c)}"
+}
+
+test "WithCancelSimultaneouslyCanceledParent" {
+  # Cancel the parent concurrently with creating a child.
+  for i in 0...100 {
+    parent, pcancel = context.with_cancel_cause(context.background)
+    why = errors.new("Because! #{i}")
+    pc = pcancel.dup
+    w = why
+    _ = spawn { pc(w) }
+    c, _ = context.with_cancel(parent)
+    c.done.recv
+    assert c.err == context.ContextError.Canceled, "child not canceled; got = #{c.err}"
+    assert context.cause(c) == why, "child has wrong cause; got = #{context.cause(c)}"
+  }
+}
+
+test "DeadlineExceededSupportsTimeout" {
+  assert context.ContextError.DeadlineExceeded.timeout?, "wrong value for timeout"
+  assert context.ContextError.DeadlineExceeded.temporary?
+  assert !context.ContextError.Canceled.timeout?
+}
+
+struct CauseCase {
+  name: Str
+  ctx: () -> context.Context
+  err: Error?
+  why: Error?
+}
+
+def cause_case(name: Str, err: Error?, why: Error?, ctx: () -> context.Context) -> CauseCase {
+  CauseCase.new(name: name, ctx: ctx.dup, err: err, why: why)
+}
+
+test "Cause" {
+  forever = time.second * 1000000
+  parent_cause = errors.new("parentCause")
+  child_cause = errors.new("childCause")
+  too_slow = errors.new("tooSlow")
+  finished_early = errors.new("finishedEarly")
+  canceled: Error? = context.ContextError.Canceled
+  exceeded: Error? = context.ContextError.DeadlineExceeded
+  nil_err: Error? = none
+  tests: [CauseCase] = []
+  tests << cause_case("Background", nil_err, nil_err) { context.background }
+  tests << cause_case("TODO", nil_err, nil_err) { context.todo }
+  tests << cause_case("WithCancel", canceled, canceled) {
+    ctx, cancel = context.with_cancel(context.background)
+    cancel()
+    ctx
+  }
+  tests << cause_case("WithCancelCause", canceled, parent_cause) {
+    ctx, cancel = context.with_cancel_cause(context.background)
+    cancel(parent_cause)
+    ctx
+  }
+  tests << cause_case("WithCancelCause nil", canceled, canceled) {
+    ctx, cancel = context.with_cancel_cause(context.background)
+    cancel(none)
+    ctx
+  }
+  tests << cause_case("WithCancelCause: parent cause before child", canceled, parent_cause) {
+    ctx, cancel_parent = context.with_cancel_cause(context.background)
+    ctx2, cancel_child = context.with_cancel_cause(ctx)
+    cancel_parent(parent_cause)
+    cancel_child(child_cause)
+    ctx2
+  }
+  tests << cause_case("WithCancelCause: parent cause after child", canceled, child_cause) {
+    ctx, cancel_parent = context.with_cancel_cause(context.background)
+    ctx2, cancel_child = context.with_cancel_cause(ctx)
+    cancel_child(child_cause)
+    cancel_parent(parent_cause)
+    ctx2
+  }
+  tests << cause_case("WithCancelCause: parent cause before nil", canceled, parent_cause) {
+    ctx, cancel_parent = context.with_cancel_cause(context.background)
+    ctx2, cancel_child = context.with_cancel(ctx)
+    cancel_parent(parent_cause)
+    cancel_child()
+    ctx2
+  }
+  tests << cause_case("WithCancelCause: parent cause after nil", canceled, canceled) {
+    ctx, cancel_parent = context.with_cancel_cause(context.background)
+    ctx2, cancel_child = context.with_cancel(ctx)
+    cancel_child()
+    cancel_parent(parent_cause)
+    ctx2
+  }
+  tests << cause_case("WithCancelCause: child cause after nil", canceled, canceled) {
+    ctx, cancel_parent = context.with_cancel(context.background)
+    ctx2, cancel_child = context.with_cancel_cause(ctx)
+    cancel_parent()
+    cancel_child(child_cause)
+    ctx2
+  }
+  tests << cause_case("WithCancelCause: child cause before nil", canceled, child_cause) {
+    ctx, cancel_parent = context.with_cancel(context.background)
+    ctx2, cancel_child = context.with_cancel_cause(ctx)
+    cancel_child(child_cause)
+    cancel_parent()
+    ctx2
+  }
+  tests << cause_case("WithTimeout", exceeded, exceeded) {
+    ctx, cancel = context.with_timeout(context.background, time.duration(0))
+    cancel()
+    ctx
+  }
+  tests << cause_case("WithTimeout canceled", canceled, canceled) {
+    ctx, cancel = context.with_timeout(context.background, forever)
+    cancel()
+    ctx
+  }
+  tests << cause_case("WithTimeoutCause", exceeded, too_slow) {
+    ctx, cancel = context.with_timeout_cause(context.background, time.duration(0), too_slow)
+    cancel()
+    ctx
+  }
+  tests << cause_case("WithTimeoutCause canceled", canceled, canceled) {
+    ctx, cancel = context.with_timeout_cause(context.background, forever, too_slow)
+    cancel()
+    ctx
+  }
+  tests << cause_case("WithTimeoutCause stacked", exceeded, too_slow) {
+    ctx, cancel = context.with_cancel_cause(context.background)
+    ctx2, _ = context.with_timeout_cause(ctx, time.duration(0), too_slow)
+    cancel(finished_early)
+    ctx2
+  }
+  tests << cause_case("WithTimeoutCause stacked canceled", canceled, finished_early) {
+    ctx, cancel = context.with_cancel_cause(context.background)
+    ctx2, _ = context.with_timeout_cause(ctx, forever, too_slow)
+    cancel(finished_early)
+    ctx2
+  }
+  tests << cause_case("WithoutCancel", nil_err, nil_err) { context.without_cancel(context.background) }
+  tests << cause_case("WithoutCancel canceled", nil_err, nil_err) {
+    ctx, cancel = context.with_cancel_cause(context.background)
+    ctx2 = context.without_cancel(ctx)
+    cancel(finished_early)
+    ctx2
+  }
+  tests << cause_case("WithoutCancel timeout", nil_err, nil_err) {
+    ctx, cancel = context.with_timeout_cause(context.background, time.duration(0), too_slow)
+    ctx2 = context.without_cancel(ctx)
+    cancel()
+    ctx2
+  }
+  tests << cause_case("parent of custom context not canceled", canceled, canceled) {
+    ctx, _ = context.with_cancel_cause(context.background)
+    ctx2, cancel2 = new_custom_context(ctx)
+    cancel2()
+    ctx2
+  }
+  tests << cause_case("parent of custom context is canceled before", canceled, parent_cause) {
+    ctx, cancel1 = context.with_cancel_cause(context.background)
+    ctx2, cancel2 = new_custom_context(ctx)
+    cancel1(parent_cause)
+    cancel2()
+    ctx2
+  }
+  # As in Go, "isn't really right": the custom child was canceled first,
+  # but Cause can't tell and returns the parent's cause.
+  tests << cause_case("parent of custom context is canceled after", canceled, parent_cause) {
+    ctx, cancel1 = context.with_cancel_cause(context.background)
+    ctx2, cancel2 = new_custom_context(ctx)
+    cancel2()
+    cancel1(parent_cause)
+    ctx2
+  }
+  for tc in tests {
+    ctx = tc.ctx.call
+    assert ctx.err == tc.err, "#{tc.name}: ctx.Err() = #{ctx.err} want #{tc.err}"
+    assert context.cause(ctx) == tc.why, "#{tc.name}: Cause(ctx) = #{context.cause(ctx)} want #{tc.why}"
+  }
+}
+
+test "CauseRace" {
+  why = errors.new("TestCauseRace")
+  ctx, cancel = context.with_cancel_cause(context.background)
+  c = cancel.dup
+  w = why
+  _ = spawn { c(w) }
+  loop {
+    # Poll cause rather than waiting for done.
+    if e = context.cause(ctx) {
+      assert e == why, "Cause returned #{e}, want #{why}"
+      break
+    }
+    time.sleep(time.duration(1000))
+  }
+}
+
+test "WithoutCancel" {
+  ctx = context.with_value(context.background, "key", "value")
+  ctx = context.without_cancel(ctx)
+  assert ctx.deadline == none, "ctx.Deadline() = #{ctx.deadline} want none"
+  assert !ctx.cancelable?, "ctx.Done() want nil"
+  assert ctx.err == none, "ctx.Err() = #{ctx.err} want nil"
+  v: Str? = context.value(ctx, "key")
+  assert_eq v, "value"
+}
+
+# Go's customDoneContext: another Context's values with a done channel of
+# its own.
+struct CustomDoneContext {
+  c: context.Context
+  donec: Chan[Bool]
+
+  def deadline -> time.Time? { c.deadline }
+  def done -> Chan[Bool] { donec }
+  def err -> Error? { c.err }
+  def value(key: context.Key) -> context.Any? { c.value(key) }
+}
+
+test "CustomContextPropagation" {
+  why = errors.new("TestCustomContextPropagation")
+  donec = Chan[Bool].new
+  ctx1, cancel1 = context.with_cancel_cause(context.background)
+  ctx2 = CustomDoneContext.new(c: ctx1, donec: donec)
+  ctx3, cancel3 = context.with_cancel(ctx2)
+  defer { cancel3() }
+  cancel1(why)
+  donec.close
+  ctx3.done.recv
+  assert ctx3.err == context.ContextError.Canceled, "child not canceled; got = #{ctx3.err}"
+  assert context.cause(ctx3) == why, "child has wrong cause; got = #{context.cause(ctx3)}"
+}
+
+struct CccState {
+  done: Chan[Bool]
+  err: Error?
+  cancel_child: (() -> Unit)?
+}
+
+# Go's customCauseContext.
+struct CustomCauseContext {
+  st: Mutex[CccState]
+
+  def deadline -> time.Time? { none }
+  def done -> Chan[Bool] { st.lock { |s| s.done } }
+  def err -> Error? { st.lock { |s| s.err } }
+  def value(key: context.Key) -> context.Any? { none }
+
+  def cancel {
+    child = st.lock { |s|
+      s.err = context.ContextError.Canceled
+      s.done.close
+      s.cancel_child
+    }
+    if c = child {
+      c()
+    }
+  }
+
+  def set_cancel_child(f: () -> Unit) {
+    g = f.dup
+    st.lock { |s| s.cancel_child = g }
+  }
+}
+
+def new_ccc -> CustomCauseContext {
+  CustomCauseContext.new(st: Mutex.new(CccState.new(done: Chan[Bool].new, err: none, cancel_child: none)))
+}
+
+test "CustomContextCause" {
+  canceled: Error? = context.ContextError.Canceled
+  # Cancelling a custom context: Err and Cause are Canceled.
+  ccc = new_ccc
+  ccc.cancel
+  assert ccc.err == canceled, "ccc.Err() = #{ccc.err}, want context canceled"
+  assert context.cause(ccc) == canceled, "Cause(ccc) = #{context.cause(ccc)}, want context canceled"
+
+  # A child of a custom context cancelled with a cause: the child has it,
+  # the parent isn't cancelled.
+  ccc = new_ccc
+  ctx, cause_func = context.with_cancel_cause(ccc)
+  why = errors.new("TestCustomContextCause")
+  cause_func(why)
+  assert ctx.err == canceled
+  assert context.cause(ctx) == why
+  assert ccc.err == none
+  assert context.cause(ccc) == none
+
+  # Cancelling the parent now: the child keeps its cause; the parent is
+  # canceled without one.
+  ccc.cancel
+  assert ctx.err == canceled
+  assert context.cause(ctx) == why
+  assert ccc.err == canceled
+  assert context.cause(ccc) == canceled
+
+  # A child the custom context cancels.
+  ccc = new_ccc
+  ctx, cancel_func = context.with_cancel(ccc)
+  ccc.set_cancel_child(cancel_func)
+  ccc.cancel
+  assert ctx.err == canceled
+  assert context.cause(ctx) == canceled
+  assert ccc.err == canceled
+  assert context.cause(ccc) == canceled
+}
+
+test "AfterFuncCalledAfterCancel" {
+  ctx, cancel = context.with_cancel(context.background)
+  donec = Chan[Bool].new
+  stop = context.after_func(ctx, ->() { donec.close })
+  early = false
+  t = time.after(short_duration)
+  select {
+    when _ = donec.recv => early = true
+    when _ = t.recv => early = false
+  }
+  assert !early, "AfterFunc called before context is done"
+  cancel()
+  late = false
+  t2 = time.after(quiescent)
+  select {
+    when _ = donec.recv => late = false
+    when _ = t2.recv => late = true
+  }
+  assert !late, "AfterFunc not called after context is canceled"
+  assert !stop(), "stop() = true, want false"
+}
+
+test "AfterFuncCalledAfterTimeout" {
+  ctx, cancel = context.with_timeout(context.background, short_duration)
+  defer { cancel() }
+  donec = Chan[Bool].new
+  _ = context.after_func(ctx, ->() { donec.close })
+  late = false
+  t = time.after(quiescent)
+  select {
+    when _ = donec.recv => late = false
+    when _ = t.recv => late = true
+  }
+  assert !late, "AfterFunc not called after context is canceled"
+}
+
+test "AfterFuncCalledImmediately" {
+  ctx, cancel = context.with_cancel(context.background)
+  cancel()
+  donec = Chan[Bool].new
+  _ = context.after_func(ctx, ->() { donec.close })
+  late = false
+  t = time.after(quiescent)
+  select {
+    when _ = donec.recv => late = false
+    when _ = t.recv => late = true
+  }
+  assert !late, "AfterFunc not called for already-canceled context"
+}
+
+test "AfterFuncNotCalledAfterStop" {
+  ctx, cancel = context.with_cancel(context.background)
+  donec = Chan[Bool].new
+  stop = context.after_func(ctx, ->() { donec.close })
+  assert stop(), "stop() = false, want true"
+  cancel()
+  called = false
+  t = time.after(short_duration)
+  select {
+    when _ = donec.recv => called = true
+    when _ = t.recv => called = false
+  }
+  assert !called, "AfterFunc called for already-canceled context"
+  assert !stop(), "stop() = true, want false"
+}
+
+# Cancelling doesn't wait for after-funcs to finish.
+test "AfterFuncCalledAsynchronously" {
+  ctx, cancel = context.with_cancel(context.background)
+  donec = Chan[Bool].new
+  # The send blocks until donec is read from.
+  stop = context.after_func(ctx, ->() { donec << true })
+  defer { _ = stop() }
+  cancel()
+  late = false
+  t = time.after(quiescent)
+  select {
+    when _ = donec.recv => late = false
+    when _ = t.recv => late = true
+  }
+  assert !late, "AfterFunc not called after context is canceled"
+}
+
+struct CustomState {
+  fired: Bool
+  err: Error?
+}
+
+# Go's customContext: done when its parent is (through after_func) or when
+# its own cancel is called, whichever is first.
+struct CustomContext {
+  parent: context.Context
+  donec: Chan[Bool]
+  st: Mutex[CustomState]
+
+  def deadline -> time.Time? { parent.deadline }
+  def done -> Chan[Bool] { donec }
+
+  def err -> Error? {
+    r: Error? = none
+    select {
+      when _ = donec.recv => r = st.lock { |s| s.err }
+      else => r = none
+    }
+    r
+  }
+
+  def value(key: context.Key) -> context.Any? { parent.value(key) }
+
+  # Go's doneOnce.Do(...).
+  def finish(e: Error?) {
+    st.lock { |s|
+      if !s.fired {
+        s.fired = true
+        s.err = e
+        donec.close
+      }
+    }
+  }
+}
+
+def new_custom_context(parent: context.Context) -> (context.Context, () -> Unit) {
+  c = CustomContext.new(parent: parent, donec: Chan[Bool].new, st: Mutex.new(CustomState.new(fired: false, err: none)))
+  _ = context.after_func(parent, ->() { c.finish(parent.err) })
+  (c, ->() { c.finish(context.ContextError.Canceled) })
+}
+
+# Issue #75533: once err is set, done is closed.
+test "ContextErrDoneRace" {
+  for _i in 0...10 {
+    ctx, cancel = context.with_cancel(context.background)
+    donec = ctx.done
+    c = cancel.dup
+    _ = spawn { c() }
+    while ctx.err == none {
+      time.sleep(time.duration(1000))
+    }
+    assert closed?(donec), "ctx.Err is non-nil, but ctx.Done is not closed"
+  }
+}

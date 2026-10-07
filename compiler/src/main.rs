@@ -10,6 +10,7 @@ const USAGE: &str = "usage: alx run [--release] [--sanitize] [--expect VALUE] [-
        alx check file.alx
        alx check --json [--overlays FILE|-] [--unit auto|script|package] file.alx
        alx explain mem file.alx
+       alx parse --decls files...
        alx fmt [--check] [files|dirs...]
        alx test [--release] [-v] [-short] [-run NAME[/SUB]] [-bench NAME] [-benchtime DUR] [dir | file_test.alx]";
 
@@ -24,6 +25,15 @@ fn main() -> ExitCode {
             (Some("mem"), Some(f)) => driver::explain_mem(f),
             _ => {
                 eprintln!("usage: alx explain mem file.alx");
+                ExitCode::from(2)
+            }
+        };
+    }
+    if cmd == "parse" {
+        return match args.get(1).map(String::as_str) {
+            Some("--decls") if args.len() > 2 => driver::parse_decls(&args[2..]),
+            _ => {
+                eprintln!("usage: alx parse --decls files...");
                 ExitCode::from(2)
             }
         };

@@ -1,0 +1,431 @@
+# Package outline: the declarations of an alx file, found by a byte scanner
+# (no lexer, no parser, never fails). It reads what the parser's `top_decl`
+# reads at the top level, and the `def`s inside struct, enum, error,
+# interface and refine bodies, and skips everything else by counting braces.
+# Strings ("..." with escapes and `#{}`, '...' raw), command literals,
+# comments, `#[...]` attributes and heredoc bodies are skipped the way the
+# lexer skips them (compiler/src/lexer.rs `interp_end`, `quoted_end`), so a
+# brace inside one doesn't count.
+#
+# A file that doesn't parse still gets an outline: a declaration keyword at
+# column 0 inside a brace that never closed ends that brace (the parser's
+# `resync` idea), so one broken body doesn't hide the rest of the file.
+#
+# `alx parse --decls` is the oracle: the LSP acceptance group compares the
+# two on every tracked file that parses.
+
+import "strings"
+
+# One declaration.
+#
+#   kind   def, extern, struct, enum, error, interface, refine, const,
+#          import, test, bench, example, or method (a def inside a type's
+#          body, including `def self.name` and an interface's methods)
+#   name   the bare name; an import's path; a test's string, unquoted
+#   owner  a method's type (or refinement); an import's alias; else ""
+#   lo     byte offset of the name (a test's or import's opening quote)
+#   hi     byte offset just past the declaration: past its closing brace,
+#          or the end of its line when it has no body
+#   line   the 0-based line of `lo`
+pub struct Sym {
+  kind: Str
+  name: Str
+  owner: Str
+  lo: Int
+  hi: Int
+  line: Int
+}
+
+def lower?(c: Byte) -> Bool { c >= 97 && c <= 122 }
+def upper?(c: Byte) -> Bool { c >= 65 && c <= 90 }
+def word?(c: Byte) -> Bool { lower?(c) || upper?(c) || (c >= 48 && c <= 57) || c == 95 }
+
+# The end of the identifier at i (letters, digits, `_`).
+def word_end(s: Str, i0: Int) -> Int {
+  i = i0
+  while i < s.size && word?(s[i]) {
+    i += 1
+  }
+  i
+}
+
+# The end of a def's name at i: an identifier with an optional trailing `?`
+# or `!` (the lexer's rule), or an operator method (`+`, `==`, `<=>`, `[]`).
+def def_name_end(s: Str, i: Int) -> Int {
+  return i if i >= s.size
+  c = s[i]
+  if lower?(c) || upper?(c) || c == 95 {
+    e = word_end(s, i)
+    if e < s.size && (s[e] == 63 || s[e] == 33) && !(e + 1 < s.size && s[e + 1] == 61) {
+      nx = e + 1 < s.size ? s[e + 1] : 32
+      e += 1 if s[e] == 33 || (nx != 58 && nx != 46)
+    }
+    return e
+  }
+  return i + 3 if at(s, i, "<=>")
+  return i + 2 if at(s, i, "==") || at(s, i, "[]")
+  return i + 1 if c == 43 || c == 45 || c == 42 || c == 47 || c == 37
+  i
+}
+
+def blank?(c: Byte) -> Bool { c == 32 || c == 9 || c == 13 }
+
+def skip_blank(s: Str, i0: Int) -> Int {
+  i = i0
+  while i < s.size && blank?(s[i]) {
+    i += 1
+  }
+  i
+}
+
+def at(s: Str, i: Int, w: Str) -> Bool {
+  i + w.size <= s.size && s[i...i + w.size] == w
+}
+
+# `w` at i as a whole word followed by a blank.
+def kw(s: Str, i: Int, w: Str) -> Bool {
+  at(s, i, w) && i + w.size < s.size && blank?(s[i + w.size])
+}
+
+# After `#{` (i is just past the brace): the index after the matching `}`.
+# Nested strings, command literals and comments are skipped (lexer.rs
+# `interp_end`); the code may span lines.
+def interp_end(s: Str, i0: Int) -> Int {
+  depth = 1
+  i = i0
+  while i < s.size {
+    c = s[i]
+    if c == 34 || c == 39 || c == 96 {
+      i = quoted_end(s, i)
+      next
+    }
+    if c == 35 {
+      while i < s.size && s[i] != 10 {
+        i += 1
+      }
+      next
+    }
+    depth += 1 if c == 123
+    if c == 125 {
+      depth -= 1
+      return i + 1 if depth == 0
+    }
+    i += 1
+  }
+  s.size
+}
+
+# The index after the literal whose opening quote is at i: "..." (escapes,
+# `#{}`), '...' (raw) or a command literal (escapes, `#{}`, quoted words,
+# may span lines). An unterminated string stops at its line's end.
+def quoted_end(s: Str, i0: Int) -> Int {
+  q = s[i0]
+  i = i0 + 1
+  while i < s.size {
+    c = s[i]
+    return i + 1 if c == q
+    return i if c == 10 && q != 96
+    if c == 92 && q != 39 {
+      i += 2
+      next
+    }
+    if c == 35 && q != 39 && i + 1 < s.size && s[i + 1] == 123 {
+      i = interp_end(s, i + 2)
+      next
+    }
+    if q == 96 && (c == 34 || c == 39) {
+      i = quoted_end(s, i)
+      next
+    }
+    i += 1
+  }
+  s.size
+}
+
+# The index after the `#[...]` at i: nested brackets and "strings" inside
+# don't close it (lexer.rs); it ends at its line.
+def attr_end(s: Str, i0: Int) -> Int {
+  depth = 0
+  i = i0 + 2
+  in_str = false
+  while i < s.size && s[i] != 10 {
+    c = s[i]
+    if in_str {
+      if c == 92 {
+        i += 1
+      } else if c == 34 {
+        in_str = false
+      }
+    } else if c == 34 {
+      in_str = true
+    } else if c == 91 {
+      depth += 1
+    } else if c == 93 {
+      return i + 1 if depth == 0
+      depth -= 1
+    }
+    i += 1
+  }
+  i
+}
+
+# Past `#[...]` attributes and blanks at i (on one line).
+def skip_attrs(s: Str, i0: Int) -> Int {
+  i = skip_blank(s, i0)
+  while at(s, i, "#[") {
+    i = skip_blank(s, attr_end(s, i))
+  }
+  i
+}
+
+# A declaration head found at a statement start.
+struct Head {
+  kind: Str
+  name_lo: Int
+  name_hi: Int
+  owner: Str # an import's alias
+  next: Int  # where scanning resumes
+}
+
+# The declaration starting at i, if any. `member`: inside a type's body,
+# where only defs count. `top`: at brace depth 0 outside any parentheses.
+def head_at(s: Str, i0: Int, member: Bool, top: Bool) -> Head? {
+  i = skip_attrs(s, i0)
+  if kw(s, i, "pub") {
+    i = skip_blank(s, i + 3)
+  }
+  if kw(s, i, "def") || kw(s, i, "fn") || at(s, i, "ƒ") {
+    i = skip_blank(s, i + (s[i] == 100 ? 3 : 2))
+    i = skip_blank(s, i + 5) if member && at(s, i, "self.")
+    e = def_name_end(s, i)
+    return none if e == i
+    return Head.new(kind: member ? "method" : "def", name_lo: i, name_hi: e, owner: "", next: e)
+  }
+  return none if member
+  if kw(s, i, "extern") {
+    k = skip_blank(s, i + 6)
+    return none unless kw(s, k, "def")
+    k = skip_blank(s, k + 3)
+    e = def_name_end(s, k)
+    return none if e == k
+    return Head.new(kind: "extern", name_lo: k, name_hi: e, owner: "", next: e)
+  }
+  for w in ["struct", "enum", "interface", "error", "refine"] {
+    if kw(s, i, w) {
+      k = skip_blank(s, i + w.size)
+      return none unless k < s.size && upper?(s[k])
+      e = word_end(s, k)
+      return Head.new(kind: w, name_lo: k, name_hi: e, owner: "", next: e)
+    }
+  }
+  if kw(s, i, "import") {
+    k = skip_blank(s, i + 6)
+    alias_lo = k
+    alias_hi = k
+    if k < s.size && (lower?(s[k]) || s[k] == 95) {
+      alias_hi = word_end(s, k)
+      k = skip_blank(s, alias_hi)
+    }
+    return none unless k < s.size && s[k] == 34
+    e = quoted_end(s, k)
+    return none unless e > k + 1 && s[e - 1] == 34
+    return Head.new(kind: "import", name_lo: k, name_hi: e, owner: s[alias_lo...alias_hi], next: e)
+  }
+  for w in ["test", "bench", "example"] {
+    if kw(s, i, w) {
+      k = skip_blank(s, i + w.size)
+      return none unless k < s.size && s[k] == 34
+      e = quoted_end(s, k)
+      return none unless e > k + 1 && s[e - 1] == 34
+      b = skip_blank(s, e)
+      return none unless b < s.size && s[b] == 123
+      return Head.new(kind: w, name_lo: k, name_hi: e, owner: "", next: e)
+    }
+  }
+  if top && i < s.size && upper?(s[i]) {
+    e = word_end(s, i)
+    k = skip_blank(s, e)
+    if k < s.size && ((s[k] == 61 && !(k + 1 < s.size && (s[k + 1] == 61 || s[k + 1] == 62))) || (s[k] == 58 && !(k + 1 < s.size && s[k + 1] == 58))) {
+      return Head.new(kind: "const", name_lo: i, name_hi: e, owner: "", next: e)
+    }
+  }
+  none
+}
+
+# A declaration keyword at column 0 that ends an unclosed brace (recovery).
+def strong?(s: Str, i: Int) -> Bool {
+  for w in ["def", "fn", "pub", "struct", "enum", "interface", "extern"] {
+    return true if kw(s, i, w)
+  }
+  return true if at(s, i, "ƒ")
+  for w in ["error", "refine"] {
+    return true if kw(s, i, w) && i + w.size + 1 < s.size && upper?(s[i + w.size + 1])
+  }
+  for w in ["import", "test", "bench", "example"] {
+    return true if kw(s, i, w) && i + w.size + 1 < s.size && s[i + w.size + 1] == 34
+  }
+  false
+}
+
+# A body that is open: the symbol, and the brace depth outside it.
+struct Open {
+  sym: Int
+  depth: Int
+}
+
+pub def outline(s: Str) -> [Sym] {
+  out: [Sym] = []
+  opens: [Open] = []
+  heredocs: [Str] = []
+  n = s.size
+  i = 0
+  depth = 0 # braces
+  nest = 0  # parentheses and brackets
+  stmt = true
+  owner = ""
+  owner_sym = -1
+  pend = -1 # a symbol whose body's `{` hasn't come yet
+  pend_depth = 0
+  pend_nest = 0
+  ln_pos = 0 # line counting, incremental: `lo`s only grow
+  ln = 0
+  while i < n {
+    c = s[i]
+    if c == 10 {
+      if pend >= 0 && nest <= pend_nest && depth == pend_depth {
+        out[pend].hi = i
+        pend = -1
+      }
+      i += 1
+      # heredoc bodies follow the line that opened them
+      for term in heredocs {
+        while i < n {
+          e = i
+          while e < n && s[e] != 10 {
+            e += 1
+          }
+          line = s[i...e]
+          i = e < n ? e + 1 : n
+          break if strings.trim_space(line) == term
+        }
+      }
+      heredocs = [] if heredocs.size > 0
+      stmt = true
+      next
+    }
+    if blank?(c) {
+      i += 1
+      next
+    }
+    if stmt {
+      stmt = false
+      col0 = i == 0 || s[i - 1] == 10
+      if col0 && (depth > 0 || nest > 0) && strong?(s, i) {
+        # recovery: a declaration at column 0 ends what never closed
+        for o in opens {
+          out[o.sym].hi = i - 1
+        }
+        if pend >= 0 {
+          out[pend].hi = i - 1
+          pend = -1
+        }
+        opens = []
+        depth = 0
+        nest = 0
+        owner = ""
+        owner_sym = -1
+      }
+      member = owner != "" && depth == 1 && nest == 0
+      if depth == 0 || member {
+        if h = head_at(s, i, member, depth == 0 && nest == 0) {
+          lo = h.name_lo
+          while ln_pos < lo {
+            ln += 1 if s[ln_pos] == 10
+            ln_pos += 1
+          }
+          name = s[h.name_lo...h.name_hi]
+          name = s[h.name_lo + 1...h.name_hi - 1] if s[h.name_lo] == 34
+          if pend >= 0 {
+            out[pend].hi = i
+          }
+          pend = out.size
+          pend_depth = depth
+          pend_nest = nest
+          out << Sym.new(kind: h.kind, name: name, owner: member ? owner : h.owner, lo: lo, hi: n, line: ln)
+          if depth == 0 && (h.kind == "struct" || h.kind == "enum" || h.kind == "error" || h.kind == "interface" || h.kind == "refine") {
+            owner_sym = pend
+          }
+          i = h.next
+          next
+        }
+      }
+    }
+    if c == 35 { # `#`: an attribute, a directive or a comment
+      if i + 1 < n && s[i + 1] == 91 {
+        i = attr_end(s, i)
+      } else if i + 2 < n && s[i + 1] == 33 && s[i + 2] == 91 {
+        while i < n && s[i] != 10 && s[i] != 93 {
+          i += 1
+        }
+        i += 1 if i < n && s[i] == 93
+      } else {
+        while i < n && s[i] != 10 {
+          i += 1
+        }
+      }
+      next
+    }
+    if c == 34 || c == 39 || c == 96 {
+      i = quoted_end(s, i)
+      next
+    }
+    if c == 60 && at(s, i, "<<~") {
+      k = i + 3
+      q = k < n && (s[k] == 34 || s[k] == 39)
+      k += 1 if q
+      e = word_end(s, k)
+      if e > k && (!q || (e < n && s[e] == s[i + 3])) {
+        heredocs << s[k...e]
+        i = q ? e + 1 : e
+        next
+      }
+    }
+    if c == 123 {
+      if pend >= 0 && depth == pend_depth && nest == pend_nest {
+        opens << Open.new(sym: pend, depth: depth)
+        if pend == owner_sym {
+          owner = out[pend].name
+          stmt = true # `struct P { def f ... }`
+        }
+        pend = -1
+      }
+      depth += 1
+    } else if c == 125 {
+      depth -= 1 if depth > 0
+      if pend >= 0 && depth < pend_depth {
+        out[pend].hi = i
+        pend = -1
+      }
+      while opens.size > 0 && opens[opens.size - 1].depth >= depth {
+        o = opens[opens.size - 1]
+        out[o.sym].hi = i + 1
+        opens = opens[0...opens.size - 1]
+        if o.sym == owner_sym {
+          owner = ""
+          owner_sym = -1
+        }
+      }
+    } else if c == 40 || c == 91 {
+      nest += 1
+    } else if c == 41 || c == 93 {
+      nest -= 1 if nest > 0
+    } else if c == 59 || (c == 44 && owner != "" && depth == 1) {
+      stmt = true if nest == 0 # `;`, and `,` between a type's members
+    } else if word?(c) {
+      i = word_end(s, i)
+      next
+    }
+    i += 1
+  }
+  out
+}

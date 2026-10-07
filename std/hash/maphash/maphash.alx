@@ -14,6 +14,11 @@
 #   h.Sum64() / Sum(b) / Reset()        h.sum64 / h.sum(b) / h.reset!
 #   h.Size() / BlockSize()              h.size / h.block_size
 #   h.Clone() (hash.Cloner, error)      h.clone -> Hash
+#   maphash.Comparable(seed, v) uint64  comparable(seed, v) -> U64
+#   maphash.WriteComparable(h, x)       write_comparable(h, x)
+#   maphash.Hasher[T] interface         a protocol: hash(h, v) / equal(x, y)
+#   maphash.ComparableHasher[T]         ComparableHasher[T]
+#   (Go's runtime type hashers)         Hashable (write_hash(h)), see below
 #
 # A Hash satisfies hash.Hash and hash.Hash64 structurally.
 #
@@ -35,10 +40,33 @@
 #     `new()` returns a seeded Hash, usable everywhere.
 #   - A Hash keeps its state in shared storage, so copies are the same hash, as
 #     Go's pointer is; `clone` makes an independent one.
-#   - Not ported: Comparable, WriteComparable, Hasher and ComparableHasher. They
-#     hash any comparable value by its runtime type's hasher; alx has no
-#     runtime type information to hash an arbitrary T by (it would be a
-#     derive, like #[derive(Json)]).
+#   - comparable / write_comparable hash Str, the integer types, Bool, Float
+#     and Complex with Go's runtime hashers for those types (strhash,
+#     memhash32/64, f64hash: +0 and -0 alike, each NaN differently,
+#     c128hash). Go hashes any comparable value by walking its runtime type;
+#     alx has no runtime type information, so a struct (or any other type)
+#     takes part by implementing Hashable: `def write_hash(h: Hash)`, writing
+#     each field `==` compares with write_comparable, in order. Any other T
+#     panics with "hash of unhashable type", as Go does at run time for an
+#     interface value holding an unhashable type (in Go such T mostly fails
+#     to compile). A Hashable struct's hash differs from Go's for the same
+#     fields (Go hashes plain-memory structs as one block): only the
+#     properties carry over.
+#   - write_comparable on a Hash no `!` method has touched panics (Go's
+#     silently writes into a state its first Sum64 then reseeds).
+#   - Hasher[T]: alx interfaces aren't generic, so it is a protocol taken by
+#     generic code (`struct BloomFilter[V, H] { hasher: H }`), and
+#     ComparableHasher[T] is a struct with hash and equal.
+#
+# Tests: Go's maphash_test.go (all but TestComparableAllocations, which counts
+# allocations, and the pointer, channel and `any` cases of TestComparable /
+# TestWriteComparable: alx has no pointers, its channels aren't comparable,
+# and interface values are closed sums), example_test.go,
+# example_bloom_test.go, the hash.Hash checks of internal/testhash, and
+# smhasher_test.go, the slow ones at reduced sizes (noted on each test).
+# vec_maphash_test.alx checks bytes, string, comparable and write_comparable
+# bit for bit against Go's runtime hash code run with this file's fixed keys
+# (Go's own outputs are random per process, so no other vectors exist).
 
 # A random value selecting a family of hash functions. The zero Seed is
 # invalid: bytes, string and set_seed! panic on it.
@@ -387,4 +415,86 @@ pub struct Hash {
     s = st[0]
     Hash.new(st: [HashState.new(seed: s.seed, state: s.state, buf: s.buf + [], n: s.n)])
   }
+}
+
+# ---- comparable values ----
+
+# A type whose values comparable and write_comparable hash by their fields:
+# write_hash writes each field that `==` compares with write_comparable (or
+# Hash's write methods), in order. Values that are `==` must write the same
+# things. This is the protocol alx uses where Go's runtime walks the type
+# (alx has no runtime type information).
+pub interface Hashable {
+  def write_hash(h: Hash)
+}
+
+# Go's runtime f64hash constants (64-bit hashes).
+C0: U64 = 33054211828000289
+C1: U64 = 23344194077549503
+
+# Go's memHash64Fallback / memHash32Fallback: an 8- or 4-byte key k.
+def mem_hash64(k: U64, seed: U64) -> U64 { mix(M5 ^ 8, mix(k ^ KEY1, k ^ seed ^ KEY0)) }
+def mem_hash32(k: U64, seed: U64) -> U64 { mix(M5 ^ 4, mix(k ^ KEY1, k ^ seed ^ KEY0)) }
+
+# Go's memHashFallback of a 1- or 2-byte key (its low byte, then the next if
+# s == 2).
+def mem_hash_small(k: U64, s: Int, seed: U64) -> U64 {
+  lo = k & 0xff
+  hi = s == 2 ? (k >> 8) & 0xff : lo
+  a = lo | (hi << 8) | (hi << 16)
+  mix(M5 ^ s.as_u64, mix(a ^ KEY1, seed ^ KEY0))
+}
+
+# Go's f64hash: +0 and -0 hash alike, every NaN differently.
+def f64_hash(f: Float, h: U64) -> U64 {
+  return C1 * (C0 ^ h) if f == 0.0
+  return C1 * (C0 ^ h ^ make_seed().s) if f != f
+  mem_hash64(f.__bits, h)
+}
+
+# The hash of v with seed s by Go's runtime hasher for v's type.
+def hash_value[T](v: T, s: U64) -> U64 {
+  if T is Str {
+    return s ^ KEY0 if v.size == 0 # Go's strhash has no empty-input shortcut
+    return mem_hash_str(v, 0, v.size, s)
+  }
+  if T is Int || T is U64 { return mem_hash64(v.as_u64, s) }
+  if T is I32 || T is U32 { return mem_hash32(v.as_u64 & 0xffffffff, s) }
+  if T is I16 || T is U16 { return mem_hash_small(v.as_u64, 2, s) }
+  if T is I8 || T is U8 { return mem_hash_small(v.as_u64, 1, s) }
+  if T is Bool { return mem_hash_small(v ? 1 : 0, 1, s) }
+  if T is Float { return f64_hash(v, s) }
+  if T is Complex { return f64_hash(v.imag, f64_hash(v.real, s)) }
+  if T is Hashable {
+    h = Hash.new(st: [HashState.new(seed: s, state: s, buf: [0.as_u8; BUF_SIZE], n: 0)])
+    v.write_hash(h)
+    return h.sum64
+  }
+  panic("maphash: hash of unhashable type")
+}
+
+# The hash of v with the given seed, such that comparable(seed, a) ==
+# comparable(seed, b) whenever a == b (NaNs hash randomly). T is a Str, an
+# integer, Bool, Float, Complex or a Hashable; any other T panics with "hash
+# of unhashable type", as Go's does for a type it can't hash.
+pub def comparable[T](seed: Seed, v: T) -> U64 { hash_value(v, seed.s) }
+
+# Adds x to the data hashed by h: comparable, continuing from h's state (Go's
+# WriteComparable, which first folds the count of buffered bytes into the
+# state, and leaves the buffered bytes for sum64).
+pub def write_comparable[T](h: Hash, x: T) {
+  h.check
+  n = h.st[0].n
+  h.st[0].state = mem_hash64(n.as_u64, h.st[0].state) if n != 0
+  h.st[0].state = hash_value(x, h.st[0].state)
+  nil
+}
+
+# Go's Hasher[T] is a protocol here (alx interfaces aren't generic): a type
+# with `hash(h: Hash, v: T)` and `equal(x: T, y: T) -> Bool`, taken by
+# generic code (`def f[H, V](hasher: H, v: V)`). ComparableHasher[T] is the
+# one for comparable T: write_comparable and `==`.
+pub struct ComparableHasher[T] {
+  pub def hash(h: Hash, v: T) { write_comparable(h, v) }
+  pub def equal(x: T, y: T) -> Bool { x == y }
 }

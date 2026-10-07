@@ -281,6 +281,9 @@ pub struct IfaceDef {
     /// The methods declared `#[track_caller]` (S9): their implementations
     /// must be too, and calls through the interface pass the call site.
     pub tracked: Vec<String>,
+    /// `#[shareable]`: its values may be handed to tasks (no implementor
+    /// holds unsynchronized storage; port-issues #270).
+    pub shareable: bool,
 }
 
 /// `refine Name for Type { def m ... }`: methods on an existing type,

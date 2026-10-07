@@ -1,0 +1,487 @@
+# Files: FileInfo, File, open/create, read_file/write_file, pipe.
+
+# ----------------------------------------------------------------- file info
+
+# What stat(2) says about a file. `mode` is st_mode: the type bits
+# (MODE_TYPE) and the permission bits (MODE_PERM); `go_mode` is Go's
+# FileMode bits. Times are nanoseconds since the Unix epoch.
+pub struct FileInfo {
+  name: Str
+  size: Int
+  mode: Int
+  mod_time: Int
+  access_time: Int
+  ino: Int
+  nlink: Int
+  dev: Int
+  uid: Int
+  gid: Int
+  rdev: Int
+  change_time: Int
+
+  pub def perm -> Int { mode & 0o777 }
+  pub def is_dir -> Bool { (mode & 0o170000) == 0o040000 }
+  pub def is_regular -> Bool { (mode & 0o170000) == 0o100000 }
+  pub def is_symlink -> Bool { (mode & 0o170000) == 0o120000 }
+  pub def is_named_pipe -> Bool { (mode & 0o170000) == 0o010000 }
+  pub def is_char_device -> Bool { (mode & 0o170000) == 0o020000 }
+
+  # Go's FileMode bits for this st_mode (fillFileStatFromSys): the
+  # permissions, ModeDir / ModeSymlink / ... and ModeSetuid / ModeSetgid /
+  # ModeSticky. As an io/fs FileMode: `fs.FileMode.new(bits: i.go_mode)`.
+  pub def go_mode -> U32 {
+    m: U32 = (mode & 0o777).to_u32
+    t = mode & 0o170000
+    m |= 1 << 31 if t == 0o040000
+    m |= 1 << 27 if t == 0o120000
+    m |= 1 << 25 if t == 0o010000
+    m |= 1 << 24 if t == 0o140000
+    m |= (1 << 26) | (1 << 21) if t == 0o020000
+    m |= 1 << 26 if t == 0o060000
+    m |= 1 << 23 if (mode & 0o4000) != 0
+    m |= 1 << 22 if (mode & 0o2000) != 0
+    m |= 1 << 20 if (mode & 0o1000) != 0
+    m
+  }
+}
+
+def info_of(name: Str, st: [Byte]) -> FileInfo {
+  FileInfo.new(name: base_name(name), size: get64(st, 1), mode: get64(st, 0), mod_time: get64(st, 2), access_time: get64(st, 3), ino: get64(st, 4), nlink: get64(st, 5), dev: get64(st, 6), uid: get64(st, 7), gid: get64(st, 8), rdev: get64(st, 9), change_time: get64(st, 10))
+}
+
+# The last element of a path ("/" for "/", "." for "").
+def base_name(p: Str) -> Str {
+  path.base(p)
+}
+
+# Information about the named file, following a final symlink.
+pub def stat(name: Str) -> ~FileInfo<FsError> {
+  fail ferr("stat" + " " + name, c("EINVAL")) if nul?(name)
+  st = zeros(STAT_SIZE)
+  r = alx_sys_stat(name, st, 1)
+  fail ferr("stat" + " " + name, -r.to_i) if r != 0
+  info_of(name, st)
+}
+
+# Like stat, but a final symlink is described rather than followed.
+pub def lstat(name: Str) -> ~FileInfo<FsError> {
+  fail ferr("lstat" + " " + name, c("EINVAL")) if nul?(name)
+  st = zeros(STAT_SIZE)
+  r = alx_sys_stat(name, st, 0)
+  fail ferr("lstat" + " " + name, -r.to_i) if r != 0
+  info_of(name, st)
+}
+
+# Go's SameFile: the same device and inode.
+pub def same_file(a: FileInfo, b: FileInfo) -> Bool {
+  a.dev == b.dev && a.ino == b.ino
+}
+
+# ----------------------------------------------------------------------- File
+
+# An open file: its descriptor and the name it was opened with. The state
+# lives in Atomics, so copies of a File share it (GO-VS-RUBY D36) and tasks
+# may share one, as goroutines share an *os.File: `close!` on one copy
+# closes them all (a second close, on any copy or task, fails with
+# ErrClosed), and wakes a task waiting to read or write it.
+pub struct File {
+  fdc: Atomic[Int]  # the descriptor; -1 once closed
+  dirc: Atomic[Int] # the directory stream read_dir! reads (0: none)
+  append: Bool      # opened with O_APPEND
+  name: Str
+
+  # The descriptor; -1 once closed (Go's Fd).
+  pub def fd -> Int { fdc.load }
+
+  def closed_error(op: Str) -> FsError { ferr(op + " " + name, ERR_CLOSED) }
+
+  # Reads up to p.size bytes; returns the count, 0 at the end of the file.
+  # In a task, waiting for a pipe or a terminal parks the task, not its
+  # worker (port-issues #166).
+  pub def read!(p: [Byte]) -> ~Int<FsError> {
+    fail closed_error("read") if fd < 0
+    return 0 if p.size == 0
+    n = alx_sys_read(fd, p, p.size)
+    if n < 0 {
+      # Closed by another task while this one waited (Go's ErrClosed).
+      fail closed_error("read") if fd < 0
+      fail ferr("read" + " " + name, -n)
+    }
+    n
+  }
+
+  # Waits until a read would not block (data, end of file, hangup or an error
+  # is pending): true; false if timeout passes first. An alx extension (Go has
+  # SetReadDeadline). A task parks with a deadline, so its worker runs other
+  # tasks; the main thread poll(2)s. Not supported in the browser.
+  pub def wait_readable(timeout: time.Duration) -> ~Bool<FsError> {
+    fail closed_error("read") if fd < 0
+    r = alx_fd_wait_timeout(fd, 1, timeout.ns)
+    fail ferr("read" + " " + name, -r) if r < 0
+    r == 1
+  }
+
+  # Writes all of p; returns p.size.
+  pub def write!(p: [Byte]) -> ~Int<FsError> {
+    fail closed_error("write") if fd < 0
+    off = 0
+    while off < p.size {
+      n = alx_sys_write(fd, p[off...p.size], p.size - off)
+      if n < 0 {
+        fail closed_error("write") if fd < 0
+        fail ferr("write" + " " + name, -n)
+      }
+      off += n
+    }
+    p.size
+  }
+
+  pub def write_string!(s: Str) -> ~Int<FsError> {
+    self.~write!(s.bytes.to_a)
+  }
+
+  # Reads p.size bytes at offset `off` without moving the file offset; fewer
+  # only at the end of the file.
+  pub def read_at(p: [Byte], off: Int) -> ~Int<FsError> {
+    fail closed_error("read") if fd < 0
+    fail ferr("readat" + " " + name, ERR_NEGATIVE_OFFSET) if off < 0
+    done = 0
+    while done < p.size {
+      n = c_pread(fd.to_i32, p[done...p.size], p.size - done, off + done)
+      if n < 0 {
+        code = C.errno
+        next if code == c("EINTR")
+        fail ferr("read" + " " + name, code)
+      }
+      break if n == 0
+      done += n
+    }
+    done
+  }
+
+  # Writes all of p at offset `off` without moving the file offset.
+  pub def write_at(p: [Byte], off: Int) -> ~Int<FsError> {
+    fail closed_error("write") if fd < 0
+    fail ferr("", ERR_WRITE_AT_APPEND) if append
+    fail ferr("writeat" + " " + name, ERR_NEGATIVE_OFFSET) if off < 0
+    done = 0
+    while done < p.size {
+      n = c_pwrite(fd.to_i32, p[done...p.size], p.size - done, off + done)
+      if n < 0 {
+        code = C.errno
+        next if code == c("EINTR")
+        fail ferr("write" + " " + name, code)
+      }
+      done += n
+    }
+    p.size
+  }
+
+  # Moves the offset (whence: SEEK_SET 0, SEEK_CUR 1, SEEK_END 2); returns
+  # the new offset from the start. Seeking a directory being read back to 0
+  # restarts the listing (anywhere else fails with EISDIR, as in Go).
+  pub def seek!(offset: Int, whence: Int) -> ~Int<FsError> {
+    fail closed_error("seek") if fd < 0
+    r = c_lseek(fd.to_i32, offset, whence.to_i32)
+    fail ferr("seek" + " " + name, C.errno) if r < 0
+    h = dirc.swap(0)
+    if h != 0 {
+      alx_sys_dir_close(h)
+      fail ferr("seek" + " " + name, c("EISDIR")) if r != 0
+    }
+    r
+  }
+
+  # Closes the descriptor; tasks waiting to read or write it wake up and
+  # fail. A second close fails with "file already closed" (Go's ErrClosed).
+  pub def close! -> ~Unit<FsError> {
+    old = fdc.swap(-1)
+    fail closed_error("close") if old < 0
+    h = dirc.swap(0)
+    alx_sys_dir_close(h) if h != 0
+    r = alx_fd_close(old)
+    fail ferr("close" + " " + name, -r) if r != 0
+  }
+
+  # Flushes the file's data to the device.
+  pub def sync! -> ~Unit<FsError> {
+    fail closed_error("sync") if fd < 0
+    r = c_fsync(fd.to_i32)
+    fail ferr("sync" + " " + name, C.errno) if r != 0
+  }
+
+  pub def truncate!(size: Int) -> ~Unit<FsError> {
+    fail closed_error("truncate") if fd < 0
+    r = c_ftruncate(fd.to_i32, size)
+    fail ferr("truncate" + " " + name, C.errno) if r != 0
+  }
+
+  pub def chmod!(mode: Int) -> ~Unit<FsError> {
+    fail closed_error("chmod") if fd < 0
+    r = c_fchmod(fd.to_i32, mode.to_i32)
+    fail ferr("chmod" + " " + name, C.errno) if r != 0
+  }
+
+  # Go's File.Chown (-1 leaves an id as it is).
+  pub def chown!(uid: Int, gid: Int) -> ~Unit<FsError> {
+    fail closed_error("chown") if fd < 0
+    r = c_fchown(fd.to_i32, uid.to_i32, gid.to_i32)
+    fail ferr("chown" + " " + name, C.errno) if r != 0
+  }
+
+  # Makes this directory the working directory (Go's File.Chdir).
+  pub def chdir! -> ~Unit<FsError> {
+    fail closed_error("chdir") if fd < 0
+    r = c_fchdir(fd.to_i32)
+    fail ferr("chdir" + " " + name, C.errno) if r != 0
+  }
+
+  pub def stat -> ~FileInfo<FsError> {
+    fail closed_error("stat") if fd < 0
+    st = zeros(STAT_SIZE)
+    r = alx_sys_fstat(fd.to_i32, st)
+    fail ferr("stat" + " " + name, -r.to_i) if r != 0
+    info_of(name, st)
+  }
+
+  # Is this a terminal?
+  pub def is_terminal -> Bool { fd >= 0 && c_isatty(fd.to_i32) }
+
+  # The directory's next entries, in directory order (Go's File.ReadDir):
+  # n > 0 reads at most n, an empty slice at the end; n <= 0 reads all the
+  # rest.
+  pub def read_dir!(n: Int) -> ~[DirEntry]<FsError> {
+    fail closed_error("readdir") if fd < 0
+    if dirc.load == 0 {
+      # A stream of its own over the same directory.
+      h = alx_sys_dir_fdopen(fd)
+      fail ferr(dir_open_op + " " + name, -h) if h < 0
+      alx_sys_dir_close(h) if !dirc.compare_and_swap(0, h)
+    }
+    out: [DirEntry] = []
+    kind = zeros(1)
+    while n <= 0 || out.size < n {
+      p = alx_sys_dir_next(dirc.load, kind)
+      break if p.null?
+      en = Str.from_cstr(p)
+      out << DirEntry.new(name: en, dir: name, kind: entry_kind(name, en, kind[0].to_i))
+    }
+    out
+  }
+
+  # The FileInfo of the next entries (Go's File.Readdir), as read_dir!; an
+  # entry that vanished before its lstat is left out.
+  pub def readdir!(n: Int) -> ~[FileInfo]<FsError> {
+    out: [FileInfo] = []
+    loop {
+      want = n <= 0 ? 0 : n - out.size
+      es = self.~read_dir!(want)
+      for e in es {
+        r = lstat(path.join([name, e.name]))
+        if i = r.ok {
+          out << i
+        } else if !is_not_exist(r.err.unwrap) {
+          ~r
+        }
+      }
+      break if es.size == 0 || n <= 0 || out.size >= n
+    }
+    out
+  }
+
+  # The names of the next entries (Go's File.Readdirnames), as read_dir!.
+  pub def readdirnames!(n: Int) -> ~[Str]<FsError> {
+    out: [Str] = []
+    for e in self.~read_dir!(n) { out << e.name }
+    out
+  }
+
+  # Copies r to the file until r's end (Go's File.ReadFrom); the count.
+  pub def read_from!(r: Reader) -> ~Int {
+    buf = zeros(32 * 1024)
+    total = 0
+    src = r
+    loop {
+      k = src.~read!(buf)
+      break if k == 0
+      self.~write!(buf[0...k])
+      total += k
+    }
+    total
+  }
+
+  # Copies the rest of the file to w (Go's File.WriteTo); the count.
+  pub def write_to!(w: Writer) -> ~Int {
+    buf = zeros(32 * 1024)
+    total = 0
+    dst = w
+    loop {
+      k = self.~read!(buf)
+      break if k == 0
+      dst.~write!(buf[0...k])
+      total += k
+    }
+    total
+  }
+}
+
+# io.Reader and io.Writer (os doesn't import io: io's would do as well).
+pub interface Reader {
+  def read!(p: [Byte]) -> ~Int
+}
+
+pub interface Writer {
+  def write!(p: [Byte]) -> ~Int
+}
+
+def dir_open_op -> Str { darwin? ? "fdopendir" : "readdirent" }
+
+# An entry's kind from readdir's d_type, or (0: the file system didn't say)
+# from lstat.
+def entry_kind(dir: Str, name: Str, k: Int) -> Int {
+  return k if k != 0
+  st = zeros(STAT_SIZE)
+  return 4 if alx_sys_stat(path.join([dir, name]), st, 0) != 0
+  t = get64(st, 0) & 0o170000
+  return 1 if t == 0o100000
+  return 2 if t == 0o040000
+  return 3 if t == 0o120000
+  4
+}
+
+# A File over an existing descriptor; none for a negative one (Go's NewFile
+# returns nil).
+pub def new_file(fd: Int, name: Str) -> File? {
+  return none if fd < 0
+  file_of(fd, name)
+}
+
+def file_of(fd: Int, name: Str) -> File {
+  File.new(fdc: Atomic.new(fd), dirc: Atomic.new(0), append: false, name: name)
+}
+
+# Go's os.Stdin, os.Stdout, os.Stderr: package state (R11), so a program can
+# point them elsewhere (`os.STDOUT.store(f)`), as Go's are variables. A load
+# is a copy of the File: closing it closes the descriptor, but other copies
+# don't see that it is closed.
+pub STDIN = Atomic.new(file_of(0, "/dev/stdin"))
+pub STDOUT = Atomic.new(file_of(1, "/dev/stdout"))
+pub STDERR = Atomic.new(file_of(2, "/dev/stderr"))
+
+pub def stdin -> File { STDIN.load }
+pub def stdout -> File { STDOUT.load }
+pub def stderr -> File { STDERR.load }
+
+# The platform's O_* value for the portable flags.
+def native_flags(flags: Int) -> Int {
+  v = flags & 3
+  v |= c("O_APPEND") if (flags & 8) != 0
+  v |= c("O_CREAT") if (flags & 16) != 0
+  v |= c("O_EXCL") if (flags & 32) != 0
+  v |= c("O_SYNC") if (flags & 64) != 0
+  v |= c("O_TRUNC") if (flags & 128) != 0
+  v |= c("O_NONBLOCK") if (flags & 256) != 0
+  v | c("O_CLOEXEC")
+}
+
+# Opens the named file with the given O_* flags; a new file gets permissions
+# `perm` (before the umask).
+pub def open_file(name: Str, flags: Int, perm: Int) -> ~File<FsError> {
+  fd = ~open_fd(name, flags, perm)
+  f = file_of(fd, Str.from_bytes(name.bytes.to_a))
+  f.append = (flags & O_APPEND) != 0
+  f
+}
+
+def open_fd(name: Str, flags: Int, perm: Int) -> ~Int<FsError> {
+  fail ferr("open" + " " + name, c("EINVAL")) if nul?(name)
+  nf = native_flags(flags).to_i32
+  fd = alx_sys_open(name, nf, perm.to_i32)
+  while fd < 0 {
+    code = C.errno
+    fail ferr("open" + " " + name, code) if code != c("EINTR")
+    fd = alx_sys_open(name, nf, perm.to_i32)
+  }
+  fd.to_i
+}
+
+# Opens for reading. (open and create call open_fd, not open_file: a File,
+# whose descriptor is in a slice, returned through two fallible calls in a row
+# is corrupted by a compiler bug.)
+pub def open(name: Str) -> ~File<FsError> {
+  fd = ~open_fd(name, O_RDONLY, 0)
+  file_of(fd, Str.from_bytes(name.bytes.to_a))
+}
+
+# Creates or truncates for reading and writing (permissions 0o666).
+pub def create(name: Str) -> ~File<FsError> {
+  fd = ~open_fd(name, O_RDWR | O_CREATE | O_TRUNC, 0o666)
+  file_of(fd, Str.from_bytes(name.bytes.to_a))
+}
+
+# The whole content of a file.
+pub def read_file(name: Str) -> ~[Byte]<FsError> {
+  fd = ~open_fd(name, O_RDONLY, 0)
+  r = read_all_fd(fd, name)
+  alx_fd_close(fd)
+  ~r
+}
+
+def read_all_fd(fd: Int, name: Str) -> ~[Byte]<FsError> {
+  st = zeros(STAT_SIZE)
+  size = 0
+  size = get64(st, 1) if alx_sys_fstat(fd.to_i32, st) == 0
+  r = read_file_contents(size) { |p| alx_sys_read(fd, p, p.size) }
+  fail ferr("read" + " " + name, r[1]) if r[1] != 0
+  r[0]
+}
+
+# Go's readFileContents: reads with `read` (the count, 0 at the end, or
+# -errno) into a buffer sized from the file's stat size (+1, to see the end
+# in one read; at least 512, as /proc files claim size 0). The bytes read,
+# and the errno that stopped it (0 at the end).
+def read_file_contents(stat_size: Int, read: ([Byte]) -> Int) -> ([Byte], Int) {
+  zero_size = stat_size == 0
+  size = stat_size < 0 ? 0 : stat_size
+  size += 1
+  size = 512 if size < 512
+  buf = zeros(size)
+  len = 0
+  loop {
+    n = read.call(buf[len...buf.size])
+    return (buf[0...len], -n) if n < 0
+    break if n == 0
+    len += n
+    remain = buf.size - len
+    if remain == 0 || (zero_size && remain < 512) {
+      bigger = zeros(buf.size + 512 + buf.size / 4)
+      copy(bigger[0...len], buf[0...len])
+      buf = bigger
+    }
+  }
+  (buf[0...len], 0)
+}
+
+# Writes data to the named file, creating it with `perm` or truncating it.
+pub def write_file(name: Str, data: [Byte], perm: Int) -> ~Unit<FsError> {
+  f = ~open_file(name, O_WRONLY | O_CREATE | O_TRUNC, perm)
+  r = f.write!(data)
+  r2 = f.close!
+  ~r
+  ~r2
+}
+
+# The whole content of a file as a string.
+pub def read_file_string(name: Str) -> ~Str<FsError> {
+  b = ~read_file(name)
+  Str.from_bytes(b)
+}
+
+# A connected pair of Files (Go's Pipe): reads from the first return the
+# bytes written to the second.
+pub def pipe -> ~(File, File)<FsError> {
+  b = zeros(16)
+  r = alx_sys_pipe(b, 0)
+  fail ferr("pipe", -r) if r < 0
+  (file_of(get64(b, 0), "|0"), file_of(get64(b, 1), "|1"))
+}

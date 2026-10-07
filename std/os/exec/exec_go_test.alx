@@ -1,0 +1,797 @@
+#![test(external)]
+# Go's os/exec tests (exec_test.go, exec_posix_test.go, lp_unix_test.go,
+# dot_test.go, lp_test.go), translated. Go re-runs its test binary as the
+# helper commands; here they are /bin/sh scripts and standard tools doing
+# the same (echo, cat, pipetest, stdinClose, exit, stderrfail, yes, hang,
+# pwd). Untranslated tests are listed in exec.alx's header.
+
+import "os"
+import "os/exec"
+import "io"
+import "bufio"
+import "bytes"
+import "context"
+import "strings"
+import "time"
+import "testing"
+
+# ------------------------------------------------------- the helper commands
+
+def helper(name: Str, args: [Str]) -> exec.Cmd {
+  case name {
+    "echo" => exec.command("echo", args)
+    "echoenv" => exec.command("/bin/sh", ["-c", "for v in \"$@\"; do eval \"printf '%s\\\\n' \\\"\\${$v}\\\"\"; done", "sh"] + args)
+    "cat" => exec.command("cat", args)
+    "pipetest" => exec.command("/bin/sh", ["-c", PIPETEST])
+    "stdinClose" => exec.command("/bin/sh", ["-c", "s=$(cat); [ \"$s\" = \"#{STDIN_CLOSE_TEST}\" ] || { echo \"Error: Read $s\" >&2; exit 1; }"])
+    "exit" => exec.command("/bin/sh", ["-c", "exit #{args[0]}"])
+    "stderrfail" => exec.command("/bin/sh", ["-c", "echo 'some stderr text' >&2; exit 1"])
+    "yes" => exec.command("yes", args)
+    "pwd" => exec.command("/bin/sh", ["-c", "pwd"])
+    _ => exec.command(name, args)
+  }
+}
+
+def helper_context(ctx: context.Context, name: Str, args: [Str]) -> exec.Cmd {
+  c = helper(name, args)
+  c.ctx = ctx
+  c.kill_on_cancel = true
+  c
+}
+
+# Go's cmdPipeTest: lines "O:x" go to stdout, "E:x" to stderr, anything
+# else fails.
+PIPETEST = "while IFS= read -r l; do case \"$l\" in O:*) printf '%s\\n' \"$l\" ;; E:*) printf '%s\\n' \"$l\" >&2 ;; *) exit 1 ;; esac; done"
+
+STDIN_CLOSE_TEST = "Some test string."
+
+def b(s: Str) -> [Byte] { s.bytes.to_a }
+
+# ------------------------------------------------------------- exec_test.go
+
+test "Echo" {
+  assert_eq helper("echo", ["foo bar", "baz"]).output.unwrap, "foo bar baz\n"
+}
+
+# Go sets cmd.Path to a path relative to cmd.Dir.
+test "CommandRelativeName" { |t|
+  dir = t.temp_dir
+  os.mkdir(dir + "/_test", 0o755).unwrap
+  os.symlink(exec.look_path("echo").unwrap, dir + "/_test/echo.test").unwrap
+  cmd = helper("echo", ["foo"])
+  cmd.lpath = "_test/echo.test"
+  cmd.dir = dir
+  assert_eq cmd.output.unwrap, "foo\n"
+}
+
+test "CatStdin" {
+  input = "Input string\nLine 2"
+  p = helper("cat", [])
+  p.stdin_reader = strings.new_reader(input)
+  assert_eq p.output.unwrap, input
+}
+
+test "EchoFileRace" {
+  cmd = helper("echo", [])
+  stdin = cmd.stdin_pipe!.unwrap
+  cmd.start!.unwrap
+  w = stdin
+  wrote = spawn {
+    f = w
+    f.write_string!("echo\n")
+    0
+  }
+  cmd.wait!.unwrap
+  wrote.wait.unwrap
+}
+
+test "CatGoodAndBadFile" { |t|
+  good = t.temp_dir + "/exec_test.go"
+  os.write_file(good, b("func TestCatGoodAndBadFile(t *testing.T) {\n}\n"), 0o644).unwrap
+  r = helper("cat", ["/bogus/file.foo", good])
+  r.check = false
+  out = r.combined_output.unwrap
+  st = r.process_state
+  # (combined_output on a copy: run it again to see the status.)
+  c2 = helper("cat", ["/bogus/file.foo", good])
+  e = c2.combined_output.err
+  assert e != none && exec.exit_info(e.unwrap) != none, "expected ExitError from cat combined; got #{e}"
+  _ = st
+  lines = out.split("\n")
+  assert lines.size >= 2, "expected two lines from cat; got #{out}"
+  # cat's own complaint here, Go's helper's "Error: open /bogus/file.foo".
+  assert lines[0].include?("/bogus/file.foo"), "expected stderr to complain about file; got #{lines[0]}"
+  assert out.include?("func TestCatGoodAndBadFile(t *testing.T)"), "expected test code; got #{out}"
+}
+
+test "NoExistExecutable" {
+  assert exec.command("/no-exist-executable", []).run.err?, "expected error from /no-exist-executable"
+}
+
+test "ExitStatus" {
+  cmd = helper("exit", ["42"])
+  e = cmd.run.err
+  info = exec.exit_info(e.unwrap)
+  assert info != none, "expected ExitError from exit 42; got #{e}"
+  assert_eq info.unwrap.go_message, "exit status 42"
+}
+
+test "ExitCode" {
+  cmd = helper("exit", ["42"])
+  _ = cmd.start!
+  _ = cmd.wait!
+  assert_eq cmd.process_state.unwrap.exit_code, 42
+  cmd2 = helper("exit", ["255"])
+  _ = cmd2.start!
+  _ = cmd2.wait!
+  assert_eq cmd2.process_state.unwrap.exit_code, 255
+  cmd3 = helper("cat", [])
+  cmd3.start!.unwrap
+  cmd3.wait!.unwrap
+  assert_eq cmd3.process_state.unwrap.exit_code, 0
+  # Not run: Go's nil ProcessState has ExitCode -1; none here.
+  cmd4 = helper("cat", [])
+  assert cmd4.process_state == none
+}
+
+def line(br: bufio.Reader) -> Str {
+  r = br
+  r.read_line!.unwrap.unwrap
+}
+
+test "Pipes" {
+  c = helper("pipetest", [])
+  stdin = c.stdin_pipe!.unwrap
+  stdout = c.stdout_pipe!.unwrap
+  stderr = c.stderr_pipe!.unwrap
+  outbr = bufio.new_reader(stdout)
+  errbr = bufio.new_reader(stderr)
+  c.start!.unwrap
+  stdin.write!(b("O:I am output\n")).unwrap
+  assert_eq line(outbr), "O:I am output"
+  stdin.write!(b("E:I am error\n")).unwrap
+  assert_eq line(errbr), "E:I am error"
+  stdin.write!(b("O:I am output2\n")).unwrap
+  assert_eq line(outbr), "O:I am output2"
+  stdin.close!.unwrap
+  c.wait!.unwrap
+}
+
+test "StdinClose" {
+  cmd = helper("stdinClose", [])
+  stdin = cmd.stdin_pipe!.unwrap
+  # Go checks that the WriteCloser is an *os.File underneath: it is one.
+  assert stdin.fd >= 0, "can't access methods of underlying os.File"
+  cmd.start!.unwrap
+  w = stdin
+  copier = spawn {
+    f = w
+    io.copy(f, strings.new_reader(STDIN_CLOSE_TEST)).unwrap
+    r = f.close!
+    if e = r.err {
+      assert os.is_closed(e), "Close: #{e}"
+    }
+    0
+  }
+  cmd.wait!.unwrap
+  copier.wait.unwrap
+}
+
+test "StdinCloseRace" {
+  cmd = helper("stdinClose", [])
+  stdin = cmd.stdin_pipe!.unwrap
+  cmd.start!.unwrap
+  p = cmd.process.unwrap
+  killer = spawn {
+    _ = p.kill
+    0
+  }
+  w = stdin
+  copier = spawn {
+    f = w
+    _ = io.copy(f, strings.new_reader("unexpected string"))
+    r = f.close!
+    if e = r.err {
+      assert os.is_closed(e), "stdin.Close: #{e}"
+    }
+    0
+  }
+  killer.wait.unwrap
+  copier.wait.unwrap
+  assert cmd.wait!.err?, "Wait: succeeded unexpectedly"
+}
+
+# The descriptors this process has open (Go's fdtest over 0..99).
+def open_fds -> [Int] {
+  out: [Int] = []
+  for i in 0...100 {
+    out << i if os.new_file(i, "fd").unwrap.stat.ok?
+  }
+  out
+}
+
+test "PipeLookPathLeak" {
+  old = open_fds
+  for _i in 0...6 {
+    cmd = exec.command("something-that-does-not-exist-executable", [])
+    _ = cmd.stdout_pipe!
+    _ = cmd.stderr_pipe!
+    _ = cmd.stdin_pipe!
+    assert cmd.run.err?, "unexpected success"
+  }
+  for fd in open_fds {
+    assert old.include?(fd), "leaked file descriptor #{fd}"
+  }
+}
+
+# Go builds a helper (read3.go) that reads fd 3; `cat <&3` does here.
+test "ExtraFiles" {
+  tf = os.create_temp("", "").unwrap
+  text = "Hello, fd 3!"
+  tf.write!(b(text)).unwrap
+  tf.seek!(0, io.SEEK_START).unwrap
+  c = exec.command("/bin/sh", ["-c", "cat <&3"])
+  out = bytes.new_buffer([])
+  errb = bytes.new_buffer([])
+  c.stdout = out
+  c.stderr = errb
+  c.extra_files = [tf]
+  c.run.unwrap
+  assert_eq out.string, text
+  tf.close!.unwrap
+  os.remove(tf.name).unwrap
+}
+
+# Go passes listeners as fd 3 to two concurrent helpers; here two files.
+test "ExtraFilesRace" {
+  for i in 0...3 {
+    fa = os.create_temp("", "").unwrap
+    fa.write!(b("a#{i}")).unwrap
+    fa.seek!(0, 0).unwrap
+    fb = os.create_temp("", "").unwrap
+    fb.write!(b("b#{i}")).unwrap
+    fb.seek!(0, 0).unwrap
+    ca = exec.command("/bin/sh", ["-c", "cat <&3"])
+    ca.extra_files = [fa]
+    cb = exec.command("/bin/sh", ["-c", "cat <&3"])
+    cb.extra_files = [fb]
+    ta = spawn { ca.combined_output.unwrap }
+    tb = spawn { cb.combined_output.unwrap }
+    assert_eq ta.wait.unwrap, "a#{i}"
+    assert_eq tb.wait.unwrap, "b#{i}"
+    for f in [fa, fb] {
+      g = f
+      g.close!.unwrap
+      os.remove(g.name).unwrap
+    }
+  }
+}
+
+# Go's delayedInfiniteReader.
+struct DelayedInfiniteReader {
+  pub def read!(p: [Byte]) -> ~Int {
+    time.sleep(time.millisecond * 100)
+    for i in 0...p.size { p[i] = 120 }
+    p.size
+  }
+}
+
+test "IgnorePipeErrorOnSuccess" { |pt|
+  pt.run("10MB") { |_t|
+    cmd = helper("echo", ["foo"])
+    out = bytes.new_buffer([])
+    cmd.stdin_reader = strings.new_reader("x" * (10 << 20))
+    cmd.stdout = out
+    cmd.run.unwrap
+    assert_eq out.string, "foo\n"
+  }
+  pt.run("Infinite") { |_t|
+    cmd = helper("echo", ["foo"])
+    out = bytes.new_buffer([])
+    cmd.stdin_reader = DelayedInfiniteReader.new
+    cmd.stdout = out
+    cmd.run.unwrap
+    assert_eq out.string, "foo\n"
+  }
+}
+
+struct BadWriter {
+  pub def write!(_p: [Byte]) -> ~Int {
+    fail io.StreamError.UnexpectedEof
+  }
+}
+
+test "ClosePipeOnCopyError" {
+  cmd = helper("yes", [])
+  cmd.stdout = BadWriter.new
+  assert cmd.run.err?, "yes unexpectedly completed successfully"
+}
+
+test "OutputStderrCapture" {
+  e = helper("stderrfail", []).output.err
+  info = exec.exit_info(e.unwrap)
+  assert info != none, "Output error type = #{e}; want ExitError"
+  assert_eq info.unwrap.stderr, "some stderr text\n"
+}
+
+test "Context" {
+  ctx, cancel = context.with_cancel(context.background)
+  c = helper_context(ctx, "pipetest", [])
+  stdin = c.stdin_pipe!.unwrap
+  stdout = c.stdout_pipe!.unwrap
+  c.start!.unwrap
+  stdin.write!(b("O:hi\n")).unwrap
+  buf: [Byte] = [0; 5]
+  n = io.read_full(stdout, buf).unwrap
+  assert n == 5 && Str.from_bytes(buf) == "O:hi\n", "ReadFull = #{n}, #{Str.from_bytes(buf)}"
+  cancel.call
+  assert c.wait!.err?, "expected Wait failure"
+}
+
+test "ContextCancel" {
+  ctx, cancel = context.with_cancel(context.background)
+  c = helper_context(ctx, "cat", [])
+  stdin = c.stdin_pipe!.unwrap
+  c.start!.unwrap
+  stdin.write_string!("echo").unwrap
+  cancel.call
+  start = time.now
+  delay = time.millisecond
+  loop {
+    break if stdin.write_string!("echo").err?
+    assert time.since(start) <= time.minute, "canceling context did not stop program"
+    delay = delay * 2
+    delay = time.second if delay > time.second
+    time.sleep(delay)
+  }
+  assert c.wait!.err?, "program unexpectedly exited successfully"
+  _ = stdin.close!
+}
+
+test "DedupEnvEcho" {
+  cmd = helper("echoenv", ["FOO"])
+  cmd.env = cmd.environ + ["FOO=bad", "FOO=good"]
+  assert_eq cmd.combined_output.unwrap.strip, "good"
+}
+
+test "EnvNULCharacter" {
+  cmd = helper("echoenv", ["FOO", "BAR"])
+  cmd.env = cmd.environ + ["FOO=foo" + Str.from_bytes([0]) + "BAR=bar"]
+  r = cmd.combined_output
+  assert r.err?, "output = #{r.ok}; want error"
+  assert_eq r.err.unwrap.message, "exec: environment variable contains NUL"
+}
+
+test "String" { |t|
+  echo_path = exec.look_path("echo")
+  t.skip(echo_path.err.unwrap.message) if echo_path.err?
+  ep = echo_path.unwrap
+  for tc in [([], ep), (["a"], ep + " a"), (["a", "b"], ep + " a b")] {
+    assert_eq exec.command("echo", tc[0]).string, tc[1]
+  }
+}
+
+test "StringPathNotResolved" { |t|
+  t.skip("wow, thanks") if exec.look_path("makemeasandwich").ok?
+  assert_eq exec.command("makemeasandwich", ["-lettuce"]).string, "makemeasandwich -lettuce"
+}
+
+test "NoPath" {
+  c = exec.Cmd.new
+  e = c.start!.err
+  assert e != none && e.unwrap.message == "exec: no command", "Cmd.new.start! = #{e}, want \"exec: no command\""
+}
+
+test "DoubleStartLeavesPipesOpen" {
+  cmd = helper("pipetest", [])
+  inp = cmd.stdin_pipe!.unwrap
+  out = cmd.stdout_pipe!.unwrap
+  cmd.start!.unwrap
+  e = cmd.start!.err
+  assert e != none && e.unwrap.message.end_with?("already started"), "second call to Start returned #{e}; want an 'already started' error"
+  o = out
+  outc = spawn { io.read_all(o).unwrap }
+  msg = "O:Hello, pipe!\n"
+  inp.write_string!(msg).unwrap
+  inp.close!.unwrap
+  assert_eq Str.from_bytes(outc.wait.unwrap), msg
+  cmd.wait!.unwrap
+}
+
+# Go's "hang" helper, as sh: sleeps `secs` with stdout closed; -interrupt
+# exits 0 on SIGINT, else SIGINT is ignored; -subsleep leaves a child
+# sleeping with stderr open; -probe writes to stderr every few ms.
+def hang(ctx: context.Context, secs: Str, interrupt: Bool, subsleep: Bool, probe: Bool) -> exec.Cmd {
+  s = "exec >&-; "
+  s += interrupt ? "trap 'kill $! 2>/dev/null; echo $$: received interrupt >&2; exit 0' INT; " : "trap '' INT; "
+  s += "(i=0; while [ $i -lt 2000 ]; do echo ok >&2 || exit 1; sleep 0.01; i=$((i+1)); done) & " if probe
+  s += "(sleep 20) & " if subsleep
+  s += "sleep #{secs} 2>&- </dev/null & wait $!; echo $$: slept >&2"
+  c = exec.command("/bin/sh", ["-c", s])
+  c.ctx = ctx
+  c
+}
+
+# Go's startHang: stdin a tick reader, stderr a buffer, stdout a pipe read
+# to its end (the helper closes it at once).
+def start_hang(c0: exec.Cmd, cancel: ((os.Process) -> ~Unit)?, kill: Bool, wait_delay: Int) -> exec.Cmd {
+  c = c0
+  c.stdin_reader = strings.new_reader("")
+  c.stderr = bytes.new_buffer([])
+  c.cancel = cancel
+  c.kill_on_cancel = kill
+  c.wait_delay = wait_delay
+  out = c.stdout_pipe!.unwrap
+  c.start!.unwrap
+  io.read_all(out).unwrap
+  c
+}
+
+test "WaitInterrupt" { |pt|
+  too_long = "20"
+  pt.run("Wait") { |_t|
+    cmd = start_hang(hang(context.background, "0.001", false, false, false), none, true, 0)
+    cmd.wait!.unwrap
+    ps = cmd.process_state.unwrap
+    assert ps.exited && ps.exit_code == 0, "cmd did not exit 0: #{ps.to_s}"
+  }
+  pt.run("WaitDelay") { |_t|
+    ctx, cancel = context.with_cancel(context.background)
+    cmd = start_hang(hang(ctx, too_long, true, false, false), none, false, 600_000_000_000)
+    cancel.call
+    time.sleep(time.millisecond * 100)
+    cmd.process.unwrap.signal(os.INTERRUPT).unwrap
+    cmd.wait!.unwrap
+    ps = cmd.process_state.unwrap
+    assert ps.exited && ps.exit_code == 0, "cmd did not exit 0: #{ps.to_s}"
+  }
+  pt.run("SIGKILL-hang") { |_t|
+    ctx, cancel = context.with_cancel(context.background)
+    cmd = start_hang(hang(ctx, too_long, false, true, true), none, true, 10_000_000)
+    cancel.call
+    e = cmd.wait!.err
+    assert e != none && exec.exit_info(e.unwrap) != none, "Wait error = #{e}; want ExitError"
+  }
+  pt.run("Exit-hang") { |_t|
+    cmd = start_hang(hang(context.background, "0.001", false, true, true), none, false, 10_000_000)
+    e = cmd.wait!.err
+    assert e != none && exec.wait_delay?(e.unwrap), "Wait error = #{e}; want ErrWaitDelay"
+  }
+  pt.run("SIGINT-ignored") { |_t|
+    ctx, cancel = context.with_cancel(context.background)
+    interrupt = ->(p: os.Process) -> ~Unit { ~p.signal(os.INTERRUPT) }
+    cmd = start_hang(hang(ctx, too_long, false, false, false), interrupt, false, 10_000_000)
+    cancel.call
+    e = cmd.wait!.err
+    assert e != none && exec.exit_info(e.unwrap) != none, "Wait error = #{e}; want ExitError"
+  }
+  pt.run("SIGINT-handled") { |_t|
+    ctx, cancel = context.with_cancel(context.background)
+    interrupt = ->(p: os.Process) -> ~Unit { ~p.signal(os.INTERRUPT) }
+    cmd = start_hang(hang(ctx, too_long, true, false, false), interrupt, false, 0)
+    time.sleep(time.millisecond * 100) # the trap is set
+    cancel.call
+    e = cmd.wait!.err
+    assert e != none && e.unwrap.message == "context canceled", "Wait error = #{e}; want context canceled"
+    ps = cmd.process_state.unwrap
+    assert ps.exited && ps.exit_code == 0, "cmd did not exit 0: #{ps.to_s}"
+  }
+}
+
+test "CancelErrors" { |pt|
+  pt.run("success after error") { |_t|
+    ctx, cancel = context.with_cancel(context.background)
+    cmd = helper_context(ctx, "pipetest", [])
+    stdin = cmd.stdin_pipe!.unwrap
+    s = stdin
+    cmd.cancel = ->(_p: os.Process) -> ~Unit {
+      f = s
+      _ = f.close!
+      fail exec.ExecError.Usage("arbitrary error")
+    }
+    cmd.start!.unwrap
+    cancel.call
+    e = cmd.wait!.err
+    assert e != none && e.unwrap.message == "exec: canceling Cmd: arbitrary error", "Wait error = #{e}; want an error wrapping arbitrary error"
+  }
+  pt.run("success after ErrProcessDone") { |_t|
+    ctx, cancel = context.with_cancel(context.background)
+    cmd = helper_context(ctx, "pipetest", [])
+    stdin = cmd.stdin_pipe!.unwrap
+    stdout = cmd.stdout_pipe!.unwrap
+    called = Chan[Bool].new(1)
+    done = Chan[Bool].new(0)
+    cl = called
+    dn = done
+    cmd.cancel = ->(_p: os.Process) -> ~Unit {
+      cl << true
+      dn.recv
+      fail os.fs_error("", "", os.ERR_PROCESS_DONE)
+    }
+    cmd.start!.unwrap
+    cancel.call
+    called.recv
+    stdin.close!.unwrap
+    io.read_all(stdout).unwrap
+    done.close
+    cmd.wait!.unwrap
+  }
+  pt.run("killed after error") { |_t|
+    ctx, cancel = context.with_cancel(context.background)
+    cmd = helper_context(ctx, "pipetest", [])
+    stdin = cmd.stdin_pipe!.unwrap
+    called = Atomic.new(false)
+    cl = called
+    cmd.cancel = ->(_p: os.Process) -> ~Unit {
+      cl.store(true)
+      fail exec.ExecError.Usage("arbitrary error")
+    }
+    cmd.wait_delay = 1_000_000
+    cmd.start!.unwrap
+    cancel.call
+    e = cmd.wait!.err
+    assert called.load, "Cancel was not called when the context was canceled"
+    assert e != none && exec.exit_info(e.unwrap) != none, "Wait error = #{e}; want ExitError"
+    _ = stdin.close!
+  }
+  pt.run("killed after spurious ErrProcessDone") { |_t|
+    ctx, cancel = context.with_cancel(context.background)
+    cmd = helper_context(ctx, "pipetest", [])
+    stdin = cmd.stdin_pipe!.unwrap
+    called = Atomic.new(false)
+    cl = called
+    cmd.cancel = ->(_p: os.Process) -> ~Unit {
+      cl.store(true)
+      fail os.fs_error("", "", os.ERR_PROCESS_DONE)
+    }
+    cmd.wait_delay = 1_000_000
+    cmd.start!.unwrap
+    cancel.call
+    e = cmd.wait!.err
+    assert called.load, "Cancel was not called when the context was canceled"
+    assert e != none && exec.exit_info(e.unwrap) != none, "Wait error = #{e}; want ExitError"
+    _ = stdin.close!
+  }
+  pt.run("nonzero exit after error") { |_t|
+    ctx, cancel = context.with_cancel(context.background)
+    cmd = helper_context(ctx, "stderrfail", [])
+    stderr = cmd.stderr_pipe!.unwrap
+    interrupted = Chan[Bool].new(1)
+    it = interrupted
+    cmd.cancel = ->(_p: os.Process) -> ~Unit {
+      it << true
+      fail exec.ExecError.Usage("arbitrary error")
+    }
+    cmd.start!.unwrap
+    cancel.call
+    interrupted.recv
+    io.read_all(stderr).unwrap
+    e = cmd.wait!.err
+    info = e == none ? none : exec.exit_info(e.unwrap)
+    assert info != none && info.unwrap.exit_code == 1, "Wait error = #{e}; want exit status 1"
+  }
+}
+
+test "ConcurrentExec" {
+  ctx, cancel = context.with_cancel(context.background)
+  n = 4
+  hangs: [Task[~Int]] = []
+  for _i in 0...n {
+    cx = ctx
+    hangs << spawn {
+      cmd = helper_context(cx, "pipetest", [])
+      stdin = cmd.stdin_pipe!.unwrap
+      s = stdin
+      cmd.cancel = ->(_p: os.Process) -> ~Unit {
+        f = s
+        ~f.close!
+      }
+      r = cmd.start!
+      if e = r.err {
+        assert e.message == "context canceled", e.message
+      } else {
+        _ = cmd.wait!
+      }
+      0
+    }
+  }
+  exits: [Task[Int]] = []
+  for _i in 0...n {
+    cx = ctx
+    exits << spawn {
+      helper_context(cx, "exit", ["0"]).run.unwrap
+      0
+    }
+  }
+  for t in exits { t.wait.unwrap }
+  cancel.call
+  for t in hangs { t.wait.unwrap }
+}
+
+test "PathRace" {
+  cmd = helper("exit", ["0"])
+  done = spawn { cmd.combined_output.unwrap }
+  done.wait.unwrap
+}
+
+# Go runs $GOROOT/bin/gofmt; /bin/sh -c true here.
+test "AbsPathExec" {
+  exe = "/usr/bin/true"
+  cmd = exec.command(exe, [])
+  assert_eq cmd.path, exe
+  cmd.run.unwrap
+  c2 = exec.Cmd.new(lpath: exe, check: true)
+  c2.run.unwrap
+  c3 = exec.Cmd.new(lpath: "true", dir: "/", check: true)
+  assert c3.run.err?, "using Cmd{Path: \"true\"}: unexpected success"
+}
+
+test "Start_twice" {
+  cmd = exec.command("/bin/nonesuch", [])
+  assert cmd.start!.err?, "running invalid command succeeded"
+  e = cmd.start!.err
+  assert_eq e.unwrap.message, "exec: already started"
+}
+
+test "NoStringPanic" {
+  s = exec.Cmd.new.string
+  assert !s.include?("PANIC")
+}
+
+# ------------------------------------------------------- exec_posix_test.go
+
+test "Waitid" {
+  cmd = helper("pipetest", [])
+  stdin = cmd.stdin_pipe!.unwrap
+  stdout = cmd.stdout_pipe!.unwrap
+  cmd.start!.unwrap
+  msg = "O:ping\n"
+  stdin.write_string!(msg).unwrap
+  buf: [Byte] = [0; msg.size]
+  io.read_full(stdout, buf).unwrap
+  p = cmd.process.unwrap
+  p.signal(17 + (os.getpagesize == 16384 ? 0 : 2)).unwrap # SIGSTOP: 17 on macOS, 19 on Linux
+  c = cmd
+  waiter = spawn {
+    w = c
+    w.wait!.unwrap
+    0
+  }
+  time.sleep(time.millisecond * 10)
+  p.signal(19 - (os.getpagesize == 16384 ? 0 : 1)).unwrap # SIGCONT: 19 on macOS, 18 on Linux
+  stdin.close!.unwrap
+  waiter.wait.unwrap
+}
+
+test "ImplicitPWD" { |pt|
+  cwd = os.getwd.unwrap
+  parent = cwd == "/" ? "/" : cwd[0...strings.last_index(cwd, "/")]
+  parent = "/" if parent == ""
+  cases = [("empty", "", cwd), ("dot", ".", cwd), ("dotdot", "..", parent), ("PWD", cwd, cwd), ("PWDdotdot", cwd + "/..", parent)]
+  for tc in cases {
+    pt.run(tc[0]) { |t|
+      cmd = helper("pwd", [])
+      cmd.dir = tc[1]
+      pwds = cmd.environ.select { it.start_with?("PWD=") }.map { it[4...it.size] }
+      want_pwds = [tc[2]]
+      want_pwds = [] if tc[1] == "" && os.lookup_env("PWD") == none
+      want_pwds = [os.getenv("PWD").unwrap] if tc[1] == "" && os.lookup_env("PWD") != none
+      assert pwds == want_pwds, "PWD entries in cmd.Environ(): #{pwds}, want #{want_pwds}"
+      cmd.stderr = bytes.new_buffer([])
+      got = cmd.output.unwrap.strip
+      t.error("in #{tc[1]}: pwd reported #{got}, want #{tc[2]}") if tc[1] != "" && got != tc[2]
+    }
+  }
+}
+
+test "ExplicitPWD" { |pt|
+  cwd = os.getwd.unwrap
+  link = pt.temp_dir + "/link"
+  os.symlink(cwd, link).unwrap
+  cases = [("original PWD", "", cwd), ("link PWD", "", link), ("in link with original PWD", link, cwd), ("in dir with link PWD", cwd, link)]
+  for tc in cases {
+    pt.run(tc[0]) { |_t|
+      cmd = helper("pwd", [])
+      cmd.env = cmd.environ + ["PWD=" + tc[2]]
+      cmd.dir = tc[1]
+      pwds = cmd.environ.select { it.start_with?("PWD=") }.map { it[4...it.size] }
+      assert_eq pwds, [tc[2]]
+      cmd.stderr = bytes.new_buffer([])
+      assert_eq cmd.output.unwrap.strip, tc[2]
+    }
+  }
+}
+
+# ---------------------------------------------- lp_unix_test.go, lp_test.go
+
+test "LookPathUnixEmptyPath" { |t|
+  t.chdir(t.temp_dir)
+  f = os.open_file("exec_me", os.O_CREATE | os.O_EXCL, 0o700).unwrap
+  f.close!.unwrap
+  t.setenv("PATH", "")
+  assert exec.look_path("exec_me").err?, "LookPath found exec_me in empty $PATH"
+}
+
+test "LookPathNotFound" {
+  for name in ["some-non-existent-path", "non-existent-path/slashed"] {
+    r = exec.look_path(name)
+    assert r.err?, "LookPath found #{name} in $PATH"
+    assert_eq r.err.unwrap.name, name
+  }
+}
+
+# ----------------------------------------------------------------- dot_test.go
+
+def checker(pt: testing.T, name: Str) {
+  for test_name in ["", ".", "abc/..", ".."] {
+    pt.run(name + "/" + test_name) { |t|
+      t.error("#{test_name}: error expected, got nil") if exec.look_path(test_name).ok?
+    }
+  }
+}
+
+test "LookPath" { |pt|
+  tmp_dir = pt.temp_dir + "/testdir"
+  os.mkdir(tmp_dir, 0o777).unwrap
+  executable = "execabs-test"
+  os.write_file(tmp_dir + "/" + executable, [1, 2, 3], 0o777).unwrap
+  pt.chdir(tmp_dir)
+  orig_path = os.getenv("PATH") || ""
+  for errdot in ["1", "0"] {
+    for dir in [".", "../testdir"] {
+      pt.run("GODEBUG=execerrdot=#{errdot}/PATH=#{dir}") { |t|
+        t.setenv("GODEBUG", "execerrdot=" + errdot)
+        t.setenv("PATH", dir + ":" + orig_path)
+        good = dir + "/execabs-test"
+        found = exec.look_path(good)
+        assert found.ok? && found.unwrap.start_with?(good), "LookPath(#{good}) = #{found.err}"
+        r = exec.look_path("execabs-test")
+        cmd = exec.command("execabs-test", [])
+        if errdot == "1" {
+          assert r.err? && exec.dot?(r.err.unwrap), "LookPath: want ErrDot, got #{r.err}"
+          assert cmd.err != none && exec.dot?(cmd.err.unwrap), "Command: want ErrDot, got #{cmd.err}"
+          cmd.err = none
+        } else {
+          assert r.ok?, "LookPath failed unexpectedly: #{r.err}"
+          assert cmd.err == none, "Command failed unexpectedly: #{cmd.err}"
+        }
+        e = cmd.run.err
+        assert e != none && !exec.dot?(e.unwrap), "Run: want an error like ENOEXEC, got #{e}"
+      }
+    }
+  }
+  pt.run("PATH=$PWD") { |t|
+    t.setenv("PATH", tmp_dir + ":" + orig_path)
+    good = tmp_dir + "/execabs-test"
+    assert exec.look_path(good).unwrap.start_with?(good)
+    assert exec.look_path("execabs-test").unwrap.start_with?(good)
+    assert exec.command("execabs-test", []).err == none
+  }
+  pt.run("PATH=$OTHER") { |t|
+    t.setenv("PATH", "")
+    r0 = exec.look_path("execabs-test")
+    want_err_dot = r0.err? && exec.dot?(r0.err.unwrap)
+    t.fatal("with PATH='', LookPath found it") if r0.ok?
+    dir = t.temp_dir
+    os.write_file(dir + "/" + executable, [1, 2, 3], 0o777).unwrap
+    t.setenv("PATH", dir + ":" + orig_path)
+    r = exec.look_path("execabs-test")
+    if want_err_dot {
+      case r.err.unwrap {
+        exec.ExecError.Dot(_n, p) => assert_eq p, "execabs-test"
+        _ => t.fatal("want ErrDot, got #{r.err}")
+      }
+    } else {
+      assert_eq r.unwrap, dir + "/" + executable
+    }
+  }
+  checker(pt, "PATH=$OTHER2")
+  pt.run("PATH=exe") { |t|
+    t.setenv("PATH", os.executable.unwrap)
+    checker(t, "exe")
+  }
+  pt.run("PATH=exe/xx") { |t|
+    t.setenv("PATH", os.executable.unwrap + "/xx")
+    checker(t, "exexx")
+  }
+}

@@ -1,0 +1,63 @@
+# Interface values handed to tasks (port-issues #270): whether one shares
+# storage doesn't depend on what else the program converts to it.
+
+# No type is ever converted to Waiter here, so no Waiter value exists: a
+# field of that type doesn't share storage (it used to count as unknown,
+# so as sharing).
+interface Waiter {
+  def wait_done -> Int
+}
+
+struct Job {
+  name: Str
+  waiter: Waiter?
+}
+
+def watch(j: Job) -> Int {
+  if w = j.waiter {
+    cw = w
+    t = spawn { cw.wait_done }
+    return t.wait.unwrap
+  }
+  j.name.size
+}
+
+# A #[shareable] interface: every implementor keeps its state under a lock
+# or behind a channel, so a value may go to a task wherever it came from.
+#[shareable]
+interface Signal {
+  def fire -> Int
+  def fired -> Int
+}
+
+struct Counter {
+  hits: Mutex[Int]
+
+  def fire -> Int { hits.lock { |n| n += 1; n } }
+  def fired -> Int { hits.lock { |n| n } }
+}
+
+struct Relay {
+  ch: Chan[Int]
+  total: Atomic[Int]
+
+  def fire -> Int { total.add(1) }
+  def fired -> Int { total.load }
+}
+
+# `s` is the caller's: handing it to tasks needs no `.dup`.
+def fire_from_tasks(s: Signal, n: Int) -> Int {
+  ts = (0...n).map { |_i|
+    sig = s
+    spawn { sig.fire }
+  }.to_a
+  ts.each { it.wait }
+  s.fired
+}
+
+puts watch(Job.new(name: "nightly", waiter: none))
+c: Signal = Counter.new(hits: Mutex.new(0))
+puts fire_from_tasks(c, 10)
+r: Signal = Relay.new(ch: Chan[Int].new(1), total: Atomic.new(0))
+puts fire_from_tasks(r, 5)
+puts c.fired + r.fired

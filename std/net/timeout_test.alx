@@ -1,0 +1,616 @@
+# Go's timeout_test.go, translated. TestVariousDeadlines1Proc / 4Proc are
+# TestVariousDeadlines with GOMAXPROCS changed (alx has no such knob), so
+# they run as that one test.
+
+import "context"
+import "io"
+import "time"
+
+# Go's isDeadlineExceeded.
+def deadline_exceeded?(e: Error) -> Bool {
+  case e {
+    NetError.Timeout(at) => return NetError.Timeout(at).timeout? && NetError.Timeout(at).deadline_exceeded?
+    _ => return false
+  }
+}
+
+def neg_seconds(n: Int) -> time.Duration { time.second * (-n) }
+
+test "DialTimeout" {
+  ln = new_local_listener("tcp")
+  tests: [(Int, Int)] = [
+    (-5 * 1000000000, 0),
+    (0, -5 * 1000000000),
+    (-5 * 1000000000, 5 * 1000000000),
+    (-1 << 63, 0),
+    (0, -1 << 63),
+    (1000000, 0),
+    (0, 1000000),
+    (1000000, 5 * 1000000000)
+  ]
+  for tt in tests {
+    initial_timeout, initial_delta = tt
+    d = Dialer.new(timeout: time.Duration.new(initial_timeout))
+    delta = initial_delta
+    before = time.now
+    after_dial = time.now
+    err: Error? = none
+    loop {
+      if delta != 0 {
+        d.deadline = time.now.add(time.Duration.new(delta))
+      }
+      before = time.now
+      r = d.dial(ln.network, ln.addr)
+      after_dial = time.now
+      if e = r.err {
+        err = e
+        break
+      }
+      c = r.unwrap
+      c.close!
+      assert delta > 1 || d.timeout.ns > 1, "can't reduce Timeout or Deadline"
+      delta = delta / 2 if delta > 1
+      d.timeout = time.Duration.new(d.timeout.ns / 2) if d.timeout.ns > 1
+    }
+    if d.deadline.is_zero || after_dial.before(d.deadline) {
+      delay = after_dial.sub(before)
+      assert delay.ns >= d.timeout.ns, "Dial returned after #{delay}; want >= #{d.timeout}"
+    }
+    e = err.unwrap
+    if p = parse_dial_error(e) {
+      assert false, "unexpected error from Dial: #{p}"
+    }
+    assert is_timeout(e), "Dial: #{e.message}, want timeout"
+  }
+  ln.close!
+}
+
+test "DialTimeoutMaxDuration" {
+  ln = new_local_listener("tcp")
+  for tt in [(9223372036854775807, 0), (0, 9223372036854775807)] {
+    timeout, delta = tt
+    d = Dialer.new(timeout: time.Duration.new(timeout))
+    if delta != 0 {
+      d.deadline = time.now.add(time.Duration.new(delta))
+    }
+    c = d.dial(ln.network, ln.addr).unwrap
+    c.close!.unwrap
+  }
+  ln.close!.unwrap
+}
+
+test "AcceptTimeout" {
+  for timeout in [neg_seconds(5), time.millisecond * 10] {
+    ln = new_local_listener("tcp")
+    dial_done: Task[Unit]? = none
+    ctx, cancel = context.with_cancel(context.background)
+    if timeout.ns < 0 {
+      addr = ln.addr
+      dial_done = spawn {
+        r = Dialer.new.dial_context(ctx, "tcp", addr)
+        if r.ok? {
+          c = r.unwrap
+          c.close!
+        }
+      }
+      time.sleep(time.millisecond * 10)
+    }
+    ln.set_deadline(time.now.add(timeout)).unwrap
+    r = ln.accept
+    if r.ok? {
+      c = r.unwrap
+      c.close!
+    }
+    e = r.err.unwrap
+    if p = parse_accept_error(e) {
+      assert false, p
+    }
+    assert deadline_exceeded?(e), "wanted deadline exceeded: #{e.message}"
+    cancel.call
+    if t = dial_done {
+      t.wait
+    }
+    ln.close!
+  }
+}
+
+test "AcceptTimeoutMustReturn" {
+  ln = new_local_listener("tcp")
+  ln.set_deadline(time.Time.new).unwrap
+  ln.set_deadline(time.now.add(time.millisecond * 10)).unwrap
+  r = ln.accept
+  if r.ok? {
+    c = r.unwrap
+    c.close!
+  }
+  e = r.err.unwrap
+  if p = parse_accept_error(e) {
+    assert false, p
+  }
+  assert deadline_exceeded?(e), e.message
+  ln.close!
+}
+
+test "AcceptTimeoutMustNotReturn" {
+  ln = new_local_listener("tcp")
+  ch = Chan[Str].new(1)
+  started = Chan[Bool].new(1)
+  t = spawn {
+    ln.set_deadline(time.now.add(neg_seconds(5)))
+    ln.set_deadline(time.Time.new)
+    started << true
+    r = ln.accept
+    ch << (r.err? ? r.err.unwrap.message : "accepted")
+  }
+  started.recv
+  returned = ""
+  select {
+    when v = ch.recv => returned = v || ""
+    when x = time.after(time.millisecond * 100).recv => nil
+  }
+  assert_eq returned, ""
+  ln.close!
+  t.wait
+}
+
+test "ReadTimeout" {
+  ln = new_local_listener("tcp")
+  srv = spawn {
+    c = ln.~accept
+    c.~write!(bytes_of("READ TIMEOUT TEST"))
+    # Kept open until the client is done (Go's deferred Close at teardown).
+    b: [Byte] = [0]
+    c.read!(b)
+    c.~close!
+  }
+  c = dial(ln.network, ln.addr).unwrap
+  tests: [(time.Duration, [Bool])] = [(neg_seconds(5), [true, true]), (time.millisecond * 50, [false, true])]
+  for tt in tests {
+    timeout, xerrs = tt
+    c.set_read_deadline(time.now.add(timeout)).unwrap
+    b: [Byte] = [0]
+    for xerr in xerrs {
+      loop {
+        r = c.read!(b)
+        if xerr {
+          e = r.err.unwrap
+          if p = parse_read_error(e) {
+            assert false, p
+          }
+          assert deadline_exceeded?(e), e.message
+        }
+        if r.ok? {
+          time.sleep(time.Duration.new(timeout.ns / 3))
+          next
+        }
+        break
+      }
+    }
+  }
+  c.close!
+  srv.wait
+  ln.close!
+}
+
+test "ReadTimeoutMustNotReturn" {
+  ln = new_local_listener("tcp")
+  c = dial(ln.network, ln.addr).unwrap
+  ch = Chan[Str].new(1)
+  started = Chan[Bool].new(1)
+  t = spawn {
+    c.set_deadline(time.now.add(neg_seconds(5)))
+    c.set_write_deadline(time.now.add(neg_seconds(5)))
+    c.set_read_deadline(time.Time.new)
+    started << true
+    b: [Byte] = [0]
+    r = c.read!(b)
+    if e = r.err {
+      m = parse_read_error(e) || ""
+      if is_timeout(e) || is_temporary(e) {
+        m = m + " timeout or temporary: " + e.message
+      }
+      ch << m
+    } else {
+      ch << "read returned #{r.unwrap}"
+    }
+  }
+  started.recv
+  early = false
+  select {
+    when v = ch.recv => early = true
+    when x = time.after(time.millisecond * 100).recv => nil
+  }
+  assert !early, "expected Read to not return"
+  c.close!
+  assert_eq ch.recv || "", ""
+  t.wait
+  ln.close!
+}
+
+test "ReadFromTimeout" {
+  srv = new_local_packet_listener("udp")
+  host, _ = split_host_port(srv.local_addr).unwrap
+  c = listen_packet("udp", join_host_port(host, "0")).unwrap
+  dst = c.local_net_addr.unwrap
+  srv.write_to!(bytes_of("READFROM TIMEOUT TEST"), dst).unwrap
+  tests: [(time.Duration, [Bool])] = [(neg_seconds(5), [true, true]), (time.millisecond * 50, [false, true])]
+  for tt in tests {
+    timeout, xerrs = tt
+    c.set_read_deadline(time.now.add(timeout)).unwrap
+    b: [Byte] = [0]
+    for xerr in xerrs {
+      loop {
+        r = c.read_from!(b)
+        if xerr {
+          e = r.err.unwrap
+          if p = parse_read_error(e) {
+            assert false, p
+          }
+          assert deadline_exceeded?(e), e.message
+        }
+        if r.ok? {
+          time.sleep(time.Duration.new(timeout.ns / 3))
+          next
+        }
+        break
+      }
+    }
+  }
+  c.close!
+  srv.close!
+}
+
+test "WriteTimeout" {
+  ln = new_local_listener("tcp")
+  tests: [(time.Duration, [Bool])] = [(neg_seconds(5), [true, true]), (time.millisecond * 10, [false, true])]
+  conns: [Conn] = []
+  for tt in tests {
+    timeout, xerrs = tt
+    c = dial(ln.network, ln.addr).unwrap
+    conns << c
+    c.set_write_deadline(time.now.add(timeout)).unwrap
+    for xerr in xerrs {
+      loop {
+        r = c.write!(bytes_of("WRITE TIMEOUT TEST"))
+        if xerr {
+          e = r.err.unwrap
+          if p = parse_write_error(e) {
+            assert false, p
+          }
+          assert deadline_exceeded?(e), e.message
+        }
+        if r.ok? {
+          time.sleep(time.Duration.new(timeout.ns / 3))
+          next
+        }
+        break
+      }
+    }
+  }
+  for c in conns {
+    cc = c
+    cc.close!
+  }
+  ln.close!
+}
+
+test "WriteTimeoutMustNotReturn" {
+  ln = new_local_listener("tcp")
+  c = dial(ln.network, ln.addr).unwrap
+  ch = Chan[Str].new(1)
+  started = Chan[Bool].new(1)
+  t = spawn {
+    c.set_deadline(time.now.add(neg_seconds(5)))
+    c.set_read_deadline(time.now.add(neg_seconds(5)))
+    c.set_write_deadline(time.Time.new)
+    started << true
+    b: [Byte] = [0; 1024]
+    loop {
+      r = c.write!(b)
+      if e = r.err {
+        m = parse_write_error(e) || ""
+        if is_timeout(e) || is_temporary(e) {
+          m = m + " timeout or temporary: " + e.message
+        }
+        ch << m
+        break
+      }
+    }
+  }
+  started.recv
+  early = false
+  select {
+    when v = ch.recv => early = true
+    when x = time.after(time.millisecond * 100).recv => nil
+  }
+  assert !early, "expected Write to not return"
+  c.close!
+  assert_eq ch.recv || "", ""
+  t.wait
+  ln.close!
+}
+
+test "WriteToTimeout" {
+  c1 = new_local_packet_listener("udp")
+  host, _ = split_host_port(c1.local_addr).unwrap
+  dst = c1.local_net_addr.unwrap
+  for timeout in [neg_seconds(5), time.millisecond * 10] {
+    c2 = listen_packet("udp", join_host_port(host, "0")).unwrap
+    c2.set_write_deadline(time.now.add(timeout)).unwrap
+    backoff = 1
+    exceeded = 0
+    while exceeded < 2 {
+      r = c2.write_to!(bytes_of("WRITETO TIMEOUT TEST"), dst)
+      if r.ok? && timeout.ns >= 0 && exceeded == 0 {
+        time.sleep(time.Duration.new(timeout.ns / 3))
+        next
+      }
+      e = r.err.unwrap
+      if case_errno(e) == c("ENOBUFS") {
+        time.sleep(time.millisecond * backoff)
+        backoff *= 2
+        next
+      }
+      if p = parse_write_error(e) {
+        assert false, "failed to parse error: #{p}"
+      }
+      assert deadline_exceeded?(e), "error is not 'deadline exceeded': #{e.message}"
+      exceeded += 1
+    }
+    c2.close!
+  }
+  c1.close!
+}
+
+def case_errno(e: Error) -> Int {
+  case e {
+    NetError.Other(at) => return at.code
+    _ => return 0
+  }
+}
+
+MIN_DYNAMIC_TIMEOUT_NS = 1000000
+MAX_DYNAMIC_TIMEOUT_NS = 4000000000
+
+def timeout_upper_bound(d: Int) -> Int { d * 11 / 10 }
+
+# Go's nextTimeout: (next, ok).
+def next_timeout(actual: Int) -> (Int, Bool) {
+  return (MAX_DYNAMIC_TIMEOUT_NS, false) if actual >= MAX_DYNAMIC_TIMEOUT_NS
+  n = actual * 5 / 4
+  (n < MAX_DYNAMIC_TIMEOUT_NS ? n : MAX_DYNAMIC_TIMEOUT_NS, true)
+}
+
+test "ReadTimeoutFluctuation" {
+  ln = new_local_listener("tcp")
+  c = dial(ln.network, ln.addr).unwrap
+  d = MIN_DYNAMIC_TIMEOUT_NS
+  b: [Byte] = [0; 256]
+  loop {
+    t0 = time.now
+    deadline = t0.add(time.Duration.new(d))
+    c.set_read_deadline(deadline).unwrap
+    r = c.read!(b)
+    t1 = time.now
+    e = r.err.unwrap
+    assert is_timeout(e), "Read did not return (0, timeout): #{e.message}"
+    if p = parse_read_error(e) {
+      assert false, p
+    }
+    assert deadline_exceeded?(e), e.message
+    actual = t1.sub(t0).ns
+    assert !t1.before(deadline), "Read took #{actual}ns; expected at least #{d}ns"
+    if actual > timeout_upper_bound(d) {
+      nt, ok = next_timeout(actual)
+      assert ok, "Read took #{actual}ns; expected at most #{timeout_upper_bound(d)}ns"
+      d = nt
+      next
+    }
+    break
+  }
+  c.close!
+  ln.close!
+}
+
+test "ReadFromTimeoutFluctuation" {
+  c1 = new_local_packet_listener("udp")
+  c2 = dial(c1.conn.network, c1.local_addr).unwrap
+  d = MIN_DYNAMIC_TIMEOUT_NS
+  b: [Byte] = [0; 256]
+  loop {
+    t0 = time.now
+    deadline = t0.add(time.Duration.new(d))
+    c2.set_read_deadline(deadline).unwrap
+    r = c2.read_from!(b)
+    t1 = time.now
+    e = r.err.unwrap
+    assert is_timeout(e), "ReadFrom did not return (0, timeout): #{e.message}"
+    if p = parse_read_error(e) {
+      assert false, p
+    }
+    assert deadline_exceeded?(e), e.message
+    actual = t1.sub(t0).ns
+    assert !t1.before(deadline), "ReadFrom took #{actual}ns; expected at least #{d}ns"
+    if actual > timeout_upper_bound(d) {
+      nt, ok = next_timeout(actual)
+      assert ok, "ReadFrom took #{actual}ns; expected at most #{timeout_upper_bound(d)}ns"
+      d = nt
+      next
+    }
+    break
+  }
+  c2.close!
+  c1.close!
+}
+
+test "WriteTimeoutFluctuation" {
+  ln = new_local_listener("tcp")
+  c = dial(ln.network, ln.addr).unwrap
+  d = MIN_DYNAMIC_TIMEOUT_NS
+  loop {
+    t0 = time.now
+    deadline = t0.add(time.Duration.new(d))
+    c.set_write_deadline(deadline).unwrap
+    n = 0
+    err: Error? = none
+    loop {
+      r = c.write!(bytes_of("TIMEOUT TRANSMITTER"))
+      if e = r.err {
+        err = e
+        break
+      }
+      n += r.unwrap
+    }
+    t1 = time.now
+    e = err.unwrap
+    assert is_timeout(e), "Write did not return (any, timeout): #{e.message}"
+    if p = parse_write_error(e) {
+      assert false, p
+    }
+    assert deadline_exceeded?(e), e.message
+    actual = t1.sub(t0).ns
+    assert !t1.before(deadline), "Write took #{actual}ns; expected at least #{d}ns"
+    if actual > timeout_upper_bound(d) {
+      if n > 0 {
+        d *= 2 if d <= MAX_DYNAMIC_TIMEOUT_NS / 2
+      } else {
+        nt, ok = next_timeout(actual)
+        assert ok, "Write took #{actual}ns; expected at most #{timeout_upper_bound(d)}ns"
+        d = nt
+      }
+      next
+    }
+    break
+  }
+  c.close!
+  ln.close!
+}
+
+test "VariousDeadlines" {
+  ln = new_local_listener("tcp")
+  srv = spawn {
+    loop {
+      r = ln.accept
+      break if r.err?
+      c = r.unwrap
+      b: [Byte] = [0]
+      c.read!(b)
+      c.close!
+    }
+  }
+  timeouts = [1, 2, 5, 50, 100, 200, 500, 750, 1000, 5000, 25000, 250000, 500000, 1000000, 5000000, 100000000, 250000000, 500000000, 1000000000]
+  for timeout in timeouts {
+    # Go runs each 3 times outside -short; once here for the long ones.
+    runs = timeout > 1000000 ? 1 : 3
+    for _run in 0...runs {
+      c = dial(ln.network, ln.addr).unwrap
+      t0 = time.now
+      c.set_deadline(t0.add(time.Duration.new(timeout))).unwrap
+      r = io.copy(io.Discard.new, c)
+      c.close!
+      e = r.err.unwrap
+      assert is_timeout(e), "#{timeout}ns: Copy = #{e.message}; want timeout"
+    }
+  }
+  ln.close!
+  srv.wait
+}
+
+test "ReadWriteProlongedTimeout" {
+  ln = new_local_listener("tcp")
+  srv = spawn {
+    c = ln.~accept
+    reader = spawn {
+      b: [Byte] = [0]
+      loop {
+        r = c.set_read_deadline(time.now.add(time.hour))
+        break if r.err?
+        rr = c.read!(b)
+        break if rr.err? || rr.unwrap == 0
+      }
+    }
+    writer = spawn {
+      b: [Byte] = [0]
+      loop {
+        r = c.set_write_deadline(time.now.add(time.hour))
+        break if r.err?
+        break if c.write!(b).err?
+      }
+    }
+    reader.wait
+    c.~close!
+    writer.wait
+  }
+  c = dial(ln.network, ln.addr).unwrap
+  b: [Byte] = [0]
+  for _i in 0...1000 {
+    c.write!(b)
+    c.read!(b)
+  }
+  c.close!
+  srv.wait
+  ln.close!
+}
+
+test "ReadWriteDeadlineRace" {
+  n = 50
+  ln = new_local_listener("tcp")
+  c = dial(ln.network, ln.addr).unwrap
+  t1 = spawn {
+    for _i in 0...n {
+      break if c.set_read_deadline(time.now.add(time.microsecond * 2)).err?
+      break if c.set_write_deadline(time.now.add(time.microsecond * 2)).err?
+      time.sleep(time.microsecond * 2)
+    }
+  }
+  t2 = spawn {
+    b: [Byte] = [0]
+    for _i in 0...n {
+      c.read!(b)
+    }
+  }
+  t3 = spawn {
+    b: [Byte] = [0]
+    for _i in 0...n {
+      c.write!(b)
+    }
+  }
+  t1.wait
+  t2.wait
+  t3.wait
+  c.close!
+  ln.close!
+}
+
+test "ConcurrentSetDeadline" {
+  ln = new_local_listener("tcp")
+  conns = 10
+  cs = Mutex[[Conn]].new([])
+  for _i in 0...conns {
+    c = dial(ln.network, ln.addr).unwrap
+    cs.lock { |v| v << c }
+  }
+  now_ns = time.now.unix_nano
+  tasks = (0...8).map { |i|
+    spawn {
+      list = cs.lock { |v| v.dup }
+      j = 100
+      while j > 0 {
+        for k in 0...conns {
+          c = list[k]
+          c.set_read_deadline(time.unix(0, now_ns + 7200000000000 + 1000000000 * i * j * k))
+          c.set_write_deadline(time.unix(0, now_ns + 3600000000000 + 1000000000 * i * j * k))
+        }
+        j -= 1
+      }
+    }
+  }.to_a
+  for t in tasks {
+    t.wait
+  }
+  for c in cs.lock { |v| v.dup } {
+    cc = c
+    cc.close!
+  }
+  ln.close!
+}

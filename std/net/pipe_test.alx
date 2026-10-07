@@ -1,0 +1,407 @@
+# Go's pipe_test.go, translated, with the conformance suite it runs
+# (golang.org/x/net/nettest.TestConn) translated too and run on net.Pipe and
+# on a loopback TCP pair. RacyRead and RacyWrite run with fewer tasks and
+# rounds.
+
+import "io"
+import "time"
+
+# c1 and c2 of a fresh pipe ("pipe") or TCP pair ("tcp").
+def make_pipe(kind: Str) -> (Conn, Conn) {
+  return pipe if kind == "pipe"
+  s, c = tcp_conn_pair
+  (c, s)
+}
+
+def never_timeout -> time.Time { time.Time.new }
+def a_long_time_ago -> time.Time { time.unix(233431200, 0) }
+
+# Copies r to w 1024 bytes at a time until r ends or fails.
+def chunked_copy_conn(w: Conn, r: Conn) -> Str {
+  ww = w
+  rr = r
+  b: [Byte] = [0; 1024]
+  loop {
+    n = rr.read!(b)
+    return "" if n.err?
+    return "" if n.unwrap == 0
+    return "write: #{ww.write!(b[0...n.unwrap]).err.unwrap.message}" if ww.write!(b[0...n.unwrap]).err?
+  }
+  ""
+}
+
+def timeout_error?(e: Error?) -> Bool {
+  x = e || return false
+  is_timeout(x)
+}
+
+def roundtrip(c: Conn) -> Str {
+  c.set_deadline(never_timeout)
+  s = "Hello, world!"
+  buf = bytes_of(s)
+  return "roundtrip write" if c.write!(buf).err?
+  got = io.read_full(c, buf)
+  return "roundtrip read" if got.err?
+  Str.from_bytes(buf) == s ? "" : "roundtrip data mismatch: #{Str.from_bytes(buf)}"
+}
+
+def resync(c: Conn) -> Str {
+  c.set_deadline(never_timeout)
+  w = spawn {
+    one: [Byte] = [0xff]
+    c.write!(one).err? ? "resync write" : ""
+  }
+  buf: [Byte] = [0; 1024]
+  out = ""
+  loop {
+    r = c.read!(buf)
+    if r.err? {
+      out = "unexpected Read error: #{r.err.unwrap.message}"
+      break
+    }
+    n = r.unwrap
+    break if n > 0 && buf[n - 1] == 0xff
+  }
+  m = w.wait.unwrap
+  out + m
+}
+
+def conn_kinds -> [Str] { ["pipe", "tcp"] }
+
+test "Conn/BasicIO" {
+  for kind in conn_kinds {
+    c1, c2 = make_pipe(kind)
+    want: [Byte] = []
+    seed = 1
+    for _i in 0...(1 << 16) {
+      seed = (seed * 1103515245 + 12345) % 2147483648
+      want << (seed >> 16).as_u8
+    }
+    send = want.dup
+    writer = spawn {
+      off = 0
+      while off < send.size {
+        k = off + 1024 < send.size ? off + 1024 : send.size
+        c1.~write!(send[off...k])
+        off = k
+      }
+      c1.~close!
+    }
+    reader = spawn {
+      got: [Byte] = []
+      b: [Byte] = [0; 1024]
+      loop {
+        n = c2.~read!(b)
+        break if n == 0
+        got = got + b[0...n]
+      }
+      c2.~close!
+      got
+    }
+    writer.wait.unwrap
+    assert reader.wait.unwrap == want, "#{kind}: transmitted data differs"
+  }
+}
+
+test "Conn/PingPong" {
+  for kind in conn_kinds {
+    c1, c2 = make_pipe(kind)
+    tasks = [c1, c2].map { |c|
+      spawn {
+        buf: [Byte] = [0; 8]
+        prev = 0
+        bad = ""
+        loop {
+          r = io.read_full(c, buf)
+          break if r.err? || r.unwrap < 8
+          v = le64(buf, 0)
+          put_le64(buf, 0, v + 1)
+          bad = "mismatching value: got #{v}, want #{prev + 2}" if prev != 0 && prev + 2 != v
+          prev = v
+          break if v == 1000
+          break if c.write!(buf).err?
+        }
+        c.close!
+        bad
+      }
+    }.to_a
+    zero: [Byte] = [0; 8]
+    c1.write!(zero).unwrap
+    for t in tasks {
+      assert_eq t.wait.unwrap, ""
+    }
+  }
+}
+
+test "Conn/RacyRead" {
+  for kind in conn_kinds {
+    c1, c2 = make_pipe(kind)
+    feeder = spawn {
+      b: [Byte] = [7; 1024]
+      loop {
+        break if c2.write!(b).err?
+      }
+    }
+    c1.set_read_deadline(time.now.add(time.millisecond))
+    readers = (0...4).map { |_i|
+      spawn {
+        b1: [Byte] = [0; 1024]
+        bad = ""
+        for _j in 0...20 {
+          r = c1.read!(b1)
+          if e = r.err {
+            bad = "got error: #{e.message}, want a timeout" unless is_timeout(e)
+            c1.set_read_deadline(time.now.add(time.millisecond))
+          }
+        }
+        bad
+      }
+    }.to_a
+    for t in readers {
+      assert_eq t.wait.unwrap, ""
+    }
+    c1.close!
+    c2.close!
+    feeder.wait
+  }
+}
+
+test "Conn/RacyWrite" {
+  for kind in conn_kinds {
+    c1, c2 = make_pipe(kind)
+    drainer = spawn {
+      b: [Byte] = [0; 1024]
+      loop {
+        r = c2.read!(b)
+        break if r.err? || r.unwrap == 0
+      }
+    }
+    c1.set_write_deadline(time.now.add(time.millisecond))
+    writers = (0...4).map { |_i|
+      spawn {
+        b1: [Byte] = [0; 1024]
+        bad = ""
+        for _j in 0...20 {
+          r = c1.write!(b1)
+          if e = r.err {
+            bad = "got error: #{e.message}, want a timeout" unless is_timeout(e)
+            c1.set_write_deadline(time.now.add(time.millisecond))
+          }
+        }
+        bad
+      }
+    }.to_a
+    for t in writers {
+      assert_eq t.wait.unwrap, ""
+    }
+    c1.close!
+    c2.close!
+    drainer.wait
+  }
+}
+
+test "Conn/ReadTimeout" {
+  for kind in conn_kinds {
+    c1, c2 = make_pipe(kind)
+    drainer = spawn { chunked_copy_conn(c2, c2) }
+    c1.set_read_deadline(a_long_time_ago)
+    b: [Byte] = [0; 1024]
+    assert timeout_error?(c1.read!(b).err), "#{kind}: want a timeout"
+    c1.write!(b).unwrap
+    c1.close!
+    c2.close!
+    drainer.wait
+  }
+}
+
+test "Conn/WriteTimeout" {
+  for kind in conn_kinds {
+    c1, c2 = make_pipe(kind)
+    feeder = spawn {
+      b: [Byte] = [1; 1024]
+      loop {
+        break if c2.write!(b).err?
+      }
+    }
+    c1.set_write_deadline(a_long_time_ago)
+    b: [Byte] = [0; 1024]
+    assert timeout_error?(c1.write!(b).err), "#{kind}: want a timeout"
+    c1.read!(b).unwrap
+    c1.close!
+    c2.close!
+    feeder.wait
+  }
+}
+
+test "Conn/PastTimeout" {
+  for kind in conn_kinds {
+    c1, c2 = make_pipe(kind)
+    echo_t = spawn { chunked_copy_conn(c2, c2) }
+    assert_eq roundtrip(c1), ""
+    c1.set_deadline(a_long_time_ago)
+    b: [Byte] = [0; 1024]
+    assert timeout_error?(c1.write!(b).err), "#{kind}: write want a timeout"
+    assert timeout_error?(c1.read!(b).err), "#{kind}: read want a timeout"
+    assert_eq roundtrip(c1), ""
+    c1.close!
+    c2.close!
+    echo_t.wait
+  }
+}
+
+test "Conn/PresentTimeout" {
+  for kind in conn_kinds {
+    c1, c2 = make_pipe(kind)
+    deadline_set = Atomic.new(false)
+    setter = spawn {
+      time.sleep(time.millisecond * 100)
+      deadline_set.store(true)
+      c1.set_read_deadline(a_long_time_ago)
+      c1.set_write_deadline(a_long_time_ago)
+    }
+    reader = spawn {
+      b: [Byte] = [0; 1024]
+      r = c1.read!(b)
+      bad = timeout_error?(r.err) ? "" : "read: want a timeout"
+      bad = bad + " read timed out before the deadline was set" unless deadline_set.load
+      bad
+    }
+    writer = spawn {
+      b: [Byte] = [0; 1024]
+      err: Error? = none
+      loop {
+        r = c1.write!(b)
+        if e = r.err {
+          err = e
+          break
+        }
+      }
+      bad = timeout_error?(err) ? "" : "write: want a timeout"
+      bad = bad + " write timed out before the deadline was set" unless deadline_set.load
+      bad
+    }
+    setter.wait
+    assert_eq reader.wait.unwrap, ""
+    assert_eq writer.wait.unwrap, ""
+    c1.close!
+    c2.close!
+  }
+}
+
+test "Conn/FutureTimeout" {
+  for kind in conn_kinds {
+    c1, c2 = make_pipe(kind)
+    c1.set_deadline(time.now.add(time.millisecond * 100))
+    reader = spawn {
+      b: [Byte] = [0; 1024]
+      timeout_error?(c1.read!(b).err)
+    }
+    writer = spawn {
+      b: [Byte] = [0; 1024]
+      err: Error? = none
+      loop {
+        r = c1.write!(b)
+        if e = r.err {
+          err = e
+          break
+        }
+      }
+      timeout_error?(err)
+    }
+    assert reader.wait.unwrap, "#{kind}: read want a timeout"
+    assert writer.wait.unwrap, "#{kind}: write want a timeout"
+    echo_t = spawn { chunked_copy_conn(c2, c2) }
+    assert_eq resync(c1), ""
+    assert_eq roundtrip(c1), ""
+    c1.close!
+    c2.close!
+    echo_t.wait
+  }
+}
+
+test "Conn/CloseTimeout" {
+  for kind in conn_kinds {
+    c1, c2 = make_pipe(kind)
+    echo_t = spawn { chunked_copy_conn(c2, c2) }
+    c1.set_deadline(never_timeout)
+    closer = spawn {
+      time.sleep(time.millisecond * 100)
+      c1.close!
+    }
+    reader = spawn {
+      b: [Byte] = [0; 1024]
+      loop {
+        r = c1.read!(b)
+        break if r.err? || r.unwrap == 0
+      }
+    }
+    writer = spawn {
+      b: [Byte] = [0; 1024]
+      loop {
+        break if c1.write!(b).err?
+      }
+    }
+    closer.wait
+    reader.wait
+    writer.wait
+    c2.close!
+    echo_t.wait
+  }
+}
+
+test "Conn/ConcurrentMethods" {
+  for kind in conn_kinds {
+    c1, c2 = make_pipe(kind)
+    echo_t = spawn { chunked_copy_conn(c2, c2) }
+    tasks: [Task[Unit]] = []
+    for _i in 0...20 {
+      tasks << spawn {
+        b: [Byte] = [0; 1024]
+        c1.read!(b)
+        nil
+      }
+      tasks << spawn {
+        b: [Byte] = [0; 1024]
+        c1.write!(b)
+        nil
+      }
+      tasks << spawn {
+        c1.set_deadline(time.now.add(time.millisecond * 10))
+        nil
+      }
+      tasks << spawn {
+        c1.set_read_deadline(a_long_time_ago)
+        nil
+      }
+      tasks << spawn {
+        c1.set_write_deadline(a_long_time_ago)
+        nil
+      }
+      tasks << spawn {
+        c1.local_net_addr
+        c1.remote_net_addr
+        nil
+      }
+    }
+    for t in tasks {
+      t.wait
+    }
+    assert_eq resync(c1), ""
+    assert_eq roundtrip(c1), ""
+    c1.close!
+    c2.close!
+    echo_t.wait
+  }
+}
+
+test "PipeCloseError" {
+  c1, c2 = pipe
+  c1.close!
+  empty: [Byte] = []
+  assert_eq c1.read!(empty).err.unwrap.message, "io: read/write on closed pipe"
+  assert_eq c1.write!(empty).err.unwrap.message, "io: read/write on closed pipe"
+  assert_eq c1.set_deadline(time.Time.new).err.unwrap.message, "io: read/write on closed pipe"
+  assert_eq c2.read!(empty).unwrap, 0
+  assert_eq c2.write!(empty).err.unwrap.message, "io: read/write on closed pipe"
+  assert_eq c2.set_deadline(time.Time.new).err.unwrap.message, "io: read/write on closed pipe"
+}

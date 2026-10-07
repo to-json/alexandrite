@@ -1,6 +1,5 @@
 # Time layouts: format and parse, a port of Go's time/format.go.
 import "strings"
-import "strconv"
 
 # Element codes (low byte); the fractional-second elements also carry their digit
 # count in bits 8..15 and a "comma separator" flag in bit 16.
@@ -43,12 +42,39 @@ C_FRAC9 = 35                # .999
 # Why a time string didn't parse (Go's *ParseError).
 pub error ParseError {
   Cannot(layout: Str, value: Str, layout_elem: Str, value_elem: Str)
-  Failed(value: Str, why: Str)
+  Failed(layout: Str, value: Str, why: Str)
 
   def message -> Str {
     case self {
-      Cannot(l, v, le, ve) => "parsing time #{strconv.quote(v)} as #{strconv.quote(l)}: cannot parse #{strconv.quote(ve)} as #{strconv.quote(le)}"
-      Failed(v, why) => "parsing time #{strconv.quote(v)}: #{why}"
+      Cannot(l, v, le, ve) => "parsing time #{quote(v)} as #{quote(l)}: cannot parse #{quote(ve)} as #{quote(le)}"
+      Failed(_, v, why) => "parsing time #{quote(v)}: #{why}"
+    }
+  }
+
+  # Go's ParseError fields. A Failed error (a value out of range, extra text)
+  # keeps the layout and value but not the elements.
+  pub def layout -> Str {
+    case self {
+      Cannot(l, _, _, _) => l
+      Failed(l, _, _) => l
+    }
+  }
+  pub def value -> Str {
+    case self {
+      Cannot(_, v, _, _) => v
+      Failed(_, v, _) => v
+    }
+  }
+  pub def layout_elem -> Str {
+    case self {
+      Cannot(_, _, le, _) => le
+      Failed(_, _, _) => ""
+    }
+  }
+  pub def value_elem -> Str {
+    case self {
+      Cannot(_, _, _, ve) => ve
+      Failed(_, _, _) => ""
     }
   }
 }
@@ -339,17 +365,41 @@ def comma_or_period?(c: Int) -> Bool { c == 46 || c == 44 }
 # Nanoseconds from the fraction at the start of v spanning nbytes (with the
 # separator), or -1 if malformed.
 def parse_nanos(v: Str, nbytes0: Int) -> Int {
-  return -1 if !comma_or_period?(at(v, 0))
+  ns, st = parse_nanoseconds(v, nbytes0)
+  st == 0 ? ns : -1
+}
+
+# Go's atoi over s[from...to]: an optional sign, then digits (none is 0).
+def go_atoi(s: Str, from: Int, to: Int) -> Int? {
+  i = from
+  neg = false
+  if i < to && (s[i].to_i == 45 || s[i].to_i == 43) {
+    neg = s[i].to_i == 45
+    i += 1
+  }
+  n = 0
+  while i < to {
+    return none if !digit?(s, i)
+    n = n * 10 + s[i].to_i - 48
+    i += 1
+  }
+  neg ? 0 - n : n
+}
+
+# Go's parseNanoseconds: (ns, 0), or (_, 1) for a malformed fraction (errBad),
+# or (_, 2) for a negative one ("fractional second" out of range).
+def parse_nanoseconds(v: Str, nbytes0: Int) -> (Int, Int) {
+  return 0, 1 if !comma_or_period?(at(v, 0))
   nbytes = nbytes0
   nbytes = 10 if nbytes > 10
-  ns = atoi_range(v, 1, nbytes)
-  return -1 if ns < 0
+  ns = go_atoi(v, 1, nbytes) || return (0, 1)
+  return 0, 2 if ns < 0
   scale = 10 - nbytes
   while scale > 0 {
     ns *= 10
     scale -= 1
   }
-  ns
+  return ns, 0
 }
 
 # Skips the literal `prefix` of a layout at the start of v (runs of spaces match
@@ -375,12 +425,7 @@ def skip(v: Str, prefix: Str) -> (Int, Bool) {
 def parse_signed_offset(v: Str) -> Int {
   c = at(v, 0)
   return 0 if c != 45 && c != 43
-  i = 1
-  x = 0
-  while digit?(v, i) {
-    x = x * 10 + v[i].to_i - 48
-    i += 1
-  }
+  x, i = leading_int(v, 1) || return 0
   return 0 if i == 1 || x > 23
   i
 }
@@ -415,6 +460,10 @@ pub def parse_in_location(layout: Str, value: Str, loc: Location) -> ~Time<Parse
   ~parse_impl(layout, value, loc, loc)
 }
 
+# Go's parseStrictRFC3339 (UnmarshalText, UnmarshalJSON): Parse(RFC3339, s); Go's
+# extra strictness checks are disabled (go.dev/issue/54580), so they are here too.
+def parse_strict_rfc3339(s: Str) -> ~Time<ParseError> { ~parse(RFC3339, s) }
+
 def parse_impl(layout: Str, value: Str, loc: Location, local: Location) -> ~Time<ParseError> {
   v = value
   year = 0
@@ -427,7 +476,6 @@ def parse_impl(layout: Str, value: Str, loc: Location, local: Location) -> ~Time
   nsec = 0
   pm_set = false
   am_set = false
-  have_zone = false # an offset or Z was parsed
   zone_offset = -1
   zone_name = ""
   utc_z = false
@@ -439,7 +487,7 @@ def parse_impl(layout: Str, value: Str, loc: Location, local: Location) -> ~Time
     v = v[skipped...v.size]
     fail ParseError.Cannot(layout, value, lit, v) if !skip_ok
     if std == 0 {
-      fail ParseError.Failed(value, "extra text: #{strconv.quote(v)}") if v.size != 0
+      fail ParseError.Failed(layout, value, "extra text: #{quote(v)}") if v.size != 0
       break
     }
     pos = e
@@ -449,12 +497,13 @@ def parse_impl(layout: Str, value: Str, loc: Location, local: Location) -> ~Time
     bad = false
     consumed = 0
     if code == C_YEAR {
-      if v.size < 2 || !digit?(v, 0) || !digit?(v, 1) {
-        bad = true
-      } else {
-        year = atoi_range(v, 0, 2)
-        year = year >= 69 ? year + 1900 : year + 2000
+      # Go's atoi of the two bytes: a sign is allowed ("+9", "-1")
+      y2 = v.size < 2 ? none : go_atoi(v, 0, 2)
+      if y = y2 {
+        year = y >= 69 ? y + 1900 : y + 2000
         consumed = 2
+      } else {
+        bad = true
       }
     } else if code == C_LONG_YEAR {
       if v.size < 4 || !digit?(v, 0) {
@@ -580,69 +629,95 @@ def parse_impl(layout: Str, value: Str, loc: Location, local: Location) -> ~Time
         bad = true
       }
     } else if code >= C_ISO_TZ && code <= C_NUM_COLON_SECONDS_TZ {
+      # Go's: fixed-width fields cut from the value, each two digits; a range
+      # error wins over a malformed field
       iso = code <= C_ISO_COLON_SECONDS_TZ
       if iso && at(v, 0) == 90 {
         utc_z = true
-        have_zone = true
-        zone_offset = 0
         consumed = 1
       } else {
         colon = code == C_ISO_COLON_TZ || code == C_NUM_COLON_TZ
         short = code == C_ISO_SHORT_TZ || code == C_NUM_SHORT_TZ
         colon_secs = code == C_ISO_COLON_SECONDS_TZ || code == C_NUM_COLON_SECONDS_TZ
         secs_nocolon = code == C_ISO_SECONDS_TZ || code == C_NUM_SECONDS_TZ
-        need = 5
-        need = 6 if colon
-        need = 3 if short
-        need = 9 if colon_secs
-        need = 7 if secs_nocolon
-        hr = -1
-        mm = 0
-        ss = 0
-        if v.size < need {
-          bad = true
-        } else if (colon || colon_secs) && at(v, 3) != 58 {
-          bad = true
-        } else if colon_secs && at(v, 6) != 58 {
-          bad = true
-        } else {
-          hr = atoi_range(v, 1, 3)
-          if colon || colon_secs {
-            mm = atoi_range(v, 4, 6)
-          } else if !short {
-            mm = atoi_range(v, 3, 5)
-          }
-          if colon_secs {
-            ss = atoi_range(v, 7, 9)
-          } else if secs_nocolon {
-            ss = atoi_range(v, 5, 7)
-          }
-          if hr < 0 || mm < 0 || ss < 0 {
+        hs = ""
+        ms = "00"
+        sx = "00"
+        if colon {
+          if v.size < 6 || at(v, 3) != 58 {
             bad = true
           } else {
-            sign = at(v, 0)
-            if sign != 43 && sign != 45 {
+            hs = v[1...3]
+            ms = v[4...6]
+            consumed = 6
+          }
+        } else if short {
+          if v.size < 3 {
+            bad = true
+          } else {
+            hs = v[1...3]
+            consumed = 3
+          }
+        } else if colon_secs {
+          if v.size < 9 || at(v, 3) != 58 || at(v, 6) != 58 {
+            bad = true
+          } else {
+            hs = v[1...3]
+            ms = v[4...6]
+            sx = v[7...9]
+            consumed = 9
+          }
+        } else if secs_nocolon {
+          if v.size < 7 {
+            bad = true
+          } else {
+            hs = v[1...3]
+            ms = v[3...5]
+            sx = v[5...7]
+            consumed = 7
+          }
+        } else if v.size < 5 {
+          bad = true
+        } else {
+          hs = v[1...3]
+          ms = v[3...5]
+          consumed = 5
+        }
+        if !bad {
+          hr = get_num(hs, true)
+          mm = 0
+          ss = 0
+          if hr < 0 {
+            bad = true
+            hr = 0
+          } else {
+            mm = get_num(ms, true)
+            if mm < 0 {
               bad = true
-            } else if hr > 24 {
-              range_what = "time zone offset hour"
-            } else if mm > 60 {
-              range_what = "time zone offset minute"
-            } else if ss > 60 {
-              range_what = "time zone offset second"
+              mm = 0
             } else {
-              off = (hr * 60 + mm) * 60 + ss
-              zone_offset = sign == 45 ? 0 - off : off
-              have_zone = true
-              consumed = need
+              ss = get_num(sx, true)
+              if ss < 0 {
+                bad = true
+                ss = 0
+              }
             }
+          }
+          range_what = "time zone offset hour" if hr > 24
+          range_what = "time zone offset minute" if mm > 60
+          range_what = "time zone offset second" if ss > 60
+          zone_offset = (hr * 60 + mm) * 60 + ss
+          sign = at(v, 0)
+          if sign == 45 {
+            zone_offset = 0 - zone_offset
+          } else if sign != 43 {
+            bad = true
           }
         }
       }
     } else if code == C_TZ {
       if has_at(v, 0, "UTC") {
         utc_z = true
-        have_zone = true
-        zone_offset = 0
         consumed = 3
       } else {
         n = parse_zone_name(v)
@@ -658,14 +733,11 @@ def parse_impl(layout: Str, value: Str, loc: Location, local: Location) -> ~Time
       if v.size < ndigit {
         bad = true
       } else {
-        ns = parse_nanos(v, ndigit)
-        if ns < 0 {
-          # a malformed fraction: bad separator or digits
-          if !comma_or_period?(at(v, 0)) || !digit?(v, 1) {
-            bad = true
-          } else {
-            range_what = "fractional second"
-          }
+        ns, st = parse_nanoseconds(v, ndigit)
+        if st == 1 {
+          bad = true
+        } else if st == 2 {
+          range_what = "fractional second"
         } else {
           nsec = ns
           consumed = ndigit
@@ -684,7 +756,7 @@ def parse_impl(layout: Str, value: Str, loc: Location, local: Location) -> ~Time
         }
       }
     }
-    fail ParseError.Failed(value, "#{range_what} out of range") if range_what != ""
+    fail ParseError.Failed(layout, value, "#{range_what} out of range") if range_what != ""
     fail ParseError.Cannot(layout, value, stdstr, v) if bad
     v = v[consumed...v.size]
   }
@@ -696,22 +768,22 @@ def parse_impl(layout: Str, value: Str, loc: Location, local: Location) -> ~Time
   }
   if yday >= 0 {
     ylen = is_leap(year) ? 366 : 365
-    fail ParseError.Failed(value, "day-of-year out of range") if yday < 1 || yday > ylen
+    fail ParseError.Failed(layout, value, "day-of-year out of range") if yday < 1 || yday > ylen
     _, m, d = civil_from_days(days_from_civil(year, 1, 1) + yday - 1)
-    fail ParseError.Failed(value, "day-of-year does not match month") if month >= 0 && month != m
-    fail ParseError.Failed(value, "day-of-year does not match day") if day >= 0 && day != d
+    fail ParseError.Failed(layout, value, "day-of-year does not match month") if month >= 0 && month != m
+    fail ParseError.Failed(layout, value, "day-of-year does not match day") if day >= 0 && day != d
     month = m
     day = d
   } else {
     month = 1 if month < 0
     day = 1 if day < 0
   }
-  fail ParseError.Failed(value, "day out of range") if day < 1 || day > days_in_month(year, month)
+  fail ParseError.Failed(layout, value, "day out of range") if day < 1 || day > days_in_month(year, month)
 
   if utc_z {
     return date(year, month, day, hour, minute, sec, nsec, utc())
   }
-  if have_zone {
+  if zone_offset != -1 {
     t = date(year, month, day, hour, minute, sec, nsec, utc())
     t = t.add(Duration.new(0 - zone_offset * NS_PER_SEC))
     # an offset that the local zone has at that instant gives the local zone

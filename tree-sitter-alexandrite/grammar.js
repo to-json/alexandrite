@@ -256,6 +256,7 @@ module.exports = grammar({
     ),
 
     interface_definition: $ => seq(
+      optional($._attributes),
       optional('pub'),
       'interface',
       field('name', $._type_identifier),

@@ -1,0 +1,454 @@
+#![test(external)]
+# Go's flag/flag_test.go, translated (package flag_test).
+#
+# Not translated / changed:
+#  - TestIntFlagOverflow: runs only where int is 32 bits (Int is 64).
+#  - TestExitCode: re-executes the test binary with environment variables
+#    to watch os.Exit; the alx test runner has no such child mode.
+#  - TestPrintDefaults: without ZP0 / ZP1 (zeroPanicker): a Value whose
+#    to_s panics on its zero value panics when defined here (Go recovers
+#    and lists it after the defaults).
+#  - TestChangingArgs / TestUsageOutput: os.Args can't be assigned; the
+#    second parse is COMMAND_LINE's parse! of the same list, and the usage
+#    header names the test program instead of "app".
+#  - TestGet: Getter's Get() any is each value type's typed `get`, reached
+#    with a type switch.
+
+import "bytes"
+import "flag"
+import "io"
+import "os"
+import "time"
+
+def bool_string(s: Str) -> Str { s == "0" ? "false" : "true" }
+
+test "TestEverything" {
+  flag.reset_for_testing(none)
+  flag.bool("test_bool", false, "bool value")
+  flag.int("test_int", 0, "int value")
+  flag.int64("test_int64", 0, "int64 value")
+  flag.uint("test_uint", 0, "uint value")
+  flag.uint64("test_uint64", 0, "uint64 value")
+  flag.string("test_string", "0", "string value")
+  flag.float64("test_float64", 0.0, "float64 value")
+  flag.duration("test_duration", time.Duration.new(0), "time.Duration value")
+  flag.func("test_func", "func value") { |s| }
+  flag.bool_func("test_boolfunc", "func") { |s| }
+  m: Map[Str, Bool] = {}
+  desired = "0"
+  visitor = ->(f: flag.Flag) {
+    if f.name.size > 5 && f.name[0...5] == "test_" {
+      m[f.name] = true
+      v = f.value.to_s
+      ok = v == desired ||
+        (f.name == "test_bool" && v == bool_string(desired)) ||
+        (f.name == "test_duration" && v == desired + "s") ||
+        (f.name == "test_func" && v == "") ||
+        (f.name == "test_boolfunc" && v == "")
+      assert ok, "Visit: bad value #{v} for #{f.name}"
+    }
+  }
+  flag.visit_all(visitor)
+  assert_eq m.size, 10
+  m = {}
+  flag.visit(visitor)
+  assert_eq m.size, 0
+  flag.set("test_bool", "true").unwrap
+  flag.set("test_int", "1").unwrap
+  flag.set("test_int64", "1").unwrap
+  flag.set("test_uint", "1").unwrap
+  flag.set("test_uint64", "1").unwrap
+  flag.set("test_string", "1").unwrap
+  flag.set("test_float64", "1").unwrap
+  flag.set("test_duration", "1s").unwrap
+  flag.set("test_func", "1").unwrap
+  flag.set("test_boolfunc", "").unwrap
+  desired = "1"
+  flag.visit(visitor)
+  assert_eq m.size, 10
+  names: [Str] = []
+  flag.visit { |f| names << f.name }
+  assert_eq names, names.sort
+}
+
+test "TestGet" {
+  flag.reset_for_testing(none)
+  flag.bool("test_bool", true, "bool value")
+  flag.int("test_int", 1, "int value")
+  flag.int64("test_int64", 2, "int64 value")
+  flag.uint("test_uint", 3, "uint value")
+  flag.uint64("test_uint64", 4, "uint64 value")
+  flag.string("test_string", "5", "string value")
+  flag.float64("test_float64", 6.0, "float64 value")
+  flag.duration("test_duration", time.Duration.new(7), "time.Duration value")
+  seen = 0
+  flag.visit_all { |f|
+    ok = case f.value {
+      flag.BoolValue(v) => v.get == true
+      flag.IntValue(v) => (f.name == "test_int" && v.get == 1) || (f.name == "test_int64" && v.get == 2)
+      flag.UintValue(v) => (f.name == "test_uint" && v.get == 3) || (f.name == "test_uint64" && v.get == 4)
+      flag.StringValue(v) => v.get == "5"
+      flag.FloatValue(v) => v.get == 6.0
+      flag.DurationValue(v) => v.get == time.Duration.new(7)
+      _ => false
+    }
+    assert ok, "Visit: bad value #{f.value.to_s} for #{f.name}"
+    seen += 1
+  }
+  assert_eq seen, 8
+}
+
+test "TestUsage" {
+  called = Atomic.new(false)
+  flag.reset_for_testing(-> { called.store(true) })
+  fs = flag.command_line
+  assert fs.parse!(["-x"]).err?, "parse did not fail for unknown flag"
+  assert called.load, "did not call Usage for unknown flag"
+}
+
+def check_parse(f: flag.FlagSet) {
+  fs = f
+  assert !fs.parsed?, "f.Parse() = true before Parse"
+  bool_flag = fs.bool!("bool", false, "bool value")
+  bool2_flag = fs.bool!("bool2", false, "bool2 value")
+  int_flag = fs.int!("int", 0, "int value")
+  int64_flag = fs.int64!("int64", 0, "int64 value")
+  uint_flag = fs.uint!("uint", 0, "uint value")
+  uint64_flag = fs.uint64!("uint64", 0, "uint64 value")
+  string_flag = fs.string!("string", "0", "string value")
+  float64_flag = fs.float64!("float64", 0.0, "float64 value")
+  duration_flag = fs.duration!("duration", time.second * 5, "time.Duration value")
+  extra = "one-extra-argument"
+  args = [
+    "-bool",
+    "-bool2=true",
+    "--int", "22",
+    "--int64", "0x23",
+    "-uint", "24",
+    "--uint64", "25",
+    "-string", "hello",
+    "-float64", "2718e28",
+    "-duration", "2m",
+    extra,
+  ]
+  fs.parse!(args).unwrap
+  assert fs.parsed?, "f.Parse() = false after Parse"
+  assert_eq bool_flag.load, true
+  assert_eq bool2_flag.load, true
+  assert_eq int_flag.load, 22
+  assert_eq int64_flag.load, 0x23
+  assert_eq uint_flag.load, 24
+  assert_eq uint64_flag.load, 25
+  assert_eq string_flag.load, "hello"
+  assert_eq float64_flag.load, 2718e28
+  assert_eq duration_flag.load, time.minute * 2
+  assert_eq fs.args, [extra]
+}
+
+test "TestParse" {
+  flag.reset_for_testing(-> { assert false, "bad parse" })
+  check_parse(flag.command_line)
+}
+
+test "TestFlagSetParse" {
+  check_parse(flag.new_flag_set("test", flag.CONTINUE_ON_ERROR))
+}
+
+# Go's flagVar: a []string Value. The slice lives in a shared cell, so the
+# set's copy and this one are the same (Go's pointer).
+struct FlagVar {
+  st: [[Str]]
+
+  pub def to_s -> Str { st.size == 0 ? "[]" : "#{st[0]}" }
+  pub def set!(value: Str) -> ~Unit {
+    self.st[0] << value
+  }
+}
+
+def new_flag_var(xs: [Str]) -> FlagVar { FlagVar.new(st: [xs]) }
+
+test "TestUserDefined" {
+  flags = flag.new_flag_set("", flag.CONTINUE_ON_ERROR)
+  flags.init!("test", flag.CONTINUE_ON_ERROR)
+  flags.set_output!(io.Discard.new)
+  v = new_flag_var([])
+  flags.var!(v, "v", "usage")
+  flags.parse!(["-v", "1", "-v", "2", "-v=3"]).unwrap
+  assert_eq v.st[0].size, 3
+  assert_eq v.to_s, "[1 2 3]"
+}
+
+test "TestUserDefinedFunc" {
+  flags = flag.new_flag_set("test", flag.CONTINUE_ON_ERROR)
+  flags.set_output!(io.Discard.new)
+  ss: [Str] = []
+  flags.func!("v", "usage") { |s| ss << s }
+  flags.parse!(["-v", "1", "-v", "2", "-v=3"]).unwrap
+  assert_eq ss.size, 3
+  assert_eq "#{ss}", "[1 2 3]"
+  buf = bytes.new_buffer_string("")
+  flags.set_output!(buf)
+  _r = flags.parse!(["-h"])
+  assert buf.to_s.include?("usage"), "usage string not included: #{buf.to_s}"
+  flags = flag.new_flag_set("test", flag.CONTINUE_ON_ERROR)
+  flags.set_output!(io.Discard.new)
+  flags.func!("v", "usage") { |s| fail "test error" }
+  flags.parse!([]).unwrap
+  r = flags.parse!(["-v", "1"])
+  assert r.err.unwrap.message.include?("test error"), r.err.unwrap.message
+}
+
+test "TestUserDefinedForCommandLine" {
+  result = Atomic.new("")
+  flag.reset_for_testing(-> { result.store("HELP") })
+  flag.usage
+  assert_eq result.load, "HELP"
+}
+
+# Go's boolFlagVar: a bool flag while count < 4.
+struct BoolFlagVar {
+  st: [Int]
+
+  pub def to_s -> Str { st.size == 0 ? "0" : "#{st[0]}" }
+  pub def set!(value: Str) -> ~Unit {
+    self.st[0] += 1 if value == "true"
+  }
+  pub def bool_flag? -> Bool { st.size == 0 || st[0] < 4 }
+}
+
+test "TestUserDefinedBool" {
+  flags = flag.new_flag_set("test", flag.CONTINUE_ON_ERROR)
+  flags.set_output!(io.Discard.new)
+  b = BoolFlagVar.new(st: [0])
+  flags.var!(b, "b", "usage")
+  r = flags.parse!(["-b", "-b", "-b", "-b=true", "-b=false", "-b", "barg", "-b"])
+  assert_eq b.st[0], 4
+  assert r.err?, "expected error; got none"
+}
+
+test "TestUserDefinedBoolUsage" {
+  flags = flag.new_flag_set("test", flag.CONTINUE_ON_ERROR)
+  buf = bytes.new_buffer_string("")
+  flags.set_output!(buf)
+  b = BoolFlagVar.new(st: [0])
+  flags.var!(b, "b", "X")
+  flags.print_defaults
+  assert_eq buf.to_s, "  -b\tX\n"
+  b.st[0] = 4
+  flags.print_defaults
+  assert_eq buf.to_s, "  -b\tX\n  -b value\n    \tX\n"
+}
+
+test "TestSetOutput" {
+  flags = flag.new_flag_set("", flag.CONTINUE_ON_ERROR)
+  buf = bytes.new_buffer_string("")
+  flags.set_output!(buf)
+  flags.init!("test", flag.CONTINUE_ON_ERROR)
+  _r = flags.parse!(["-unknown"])
+  assert buf.to_s.include?("-unknown"), buf.to_s
+}
+
+test "TestChangingArgs" {
+  flag.reset_for_testing(-> { assert false, "bad parse" })
+  before = flag.bool("before", false, "")
+  fs = flag.command_line
+  fs.parse!(["-before", "subcmd", "-after", "args"]).unwrap
+  cmd = flag.arg(0)
+  rest = flag.args
+  after = flag.bool("after", false, "")
+  fs.parse!(rest[1...rest.size]).unwrap
+  args = flag.args
+  assert before.load && cmd == "subcmd" && after.load && args == ["args"], "expected true subcmd true [args] got #{before.load} #{cmd} #{after.load} #{args}"
+}
+
+test "TestHelp" {
+  help_called = Atomic.new(false)
+  fs = flag.new_flag_set("help test", flag.CONTINUE_ON_ERROR)
+  fs.set_usage! { help_called.store(true) }
+  f = Atomic.new(false)
+  fs.bool_var!(f, "flag", false, "regular flag")
+  fs.parse!(["-flag=true"]).unwrap
+  assert f.load, "flag was not set by -flag"
+  assert !help_called.load, "help called for regular flag"
+  r = fs.parse!(["-help"])
+  case r.err.unwrap {
+    Help(_u) => {}
+    _ => assert false, "expected ErrHelp"
+  }
+  assert_eq r.err.unwrap.message, "flag: help requested"
+  assert help_called.load, "help was not called"
+  help = Atomic.new(false)
+  fs.bool_var!(help, "help", false, "help flag")
+  help_called.store(false)
+  fs.parse!(["-help"]).unwrap
+  assert !help_called.load, "help was called; should not have been for defined help flag"
+}
+
+def default_output -> Str {
+  "  -A\tfor bootstrapping, allow 'any' type\n" +
+    "  -Alongflagname\n" +
+    "    \tdisable bounds checking\n" +
+    "  -C\ta boolean defaulting to true (default true)\n" +
+    "  -D path\n" +
+    "    \tset relative path for local imports\n" +
+    "  -E string\n" +
+    "    \tissue 23543 (default \"0\")\n" +
+    "  -F number\n" +
+    "    \ta non-zero number (default 2.7)\n" +
+    "  -G float\n" +
+    "    \ta float that defaults to zero\n" +
+    "  -M string\n" +
+    "    \ta multiline\n" +
+    "    \thelp\n" +
+    "    \tstring\n" +
+    "  -N int\n" +
+    "    \ta non-zero int (default 27)\n" +
+    "  -O\ta flag\n" +
+    "    \tmultiline help string (default true)\n" +
+    "  -V list\n" +
+    "    \ta list of strings (default [a b])\n" +
+    "  -Z int\n" +
+    "    \tan int that defaults to zero\n" +
+    "  -maxT timeout\n" +
+    "    \tset timeout for dial\n"
+}
+
+test "TestPrintDefaults" {
+  fs = flag.new_flag_set("print defaults test", flag.CONTINUE_ON_ERROR)
+  buf = bytes.new_buffer_string("")
+  fs.set_output!(buf)
+  fs.bool!("A", false, "for bootstrapping, allow 'any' type")
+  fs.bool!("Alongflagname", false, "disable bounds checking")
+  fs.bool!("C", true, "a boolean defaulting to true")
+  fs.string!("D", "", "set relative `path` for local imports")
+  fs.string!("E", "0", "issue 23543")
+  fs.float64!("F", 2.7, "a non-zero `number`")
+  fs.float64!("G", 0.0, "a float that defaults to zero")
+  fs.string!("M", "", "a multiline\nhelp\nstring")
+  fs.int!("N", 27, "a non-zero int")
+  fs.bool!("O", true, "a flag\nmultiline help string")
+  fs.var!(new_flag_var(["a", "b"]), "V", "a `list` of strings")
+  fs.int!("Z", 0, "an int that defaults to zero")
+  fs.duration!("maxT", time.Duration.new(0), "set `timeout` for dial")
+  fs.print_defaults
+  assert_eq buf.to_s, default_output
+}
+
+test "TestUsageOutput" {
+  flag.reset_for_testing(none)
+  buf = bytes.new_buffer_string("")
+  fs = flag.command_line
+  fs.set_output!(buf)
+  _r = fs.parse!(["-i=1", "-unknown"])
+  got = buf.to_s
+  assert got.start_with?("flag provided but not defined: -i\nUsage of "), got
+  assert got.end_with?(":\n"), got
+}
+
+test "TestGetters" {
+  fs = flag.new_flag_set("flag set", flag.CONTINUE_ON_ERROR)
+  assert_eq fs.name, "flag set"
+  assert_eq fs.error_handling, flag.CONTINUE_ON_ERROR
+  e: io.Writer = os.stderr
+  assert fs.output == e, "unexpected output"
+  fs.init!("gopher", flag.EXIT_ON_ERROR)
+  o: io.Writer = os.stdout
+  fs.set_output!(o)
+  assert_eq fs.name, "gopher"
+  assert_eq fs.error_handling, flag.EXIT_ON_ERROR
+  assert fs.output == o, "unexpected output"
+}
+
+def all_types(name: Str) -> flag.FlagSet {
+  fs = flag.new_flag_set(name, flag.CONTINUE_ON_ERROR)
+  fs.set_output!(io.Discard.new)
+  fs.bool!("bool", false, "")
+  fs.int!("int", 0, "")
+  fs.int64!("int64", 0, "")
+  fs.uint!("uint", 0, "")
+  fs.uint64!("uint64", 0, "")
+  fs.float64!("float64", 0.0, "")
+  fs.duration!("duration", time.Duration.new(0), "")
+  fs
+}
+
+test "TestParseError" {
+  for typ in ["bool", "int", "int64", "uint", "uint64", "float64", "duration"] {
+    fs = all_types("parse error test")
+    r = fs.parse!(["-" + typ + "=x"])
+    m = r.err.unwrap.message
+    assert m.include?("invalid") && m.include?("parse error"), m
+  }
+}
+
+test "TestRangeError" {
+  bad = [
+    "-int=123456789012345678901",
+    "-int64=123456789012345678901",
+    "-uint=123456789012345678901",
+    "-uint64=123456789012345678901",
+    "-float64=1e1000",
+  ]
+  for arg in bad {
+    fs = all_types("parse error test")
+    m = fs.parse!([arg]).err.unwrap.message
+    assert m.include?("invalid") && m.include?("value out of range"), m
+  }
+}
+
+test "TestInvalidFlags" {
+  for t in [("-foo", "flag \"-foo\" begins with -"), ("foo=bar", "flag \"foo=bar\" contains =")] {
+    fs = flag.new_flag_set("", flag.CONTINUE_ON_ERROR)
+    buf = bytes.new_buffer_string("")
+    fs.set_output!(buf)
+    name = t[0]
+    assert_panics(t[1]) {
+      fs.var!(new_flag_var([]), name, "")
+    }
+    assert_eq buf.to_s, t[1] + "\n"
+  }
+}
+
+test "TestRedefinedFlags" {
+  for t in [("", "flag redefined: foo"), ("fs", "fs flag redefined: foo")] {
+    fs = flag.new_flag_set(t[0], flag.CONTINUE_ON_ERROR)
+    buf = bytes.new_buffer_string("")
+    fs.set_output!(buf)
+    fs.var!(new_flag_var([]), "foo", "")
+    assert_panics(t[1]) {
+      fs.var!(new_flag_var([]), "foo", "")
+    }
+    assert_eq buf.to_s, t[1] + "\n"
+  }
+}
+
+test "TestUserDefinedBoolFunc" {
+  flags = flag.new_flag_set("test", flag.CONTINUE_ON_ERROR)
+  flags.set_output!(io.Discard.new)
+  ss: [Str] = []
+  flags.bool_func!("v", "usage") { |s| ss << s }
+  flags.parse!(["-v", "", "-v", "1", "-v=2"]).unwrap
+  assert_eq ss.size, 1
+  assert_eq "#{ss}", "[true]"
+  buf = bytes.new_buffer_string("")
+  flags.set_output!(buf)
+  _r = flags.parse!(["-h"])
+  assert buf.to_s.include?("usage"), buf.to_s
+  flags = flag.new_flag_set("test", flag.CONTINUE_ON_ERROR)
+  flags.set_output!(io.Discard.new)
+  flags.bool_func!("v", "usage") { |s| fail "test error" }
+  flags.parse!([]).unwrap
+  r = flags.parse!(["-v", ""])
+  assert r.err.unwrap.message.include?("test error"), r.err.unwrap.message
+}
+
+test "TestDefineAfterSet" {
+  flags = flag.new_flag_set("test", flag.CONTINUE_ON_ERROR)
+  _r = flags.set!("myFlag", "value")
+  assert_panics("before being defined") {
+    flags.string!("myFlag", "default", "usage")
+  }
+  assert_panics("flag_go_test.alx:") {
+    flags.string!("myFlag", "default", "usage")
+  }
+}

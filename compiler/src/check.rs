@@ -197,6 +197,9 @@ pub struct World<'a> {
     pub iface_order: Vec<String>,
     /// Each interface's implementors so far, with their method instances.
     pub impls: HashMap<String, Vec<(Ty, Vec<FuncId>)>>,
+    /// `#[shareable]` interfaces: each implementor and where it was first
+    /// converted (sharing.rs checks the contract).
+    pub shareable: HashMap<String, Vec<(Ty, Span)>>,
     pub stringers: HashMap<String, FuncId>,
     /// Error types (enums), in tag order: builtins first, then `error` decls.
     pub errors: Vec<Ty>,
@@ -219,6 +222,9 @@ pub struct World<'a> {
     pub vars: Vec<VarInfo>,
     /// Interfaces whose values are compared with `==` (`iface_eq_instances`).
     pub eq_ifaces: Vec<String>,
+    /// Interfaces whose values are shown (`"#{v}"`): each implementor's
+    /// `to_s` is a stringer (`iface_stringers`).
+    pub show_ifaces: Vec<String>,
 }
 
 /// A package-level `Atomic[T]` / `Mutex[T]` (R11): the global holding it
@@ -357,7 +363,7 @@ impl<'a> World<'a> {
         GENERICS.with(|g| g.borrow_mut().clear());
         RECS.with(|r| r.borrow_mut().clear());
         INSTS.with(|g| g.borrow_mut().clear());
-        Ok(World { sm, defs, by_name, instances: HashMap::new(), declared_errs: HashMap::new(), funcs: vec![], sigs: HashMap::new(), fatal: None, collect: false, diags: vec![], failed: Default::default(), decl_failed: false, structs: HashMap::new(), consts: HashMap::new(), ifaces: HashMap::new(), iface_order: vec![], impls: HashMap::new(), stringers: HashMap::new(), errors: vec![], refines: HashMap::new(), grefines: HashMap::new(), warnings: vec![], globals: vec![], pending_consts: vec![], vars: vec![], eq_ifaces: vec![] })
+        Ok(World { sm, defs, by_name, instances: HashMap::new(), declared_errs: HashMap::new(), funcs: vec![], sigs: HashMap::new(), fatal: None, collect: false, diags: vec![], failed: Default::default(), decl_failed: false, structs: HashMap::new(), consts: HashMap::new(), ifaces: HashMap::new(), iface_order: vec![], impls: HashMap::new(), shareable: HashMap::new(), stringers: HashMap::new(), errors: vec![], refines: HashMap::new(), grefines: HashMap::new(), warnings: vec![], globals: vec![], pending_consts: vec![], vars: vec![], eq_ifaces: vec![], show_ifaces: vec![] })
     }
 
     /// Collect mode: record `e` (once per place and message); a cascade is not a diagnostic.
@@ -874,6 +880,56 @@ impl<'a> World<'a> {
         }
     }
 
+    /// A shown interface value prints through its implementor's `to_s`
+    /// (Go's Stringer behind an interface, #261): the implementors are known
+    /// only now, so their stringers (and those of what they hold) are made
+    /// here, until nothing new appears.
+    pub fn iface_stringers(&mut self) -> R<()> {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut done = 0;
+        loop {
+            let mut todo: Vec<Ty> = vec![];
+            for n in self.show_ifaces.clone() {
+                for (t, _) in self.impls.get(&n).cloned().unwrap_or_default() {
+                    todo.push(t);
+                }
+            }
+            let before = (self.show_ifaces.len(), self.impls.values().map(Vec::len).sum::<usize>());
+            while let Some(t) = todo.pop() {
+                if t.has_var() || !seen.insert(t.show()) {
+                    continue;
+                }
+                if self.stringers.contains_key(&t.show()) {
+                    continue;
+                }
+                if let Some(tn) = t.type_name() {
+                    if let Some(&def) = self.by_name.get(&method_name(tn, "to_s")) {
+                        let fid = self.instance(def, vec![t.clone()], Span::default())?;
+                        self.stringers.insert(t.show(), fid);
+                        continue;
+                    }
+                }
+                match t.unrec() {
+                    Ty::Array(e) | Ty::Fixed(e, _) | Ty::Opt(e) => todo.push((*e).clone()),
+                    Ty::Map(k, v) => {
+                        todo.push((*k).clone());
+                        todo.push((*v).clone());
+                    }
+                    Ty::Tuple(ts) => todo.extend(ts.iter().cloned()),
+                    Ty::Struct(_, fs) => todo.extend(fs.iter().map(|(_, x)| x.clone())),
+                    Ty::Enum(_, vs) => todo.extend(vs.iter().flat_map(|(_, fs)| fs.iter().map(|(_, x)| x.clone()))),
+                    Ty::Iface(n) if !self.show_ifaces.contains(&n) => self.show_ifaces.push(n),
+                    _ => {}
+                }
+            }
+            let after = (self.show_ifaces.len(), self.impls.values().map(Vec::len).sum::<usize>());
+            done += 1;
+            if after == before || done > 64 {
+                return Ok(());
+            }
+        }
+    }
+
     pub fn message_instances(&mut self) -> R<HashMap<usize, FuncId>> {
         let mut out = HashMap::new();
         for (k, t) in self.errors.clone().iter().enumerate() {
@@ -935,6 +991,9 @@ impl<'a> World<'a> {
             if self.ifaces.insert(d.name.clone(), ms).is_none() {
                 self.iface_order.push(d.name.clone());
             }
+            if d.shareable {
+                self.shareable.entry(d.name.clone()).or_default();
+            }
         }
         Ok(())
     }
@@ -960,6 +1019,11 @@ impl<'a> World<'a> {
         // An implementor may hold the interface itself (a wrapper, a list of
         // handlers): then the interface's values are boxed (R13, lowering).
         let methods = self.ifaces[iface].clone();
+        if let Some(v) = self.shareable.get_mut(iface) {
+            if !v.iter().any(|(x, _)| x == t) {
+                v.push((t.clone(), sp));
+            }
+        }
         let impls = self.impls.entry(iface.to_string()).or_default();
         impls.push((t.clone(), vec![]));
         let k = impls.len() - 1;
@@ -3504,6 +3568,15 @@ impl<'w, 'a> FnCx<'w, 'a> {
             // zero value (filling another variant's slots of an enum, or a
             // field a keyword `new` leaves out; Go's would be nil).
             Ty::Iface(_) => TK::Zero,
+            // A type named inside its own definition (R12: `struct V { o: VOuter? }`
+            // with `struct VOuter { v: V }`): the zero of the type it names.
+            Ty::Rec(_) => {
+                let u = t.unrec();
+                if matches!(u, Ty::Rec(_)) {
+                    return None;
+                }
+                return self.zero_of(&u, sp);
+            }
             _ => return None,
         };
         Some(self.mk(kind, t.clone(), sp))
@@ -3910,6 +3983,12 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 self.stringers(v, sp)
             }
             Ty::Tuple(ts) => ts.iter().try_for_each(|x| self.stringers(x, sp)),
+            Ty::Iface(n) => {
+                if !self.w.show_ifaces.contains(n) {
+                    self.w.show_ifaces.push(n.clone());
+                }
+                Ok(())
+            }
             Ty::Struct(_, fs) => fs.clone().iter().try_for_each(|(_, x)| self.stringers(x, sp)),
             Ty::Enum(_, vs) => vs.clone().iter().flat_map(|(_, fs)| fs.iter().map(|(_, x)| x.clone())).collect::<Vec<_>>().iter().try_for_each(|x| self.stringers(x, sp)),
             _ => Ok(()),
@@ -3917,6 +3996,16 @@ impl<'w, 'a> FnCx<'w, 'a> {
     }
 
     fn show_value(&mut self, v: TExpr) -> R<TExpr> {
+        // An interface with a `to_s` method (its own or a default) shows
+        // through it (#261).
+        if let Ty::Iface(n) = self.resolve(&v.ty) {
+            let ms = self.w.ifaces.get(&n).cloned().unwrap_or_default();
+            if let Some(k) = ms.iter().position(|m| m.name == "to_s" && m.params.is_empty() && m.ret == Ty::Str && !m.caller) {
+                let sp = v.span;
+                self.impure = true;
+                return Ok(self.mk(TK::M(M::IfaceCall(k), Some(Box::new(v)), vec![], None), Ty::Str, sp));
+            }
+        }
         self.stringers(&v.ty.clone(), v.span)?;
         if let Some(sn) = self.resolve(&v.ty).type_name().map(str::to_string) {
             if let Some(&def) = self.w.by_name.get(&method_name(&sn, "to_s")) {
@@ -5235,6 +5324,18 @@ impl<'w, 'a> FnCx<'w, 'a> {
     }
 
     fn binary(&mut self, op: BinOp, l: TExpr, r: TExpr, sp: Span) -> R<TExpr> {
+        // `e || errors.new(..)` with e an `E?` (S7's `r.err`) and an open
+        // Error default: E converts to Error, as it would where an `Error?`
+        // is wanted.
+        let widen = op == BinOp::Or
+            && match self.resolve(&l.ty) {
+                Ty::Opt(inner) => {
+                    let rt = self.resolve(&r.ty);
+                    self.w.error_index(&inner).is_some() && (rt == Ty::Error || rt == Ty::Opt(Box::new(Ty::Error)))
+                }
+                _ => false,
+            };
+        let l = if widen { self.coerce(l, &Ty::Opt(Box::new(Ty::Error)))? } else { l };
         if op == BinOp::Or {
             if let Ty::Opt(inner) = self.resolve(&l.ty) {
                 // `opt || default`: the value if present (the default is evaluated only if not).
@@ -7175,6 +7276,11 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 let t = type_from(&te, &self.w.structs, &self.w.consts)?;
                 let k = self.w.implement(iname, &t, args[0].span)?;
                 return Ok(mk_m(self, M::IfaceOpt(k), recv, vec![], None, Ty::Opt(Box::new(t))));
+            }
+            // An interface value's `dup`: a deep copy of the value inside
+            // (so a boxed one, R13, can go to a task, #262).
+            if matches!(name, "dup" | "clone") && args.is_empty() && block.is_none() && !ms_has(&self.w.ifaces[iname], name) {
+                return Ok(mk_m(self, M::Dup, recv, vec![], None, rt.clone()));
             }
             let ms = self.w.ifaces[iname].clone();
             let Some(k) = ms.iter().position(|m| m.name == name) else {

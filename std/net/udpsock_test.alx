@@ -1,0 +1,250 @@
+# Go's udpsock_test.go, translated. Left out: TestIPv6LinkLocalUnicastUDP
+# (needs a link-local interface and external network), TestAllocs
+# (allocation counting), the benchmarks. TestUDPConnLocalName keeps its
+# loopback case (Go's wildcard cases need an external network).
+
+import "net/netip"
+import "time"
+
+def udp(ip: IP, port: Int, zone: Str = "") -> UDPAddr { UDPAddr.new(ip: ip, port: port, zone: zone) }
+
+test "ResolveUDPAddr" {
+  tests: [(Str, Str, UDPAddr?, Str)] = [
+    ("udp", "127.0.0.1:0", udp(ipv4(127, 0, 0, 1), 0), ""),
+    ("udp4", "127.0.0.1:65535", udp(ipv4(127, 0, 0, 1), 65535), ""),
+    ("udp", "[::1]:0", udp(pip("::1"), 0), ""),
+    ("udp6", "[::1]:65535", udp(pip("::1"), 65535), ""),
+    ("udp", "[::1%en0]:1", udp(pip("::1"), 1, "en0"), ""),
+    ("udp6", "[::1%911]:2", udp(pip("::1"), 2, "911"), ""),
+    ("", "127.0.0.1:0", udp(ipv4(127, 0, 0, 1), 0), ""),
+    ("", "[::1]:0", udp(pip("::1"), 0), ""),
+    ("udp", ":12345", udp(IP.new, 12345), ""),
+    ("http", "127.0.0.1:0", none, "unknown network http"),
+    ("udp", "127.0.0.1:domain", udp(pip("127.0.0.1"), 53), ""),
+    ("udp", "[::ffff:127.0.0.1]:domain", udp(pip("::ffff:127.0.0.1"), 53), ""),
+    ("udp", "[2001:db8::1]:domain", udp(pip("2001:db8::1"), 53), ""),
+    ("udp4", "127.0.0.1:domain", udp(pip("127.0.0.1"), 53), ""),
+    ("udp4", "[::ffff:127.0.0.1]:domain", udp(pip("127.0.0.1"), 53), ""),
+    ("udp6", "[2001:db8::1]:domain", udp(pip("2001:db8::1"), 53), ""),
+    ("udp4", "[2001:db8::1]:domain", none, "address 2001:db8::1: no suitable address found"),
+    ("udp6", "127.0.0.1:domain", none, "address 127.0.0.1: no suitable address found"),
+    ("udp6", "[::ffff:127.0.0.1]:domain", none, "address ::ffff:127.0.0.1: no suitable address found")
+  ]
+  for tt in tests {
+    nw, lit, want, err = tt
+    r = resolve_udp_addr(nw, lit)
+    if w = want {
+      a = r.unwrap
+      assert a.ip.equal?(w.ip) && a.port == w.port && a.zone == w.zone, "resolve_udp_addr(#{nw}, #{lit}) = #{a}, want #{w}"
+      a2 = resolve_udp_addr(a.network, a.to_s).unwrap
+      assert a2.ip.equal?(w.ip) && a2.port == w.port && a2.zone == w.zone, "(#{nw}, #{lit}): round trip = #{a2}"
+    } else {
+      assert_eq r.err.unwrap.message, err
+    }
+  }
+}
+
+def write_to_connected?(e: Error) -> Bool {
+  case e {
+    NetError.Other(at) => return at.err == "use of WriteTo with pre-connected connection"
+    _ => return false
+  }
+}
+
+test "WriteToUDP" {
+  c = listen_packet("udp", "127.0.0.1:0").unwrap
+  raddr = c.local_addr
+  # testWriteToConn
+  cc = dial("udp", raddr).unwrap
+  ra = resolve_udp_addr("udp", raddr).unwrap
+  rap = ra.addr_port
+  b = bytes_of("CONNECTED-MODE SOCKET")
+  e1 = cc.write_to_udp_addr_port!(b, rap).err.unwrap
+  assert write_to_connected?(e1), e1.message
+  e2 = cc.write_to_udp!(b, ra).err.unwrap
+  assert write_to_connected?(e2), e2.message
+  e3 = cc.write_to!(b, ra).err.unwrap
+  assert write_to_connected?(e3), e3.message
+  cc.write!(b).unwrap
+  empty: [Byte] = []
+  e4 = cc.write_msg_udp!(b, empty, ra).err.unwrap
+  assert write_to_connected?(e4), e4.message
+  cc.write_msg_udp!(b, empty, none).unwrap
+  e5 = cc.write_msg_udp_addr_port!(b, empty, rap).err.unwrap
+  assert write_to_connected?(e5), e5.message
+  cc.write_msg_udp_addr_port!(b, empty, netip.AddrPort.new).unwrap
+  cc.close!
+  # testWriteToPacketConn
+  pc = listen_packet("udp", "127.0.0.1:0").unwrap
+  b2 = bytes_of("UNCONNECTED-MODE SOCKET")
+  pc.conn.write_to_udp!(b2, ra).unwrap
+  pc.write_to!(b2, ra).unwrap
+  assert pc.conn.write!(b2).err?, "should fail"
+  e6 = pc.conn.write_msg_udp!(b2, empty, none).err.unwrap
+  assert_eq inner_of(e6), ERR_MISSING_ADDRESS
+  pc.conn.write_msg_udp!(b2, empty, ra).unwrap
+  pc.close!
+  c.close!
+}
+
+test "UDPConnLocalName" {
+  for laddr in [udp(ipv4(127, 0, 0, 1), 0)] {
+    c = listen_udp("udp4", laddr).unwrap
+    la = c.local_net_addr.unwrap
+    case la {
+      UDPAddr(a) => assert a.port != 0, "got #{la}; expected a non-zero port"
+      _ => assert false, "got #{la}; expected a UDPAddr"
+    }
+    c.close!
+  }
+}
+
+def udp_port_of(a: Addr?) -> Int {
+  x = a || return -1
+  case x {
+    UDPAddr(u) => return u.port
+    _ => return -1
+  }
+}
+
+test "UDPConnLocalAndRemoteNames" {
+  for laddr in ["", "127.0.0.1:0"] {
+    c1 = listen_packet("udp", "127.0.0.1:0").unwrap
+    la: UDPAddr? = none
+    la = resolve_udp_addr("udp", laddr).unwrap if laddr != ""
+    ra = case c1.local_net_addr.unwrap {
+      UDPAddr(u) => u
+      _ => UDPAddr.new
+    }
+    c2 = dial_udp("udp", la, ra).unwrap
+    assert udp_port_of(c1.local_net_addr) > 0, "c1 local"
+    assert !c1.conn.remote_net_addr.present?, "c1 remote"
+    assert udp_port_of(c2.local_net_addr) > 0, "c2 local"
+    assert udp_port_of(c2.remote_net_addr) > 0, "c2 remote"
+    c2.close!
+    c1.close!
+  }
+}
+
+test "UDPZeroBytePayload" {
+  c = new_local_packet_listener("udp")
+  dst = c.local_net_addr.unwrap
+  for generic_read in [false, true] {
+    empty: [Byte] = []
+    assert_eq c.write_to!(empty, dst).unwrap, 0
+    c.set_read_deadline(time.now.add(time.second * 30))
+    b: [Byte] = [0]
+    if generic_read {
+      c.conn.read!(b).unwrap
+    } else {
+      c.read_from!(b).unwrap
+    }
+  }
+  c.close!
+}
+
+test "UDPZeroByteBuffer" {
+  c = new_local_packet_listener("udp")
+  dst = c.local_net_addr.unwrap
+  b = bytes_of("UDP ZERO BYTE BUFFER TEST")
+  for generic_read in [false, true] {
+    assert_eq c.write_to!(b, dst).unwrap, b.size
+    c.set_read_deadline(time.now.add(time.millisecond * 100))
+    empty: [Byte] = []
+    err: Error? = none
+    if generic_read {
+      err = c.conn.read!(empty).err
+    } else {
+      err = c.read_from!(empty).err
+    }
+    if e = err {
+      assert is_timeout(e), e.message
+    }
+  }
+  c.close!
+}
+
+test "UDPReadSizeError" {
+  c1 = new_local_packet_listener("udp")
+  c2 = dial("udp", c1.local_addr).unwrap
+  b1 = bytes_of("READ SIZE ERROR TEST")
+  for generic_read in [false, true] {
+    assert_eq c2.write!(b1).unwrap, b1.size
+    b2: [Byte] = [0; b1.size - 1]
+    n = 0
+    if generic_read {
+      n = c1.conn.read!(b2).unwrap
+    } else {
+      n2, _ = c1.read_from!(b2).unwrap
+      n = n2
+    }
+    assert_eq n, b1.size - 1
+  }
+  c2.close!
+  c1.close!
+}
+
+test "UDPReadTimeout" {
+  la = resolve_udp_addr("udp4", "127.0.0.1:0").unwrap
+  c = listen_udp("udp4", la).unwrap
+  c.set_deadline(time.now)
+  b: [Byte] = [0]
+  r = c.read_from_udp!(b)
+  e = r.err.unwrap
+  assert is_timeout(e) && deadline_exceeded?(e), "read_from_udp got #{e.message}, want a deadline exceeded"
+  c.close!
+}
+
+test "UDPIPVersionReadMsg" {
+  conn = listen_udp("udp4", udp(ipv4(127, 0, 0, 1), 0)).unwrap
+  daddr = case conn.local_net_addr.unwrap {
+    UDPAddr(u) => u.addr_port
+    _ => netip.AddrPort.new
+  }
+  buf: [Byte] = [0; 8]
+  empty: [Byte] = []
+  conn.write_to_udp_addr_port!(buf, daddr).unwrap
+  _, _, _, saddr = conn.read_msg_udp_addr_port!(buf, empty).unwrap
+  assert saddr.addr.is4?, "returned AddrPort is not IPv4"
+  conn.write_to_udp_addr_port!(buf, daddr).unwrap
+  _, _, _, soldaddr = conn.read_msg_udp!(buf, empty).unwrap
+  assert_eq soldaddr.ip.size, 4
+  conn.close!
+}
+
+test "IPv6WriteMsgUDPAddrPortTargetAddrIPVersion" {
+  if testable_network?("udp4") && testable_network?("udp6") {
+    conn = listen_udp("udp", none).unwrap
+    buf: [Byte] = [0; 8]
+    empty: [Byte] = []
+    conn.write_msg_udp_addr_port!(buf, empty, netip.addr_port_from(netip.must_parse_addr("127.0.0.1"), 12345)).unwrap
+    conn.write_msg_udp_addr_port!(buf, empty, netip.addr_port_from(netip.must_parse_addr("::ffff:127.0.0.1"), 12345)).unwrap
+    conn.write_msg_udp_addr_port!(buf, empty, netip.addr_port_from(netip.must_parse_addr("::1"), 12345)).unwrap
+    conn.close!
+  }
+}
+
+test "IPv4WriteMsgUDPAddrPortTargetAddrIPVersion" {
+  conn = listen_udp("udp4", udp(ipv4(127, 0, 0, 1), 0)).unwrap
+  buf: [Byte] = [0; 8]
+  empty: [Byte] = []
+  conn.write_msg_udp_addr_port!(buf, empty, netip.addr_port_from(netip.must_parse_addr("127.0.0.1"), 12345)).unwrap
+  conn.write_msg_udp_addr_port!(buf, empty, netip.addr_port_from(netip.must_parse_addr("::ffff:127.0.0.1"), 12345)).unwrap
+  assert conn.write_msg_udp_addr_port!(buf, empty, netip.addr_port_from(netip.must_parse_addr("::1"), 12345)).err?, "daddr6 should have failed"
+  conn.close!
+}
+
+test "ReadWriteMsgUDPAddrPortEmptyCmsg" {
+  conn = listen_udp("udp4", udp(ipv4(127, 0, 0, 1), 0)).unwrap
+  buf: [Byte] = [0; 8]
+  cmsg: [Byte] = []
+  daddr = case conn.local_net_addr.unwrap {
+    UDPAddr(u) => u.addr_port
+    _ => netip.AddrPort.new
+  }
+  _, cmsgn = conn.write_msg_udp_addr_port!(buf, cmsg, daddr).unwrap
+  assert_eq cmsgn, 0
+  _, rn, _, _ = conn.read_msg_udp_addr_port!(buf, cmsg).unwrap
+  assert_eq rn, 0
+  conn.close!
+}

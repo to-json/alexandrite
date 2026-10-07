@@ -1,0 +1,458 @@
+#![test(external)]
+# Go's sleep_test.go (package time_test): sleep, after, after_func, Timer.
+# Iteration counts that Go's -short mode would cut are scaled down so that the
+# file runs in a few seconds; each arming of a Timer here is a task that sleeps
+# until the arming's time (a reset or stop leaves it to wake and find it stale),
+# so the tests that reset timers to an hour thousands of times use fewer timers.
+#
+# Not translated, and why:
+#   - TestIssue5745, TestZeroTimerResetPanics, TestZeroTimerStopPanics: a nil or
+#     zero *Timer; a Timer here is a value that new_timer / after_func make.
+#   - TestOverflowPeriodRuntimeTimer: Go's runtime timer heap (internal).
+#   - The Interrupt in TestSleep (a signal to the process); the sleep is tested.
+#   - Benchmarks over Go's runtime timer heap (BenchmarkParallelTimerLatency,
+#     BenchmarkStaggeredTickerLatency, BenchmarkAdjustTimers10000).
+import "time"
+
+def ms -> time.Duration { time.millisecond }
+
+# Go's newTimerFunc: an after_func Timer whose function sends on its channel.
+def new_timer_func(d: time.Duration) -> time.Timer {
+  c = Chan[time.Time].new(1)
+  c2 = c
+  t = time.after_func(d, ->() { c2 << time.now() })
+  t.c = c
+  t
+}
+
+test "TestSleep" {
+  delay = ms * 100
+  start = time.now()
+  time.sleep(delay)
+  d = time.since(start)
+  assert d >= delay, "sleep(#{delay}) slept for only #{d}"
+}
+
+# The chain of after_funcs: each schedules the next and then sleeps a second,
+# which only works if each function runs in its own task.
+def after_func_chain(i: Atomic[Int], c: Chan[Bool]) -> Unit {
+  if i.add(-1) >= 0 {
+    i2 = i
+    c2 = c
+    time.after_func(time.duration(0), ->() { after_func_chain(i2, c2) })
+    time.sleep(time.second)
+  } else {
+    c << true
+  }
+}
+
+test "TestAfterFunc" {
+  i = Atomic.new(10)
+  c = Chan[Bool].new(0)
+  i2 = i
+  c2 = c
+  time.after_func(time.duration(0), ->() { after_func_chain(i2, c2) })
+  c.recv
+}
+
+test "TestTickerStress" {
+  stop = Atomic.new(false)
+  stop2 = stop
+  bg = spawn {
+    while !stop2.load { time.sleep(time.nanosecond) }
+  }
+  ticker = time.new_ticker(time.duration(1))
+  for _i in 0...100 { ticker.c.recv }
+  ticker.stop
+  stop.store(true)
+  bg.wait
+}
+
+test "TestTickerConcurrentStress" {
+  stop = Atomic.new(false)
+  stop2 = stop
+  bg = spawn {
+    while !stop2.load { time.sleep(time.nanosecond) }
+  }
+  ticker = time.new_ticker(time.duration(1))
+  tasks = (0...10).map { |_i|
+    c = ticker.c
+    spawn {
+      for _j in 0...100 { c.recv }
+    }
+  }
+  for t in tasks { t.wait }
+  ticker.stop
+  stop.store(true)
+  bg.wait
+}
+
+test "TestAfterFuncStarvation" {
+  stop = Atomic.new(false)
+  c = Chan[Bool].new(1)
+  s1 = stop
+  c1 = c
+  producer = spawn {
+    while !s1.load { c1 << true }
+    c1.close
+  }
+  c2 = c
+  consumer = spawn {
+    loop { break if c2.recv == none }
+  }
+  s2 = stop
+  time.after_func(time.microsecond, ->() { s2.store(true) })
+  producer.wait
+  consumer.wait
+}
+
+test "TestAfter" {
+  delay = ms * 100
+  start = time.now()
+  t_end = time.after(delay).recv.unwrap
+  d = time.since(start)
+  assert d >= delay, "after(#{delay}) slept for only #{d}"
+  assert !t_end.before(start.add(delay)), "after(#{delay}) expect >= #{start.add(delay)}, got #{t_end}"
+}
+
+test "TestAfterTick" {
+  count = 10
+  delta = ms * 10
+  t0 = time.now()
+  for _i in 0...count { time.after(delta).recv }
+  d = time.now().sub(t0)
+  target = delta * count
+  assert d >= target * 9 / 10, "#{count} ticks of #{delta} too fast: took #{d}, expected #{target}"
+}
+
+# Go's testAfterStop: an error, or "" when the timers stopped as they should.
+def after_stop_once(use_func: Bool) -> Str {
+  time.after_func(ms * 100, ->() {})
+  t0 = use_func ? new_timer_func(ms * 50) : time.new_timer(ms * 50)
+  c1 = Chan[Bool].new(1)
+  c1b = c1
+  t1 = time.after_func(ms * 150, ->() { c1b << true })
+  c2 = time.after(ms * 200)
+  return "failed to stop event 0" if !t0.stop
+  return "failed to stop event 1" if !t1.stop
+  c2.recv
+  out = ""
+  select {
+    when _v = t0.c.recv => out = "event 0 was not stopped"
+    when _w = c1.recv => out = "event 1 was not stopped"
+    else => nil
+  }
+  return out if out != ""
+  return "stop returned true twice" if t1.stop
+  ""
+}
+
+test "TestAfterStop" {
+  for use_func in [false, true] {
+    errs: [Str] = []
+    ok = false
+    for _i in 0...5 {
+      e = after_stop_once(use_func)
+      if e == "" {
+        ok = true
+        break
+      }
+      errs << e
+    }
+    assert ok, "saw errors: #{errs}"
+  }
+}
+
+# Go's testAfterQueuing1: the after channels deliver in order of their delays.
+def after_queuing_once(delta: time.Duration, use_func: Bool) -> Str {
+  slots = [5, 3, 6, 6, 6, 1, 1, 2, 7, 9, 4, 8, 0]
+  result = Chan[(Int, time.Time)].new(slots.size)
+  t0 = time.now()
+  for slot in slots {
+    ac = use_func ? new_timer_func(delta * slot).c : time.after(delta * slot)
+    r = result
+    spawn { r << (slot, ac.recv.unwrap) }
+  }
+  order: [Int] = []
+  times: [time.Time] = []
+  for _s in slots {
+    r = result.recv.unwrap
+    order << r[0]
+    times << r[1]
+  }
+  for i in 1...order.size {
+    return "after calls returned out of order: #{order}" if order[i] < order[i - 1]
+  }
+  i = 0
+  for t in times {
+    dt = t.sub(t0)
+    target = delta * order[i]
+    if dt < target - delta / 2 || dt > target + delta * 10 {
+      return "after(#{target}) arrived at #{dt}"
+    }
+    i += 1
+  }
+  ""
+}
+
+test "TestAfterQueuing" {
+  for use_func in [false, true] {
+    err = "!=nil"
+    i = 0
+    while i < 5 && err != "" {
+      err = after_queuing_once(ms * (20 + i * 50), use_func)
+      i += 1
+    }
+    assert_eq err, ""
+  }
+}
+
+test "TestTimerStopStress" {
+  fired = Atomic.new(0)
+  tasks = (0...100).map { |_i|
+    f = fired
+    spawn {
+      f2 = f
+      timer = time.after_func(ms * 200, ->() { f2.add(1) })
+      time.sleep(ms * 100)
+      timer.stop
+    }
+  }
+  for t in tasks { t.wait }
+  time.sleep(ms * 300)
+  assert_eq fired.load, 0
+}
+
+test "TestSleepZeroDeadlock" {
+  c = Chan[Bool].new(0)
+  c2 = c
+  spawn { c2 << true }
+  for _i in 0...100 {
+    time.sleep(time.duration(0))
+    tmp = Chan[Bool].new(1)
+    tmp << true
+    tmp.recv
+  }
+  c.recv
+}
+
+# Go's testReset: "" or what went wrong.
+def reset_once(d: time.Duration) -> Str {
+  t0 = time.new_timer(d * 2)
+  time.sleep(d)
+  return "resetting unfired timer returned false" if !t0.reset(d * 3)
+  time.sleep(d * 2)
+  out = ""
+  select {
+    when _v = t0.c.recv => out = "timer fired early"
+    else => nil
+  }
+  return out if out != ""
+  time.sleep(d * 2)
+  select {
+    when _v = t0.c.recv => nil
+    else => out = "reset timer did not fire"
+  }
+  return out if out != ""
+  return "resetting expired timer returned true" if t0.reset(ms * 50)
+  ""
+}
+
+test "TestReset" {
+  d = ms
+  loop {
+    err = reset_once(d)
+    break if err == ""
+    d = d * 2
+    assert d <= time.second * 10, err
+  }
+}
+
+test "TestOverflowSleep" {
+  big = time.duration(9223372036854775807)
+  spawn {
+    time.sleep(big)
+    panic "big sleep returned"
+  }
+  fired = false
+  select {
+    when _v = time.after(big).recv => fired = true
+    when _w = time.after(ms * 25).recv => nil
+  }
+  assert !fired, "big timeout fired"
+  neg = time.duration(-9223372036854775808)
+  time.sleep(neg)
+  ok = false
+  select {
+    when _v = time.after(neg).recv => ok = true
+    when _w = time.after(time.second).recv => nil
+  }
+  assert ok, "negative timeout didn't fire"
+}
+
+test "TestZeroTimer" {
+  cached = new_timer_func(time.hour)
+  for kind in 0...3 {
+    for _i in 0...1000 {
+      s = time.now()
+      ti = time.new_timer(time.duration(0))
+      ti = new_timer_func(time.duration(0)) if kind == 1
+      if kind == 2 {
+        cached.reset(time.duration(0))
+        ti = cached
+      }
+      ti.c.recv
+      diff = time.since(s)
+      assert diff <= time.second * 2, "took #{diff}"
+    }
+  }
+}
+
+test "TestTimerModifiedEarlier" {
+  past = time.until(time.unix(0, 0))
+  fails = 0
+  for _i in 0...100 {
+    timer = new_timer_func(time.hour)
+    for _j in 0...10 {
+      timer.c.recv if !timer.stop
+      timer.reset(past)
+    }
+    deadline = time.new_timer(time.second * 10)
+    now = time.now()
+    select {
+      when _v = timer.c.recv => {
+        if time.since(now) > time.second * 8 { fails += 1 }
+      }
+      when _w = deadline.c.recv => fails += 1
+    }
+    deadline.stop
+  }
+  assert_eq fails, 0
+}
+
+test "TestAdjustTimers" {
+  n = 100
+  timers: [time.Timer] = (0...n).map { |_i| new_timer_func(time.hour) }
+  for t in timers { t.stop }
+  states = [0; 100]
+  x = time.now().unix_nano
+  indices = (0...n).to_a
+  # a random permutation
+  for i in 0...n {
+    x = x *% 6364136223846793005 +% 1442695040888963407
+    j = i + ((x >> 33) & 2147483647) % (n - i)
+    tmp = indices[i]
+    indices[i] = indices[j]
+    indices[j] = tmp
+  }
+  while indices.size != 0 {
+    x = x *% 6364136223846793005 +% 1442695040888963407
+    ii = ((x >> 33) & 2147483647) % indices.size
+    i = indices[ii]
+    state = states[i]
+    states[i] += 1
+    timer = timers[i]
+    if state == 0 {
+      timers[i] = new_timer_func(time.duration(0))
+    } else if state == 1 {
+      timer.c.recv
+    } else if state == 2 {
+      assert !timer.reset(time.minute), "shouldn't be active (1)"
+    } else if state == 4 {
+      assert !timer.reset(time.minute * 3), "shouldn't be active (3)"
+    } else if state == 6 {
+      assert !timer.reset(time.minute * 2), "shouldn't be active (2)"
+    } else if state == 3 || state == 5 || state == 7 {
+      timer.c.recv if !timer.stop
+    } else if state == 8 {
+      assert !timer.reset(time.duration(0)), "timer.reset returned true"
+    } else if state == 9 {
+      now = time.now()
+      timer.c.recv
+      dur = time.since(now)
+      assert dur <= ms * 750, "timer #{i} took #{dur} to complete"
+    } else if state == 10 {
+      indices[ii] = indices[indices.size - 1]
+      indices = indices[0...indices.size - 1]
+    }
+  }
+}
+
+# Go's testStopResetResult: whichever of two timers fires first, stopping or
+# resetting the other either succeeds or leaves a value to receive.
+def stop_reset_result(test_stop: Bool) {
+  start = Chan[Bool].new(0)
+  tasks = (0...10).map { |_i|
+    st = start
+    spawn {
+      st.recv
+      for _j in 0...100 {
+        timer1 = time.new_timer(time.millisecond)
+        timer2 = time.new_timer(time.millisecond)
+        select {
+          when _v = timer1.c.recv => {
+            ok = test_stop ? timer2.stop : timer2.reset(time.hour)
+            timer2.c.recv if !ok
+            timer2.stop
+          }
+          when _w = timer2.c.recv => {
+            ok = test_stop ? timer1.stop : timer1.reset(time.hour)
+            timer1.c.recv if !ok
+            timer1.stop
+          }
+        }
+      }
+    }
+  }
+  start.close
+  for t in tasks { t.wait }
+}
+
+test "TestStopResult" { stop_reset_result(true) }
+test "TestResetResult" { stop_reset_result(false) }
+
+test "TestMultiWakeupTicker" {
+  timer = time.new_ticker(time.microsecond)
+  tasks = (0...4).map { |_i|
+    c = timer.c
+    spawn {
+      for _j in 0...1000 {
+        select {
+          when _v = c.recv => nil
+          when _w = time.after(time.millisecond).recv => nil
+        }
+      }
+    }
+  }
+  for t in tasks { t.wait }
+  timer.stop
+}
+
+test "TestMultiWakeupTimer" {
+  timer = time.new_timer(time.nanosecond)
+  tasks = (0...4).map { |_i|
+    tm = timer
+    spawn {
+      for _j in 0...1000 {
+        select {
+          when _v = tm.c.recv => nil
+          else => nil
+        }
+        tm.reset(time.nanosecond)
+      }
+    }
+  }
+  for t in tasks { t.wait }
+  timer.stop
+}
+
+bench "BenchmarkAfter" { time.after(time.duration(1)).recv }
+bench "BenchmarkStop" { time.new_timer(time.second).stop }
+bench "BenchmarkSimultaneousAfterFunc100" {
+  c = Chan[Bool].new(100)
+  for _i in 0...100 {
+    c2 = c
+    time.after_func(time.duration(0), ->() { c2 << true })
+  }
+  for _i in 0...100 { c.recv }
+}

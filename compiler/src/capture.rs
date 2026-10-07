@@ -23,12 +23,13 @@ fn convert_fn(f: &mut TFunc) {
     let mut by_lambda: HashSet<LocalId> = f.lambdas.iter().flat_map(|(_, _, caps)| caps.iter().copied()).collect();
     let mut by_task = HashSet::new();
     let mut in_multi = HashSet::new();
+    let mut block_params = HashSet::new();
     for s in &f.body {
-        scan_stmt(s, &mut by_task, &mut in_multi);
+        scan_stmt(s, &mut by_task, &mut in_multi, &mut block_params);
     }
     by_lambda.retain(|l| {
         let loc = &f.locals[*l];
-        (loc.reassigned > 0 || loc.mutated || loc.pushed) && !by_task.contains(l) && !in_multi.contains(l) && (loc.user || f.params.contains(l)) && zero(&loc.ty).is_some()
+        (loc.reassigned > 0 || loc.mutated || loc.pushed) && !by_task.contains(l) && !in_multi.contains(l) && (loc.user || f.params.contains(l) || block_params.contains(l)) && zero(&loc.ty).is_some()
     });
     if by_lambda.is_empty() {
         return;
@@ -90,15 +91,18 @@ fn zero(t: &Ty) -> Option<TExpr> {
 }
 
 /// Locals captured by `spawn` / generator bodies, and those assigned by
-/// multiple assignment (both keep plain variables).
-fn scan_stmt(s: &TStmt, by_task: &mut HashSet<LocalId>, multi: &mut HashSet<LocalId>) {
+/// multiple assignment (both keep plain variables); blocks' parameters.
+fn scan_stmt(s: &TStmt, by_task: &mut HashSet<LocalId>, multi: &mut HashSet<LocalId>, bps: &mut HashSet<LocalId>) {
     if let TStmt::MultiAssign(ls, _) = s {
         multi.extend(ls.iter().copied());
     }
-    crate::prove::stmt_exprs(s, &mut |e| scan_expr(e, by_task, multi));
+    crate::prove::stmt_exprs(s, &mut |e| scan_expr(e, by_task, multi, bps));
 }
 
-fn scan_expr(e: &TExpr, by_task: &mut HashSet<LocalId>, multi: &mut HashSet<LocalId>) {
+fn scan_expr(e: &TExpr, by_task: &mut HashSet<LocalId>, multi: &mut HashSet<LocalId>, bps: &mut HashSet<LocalId>) {
+    if let TK::M(_, _, _, Some(b)) = &e.kind {
+        bps.extend(b.params.iter().copied());
+    }
     if let TK::M(M::Spawn | M::EnumNew, _, args, blk) = &e.kind {
         for a in args {
             if let TK::Local(l) = a.kind {
@@ -118,17 +122,17 @@ fn scan_expr(e: &TExpr, by_task: &mut HashSet<LocalId>, multi: &mut HashSet<Loca
     // work at every level of nesting.
     match &e.kind {
         TK::M(_, r, args, Some(b)) => {
-            r.iter().map(|r| &**r).chain(args).for_each(|c| scan_expr(c, by_task, multi));
+            r.iter().map(|r| &**r).chain(args).for_each(|c| scan_expr(c, by_task, multi, bps));
             for s in &b.body {
-                scan_stmt(s, by_task, multi);
+                scan_stmt(s, by_task, multi, bps);
             }
         }
         TK::Seq(ss) => {
             for s in ss {
-                scan_stmt(s, by_task, multi);
+                scan_stmt(s, by_task, multi, bps);
             }
         }
-        _ => crate::prove::each_child(e, &mut |c| scan_expr(c, by_task, multi)),
+        _ => crate::prove::each_child(e, &mut |c| scan_expr(c, by_task, multi, bps)),
     }
 }
 
@@ -142,6 +146,34 @@ impl Rewriter<'_> {
         let c = TExpr { kind: TK::Local(cell), ty: Ty::arr(t.clone()), span: sp };
         let z = TExpr { kind: TK::Int(0), ty: Ty::Int, span: sp };
         TExpr { kind: TK::Index(Box::new(c), Box::new(z)), ty: t.clone(), span: sp }
+    }
+
+    /// A lambda body becomes a function of its own, so the cells of the
+    /// variables declared inside it (a nested lambda captures them) are made
+    /// at its start, not the enclosing function's: there they would be
+    /// another function's locals. A block parameter's cell (any block's)
+    /// starts with its value, on each entry.
+    fn init_own_cells(&mut self, b: &mut TBlock, lambda: bool) {
+        let mut own: Vec<(LocalId, LocalId)> = self.cells.iter().filter(|(l, _)| (lambda && b.own.0 <= **l && **l < b.own.1) || b.params.contains(l)).map(|(l, c)| (*l, *c)).collect();
+        if own.is_empty() {
+            return;
+        }
+        own.sort_unstable();
+        let sp = b.span;
+        let mut init = vec![];
+        for (l, cell) in own {
+            let t = self.locals[l].ty.clone();
+            let first = if b.params.contains(&l) {
+                TExpr { kind: TK::Local(l), ty: t.clone(), span: sp }
+            } else {
+                let Some(z) = zero(&t) else { continue };
+                z
+            };
+            let arr = TExpr { kind: TK::Array(vec![first]), ty: Ty::arr(t.clone()), span: sp };
+            init.push(TStmt::Expr(TExpr { kind: TK::Assign(cell, Box::new(arr)), ty: Ty::arr(t), span: sp }));
+        }
+        init.append(&mut b.body);
+        b.body = init;
     }
 
     fn stmts(&mut self, ss: &mut [TStmt]) {
@@ -217,6 +249,7 @@ impl Rewriter<'_> {
                 }
                 if let Some(b) = blk {
                     self.stmts(&mut b.body);
+                    self.init_own_cells(b, is_lambda);
                 }
             }
             TK::PlaceAssign(_, steps, _, v) | TK::Bang(_, steps, _, v) => {

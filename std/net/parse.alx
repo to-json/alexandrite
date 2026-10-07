@@ -1,0 +1,201 @@
+# Simple parsing helpers (Go's net/parse.go): the hosts, services,
+# protocols, resolv.conf and nsswitch.conf readers use these instead of
+# strconv / strings, as Go's do.
+
+import "os"
+
+# A file read whole and handed out a line at a time (Go's *file).
+struct LineFile {
+  data: Str
+  pos: [Int]
+
+  # The next line without its newline, or none at the end. Go's readLine.
+  def read_line -> Str? {
+    p = pos[0]
+    return none if p >= data.size
+    i = p
+    while i < data.size && data[i] != 10 {
+      i += 1
+    }
+    ps = pos
+    ps[0] = i < data.size ? i + 1 : i
+    data[p...i]
+  }
+}
+
+def open_lines(name: Str) -> ~LineFile {
+  b = ~os.read_file(name)
+  LineFile.new(data: Str.from_bytes(b), pos: [0])
+}
+
+# The number of bytes of s that are in t.
+def count_any_byte(s: Str, t: Str) -> Int {
+  n = 0
+  for i in 0...s.size {
+    n += 1 if byte_in?(t, s[i])
+  }
+  n
+}
+
+def byte_in?(t: Str, c: Byte) -> Bool {
+  for i in 0...t.size {
+    return true if t[i] == c
+  }
+  false
+}
+
+# s split at any byte of t, dropping empty fields.
+def split_at_bytes(s: Str, t: Str) -> [Str] {
+  a: [Str] = []
+  last = 0
+  for i in 0...s.size {
+    if byte_in?(t, s[i]) {
+      a << s[last...i] if last < i
+      last = i + 1
+    }
+  }
+  a << s[last...s.size] if last < s.size
+  a
+}
+
+def get_fields(s: Str) -> [Str] { split_at_bytes(s, " \r\t\n") }
+
+# Bigger than we need, not too big to worry about overflow.
+BIG = 0xFFFFFF
+
+# Decimal to integer: the value, the bytes consumed, and whether it's valid.
+def dtoi(s: Str) -> (Int, Int, Bool) {
+  n = 0
+  i = 0
+  while i < s.size && s[i] >= 48 && s[i] <= 57 {
+    n = n * 10 + (s[i] - 48).to_i
+    return (BIG, i, false) if n >= BIG
+    i += 1
+  }
+  return (0, 0, false) if i == 0
+  (n, i, true)
+}
+
+# Hexadecimal to integer: the value, the bytes consumed, and whether it's valid.
+def xtoi(s: Str) -> (Int, Int, Bool) {
+  n = 0
+  i = 0
+  while i < s.size {
+    c = s[i]
+    if c >= 48 && c <= 57 {
+      n = n * 16 + (c - 48).to_i
+    } elsif c >= 97 && c <= 102 {
+      n = n * 16 + (c - 97).to_i + 10
+    } elsif c >= 65 && c <= 70 {
+      n = n * 16 + (c - 65).to_i + 10
+    } else {
+      break
+    }
+    return (0, i, false) if n >= BIG
+    i += 1
+  }
+  return (0, i, false) if i == 0
+  (n, i, true)
+}
+
+# The hex in the first two bytes of s; if s is longer, its third byte must
+# be e. Go's xtoi2.
+def xtoi2(s: Str, e: Byte) -> Byte? {
+  return none if s.size > 2 && s[2] != e
+  n, ei, ok = xtoi(s[0...(s.size < 2 ? s.size : 2)])
+  return none unless ok && ei == 2
+  n.as_u8
+}
+
+def has_upper_case?(s: Str) -> Bool {
+  for i in 0...s.size {
+    return true if s[i] >= 65 && s[i] <= 90
+  }
+  false
+}
+
+def lower_ascii(b: Byte) -> Byte {
+  return b + 32 if b >= 65 && b <= 90
+  b
+}
+
+def lower_ascii_str(s: Str) -> Str {
+  return s unless has_upper_case?(s)
+  b = s.bytes.to_a
+  for i in 0...b.size {
+    b[i] = lower_ascii(b[i])
+  }
+  Str.from_bytes(b)
+}
+
+def space?(b: Byte) -> Bool { b == 32 || b == 9 || b == 10 || b == 13 }
+
+def trim_space(x: Str) -> Str {
+  a = 0
+  z = x.size
+  while a < z && space?(x[a]) {
+    a += 1
+  }
+  while z > a && space?(x[z - 1]) {
+    z -= 1
+  }
+  x[a...z]
+}
+
+# line up to its first '#'.
+def remove_comment(line: Str) -> Str {
+  for i in 0...line.size {
+    return line[0...i] if line[i] == 35
+  }
+  line
+}
+
+# The space-separated fields of x, trimmed (Go's foreachField collects them).
+def fields_of(x: Str) -> [Str] {
+  out: [Str] = []
+  y = trim_space(x)
+  while y.size > 0 {
+    sp = -1
+    for i in 0...y.size {
+      if y[i] == 32 {
+        sp = i
+        break
+      }
+    }
+    if sp == -1 {
+      out << y
+      return out
+    }
+    f = trim_space(y[0...sp])
+    out << f if f.size > 0
+    y = trim_space(y[sp + 1...y.size])
+  }
+  out
+}
+
+def strings_has_suffix_fold?(s: Str, suffix: Str) -> Bool {
+  s.size >= suffix.size && strings_equal_fold?(s[s.size - suffix.size...s.size], suffix)
+}
+
+# ASCII-only case-insensitive equality.
+def strings_equal_fold?(s: Str, t: Str) -> Bool {
+  return false if s.size != t.size
+  for i in 0...s.size {
+    return false if lower_ascii(s[i]) != lower_ascii(t[i])
+  }
+  true
+}
+
+HEX_DIGIT = "0123456789abcdef"
+
+def hex_string(b: [Byte]) -> Str {
+  s: [Byte] = [0; b.size * 2]
+  for i in 0...b.size {
+    s[i * 2] = HEX_DIGIT[(b[i] >> 4).to_i]
+    s[i * 2 + 1] = HEX_DIGIT[(b[i] & 15).to_i]
+  }
+  Str.from_bytes(s)
+}
+
+# The decimal form of a (unsigned) value; Go's itoa.Uitoa.
+def uitoa(v: Int) -> Str { "#{v}" }

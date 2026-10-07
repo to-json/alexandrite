@@ -28,7 +28,37 @@ MAX_FILE_SIZE = 10485760
 
 # Where the system's zoneinfo files are (Go's platformZoneSources, zoneinfo_unix.go).
 def platform_zone_sources -> [Str] {
+  return [] if PLATFORM_SOURCES_OFF.load
   ["/usr/share/zoneinfo/", "/usr/share/lib/zoneinfo/", "/usr/lib/locale/TZ/", "/etc/zoneinfo"]
+}
+
+# Package state (R11), as Go's:
+# - Go's tests' DisablePlatformSources (platformZoneSources = nil).
+PLATFORM_SOURCES_OFF = Atomic.new(false)
+# - The $ZONEINFO the last load_location read (Go's zoneinfo; Go reads it once,
+#   here every load_location reads it, so that setting it takes effect).
+ZONEINFO_ENV: Mutex[Str?] = Mutex.new(none)
+# - The embedded database's loader, which importing time/tzdata registers
+#   (Go's registerLoadFromEmbeddedTZData). Not found is Errno(ENOENT).
+EMBEDDED_SET = Atomic.new(false)
+EMBEDDED_TZDATA: Atomic[(Str) -> ~[Byte]<LocationError>] = Atomic.new(->(name: Str) -> ~[Byte]<LocationError> {
+  fail LocationError.Errno(ENOENT) if name.size >= 0
+  []
+})
+
+# Called by time/tzdata's package initializer: load_location falls back to f
+# (Go's registerLoadFromEmbeddedTZData). The result is unused.
+pub def register_embedded_tzdata(f: (Str) -> ~[Byte]<LocationError>) -> Bool {
+  EMBEDDED_TZDATA.store(f)
+  EMBEDDED_SET.store(true)
+  true
+}
+
+# The $ZONEINFO load_location uses, recorded for the tests.
+def zoneinfo_env -> Str {
+  v = getenv("ZONEINFO") || ""
+  ZONEINFO_ENV.lock { |z| z = v }
+  v
 }
 
 # A zone such as CET: its abbreviation, offset (seconds east of UTC) and whether
@@ -615,7 +645,7 @@ pub def load_location(name: Str) -> ~Location<LocationError> {
   # No valid IANA name contains "..", or starts with a slash.
   fail LocationError.BadName if contains_dot_dot?(name) || name[0].to_i == 47 || name[0].to_i == 92
   first_err: LocationError? = none
-  zi = getenv("ZONEINFO") || ""
+  zi = zoneinfo_env()
   if zi != "" {
     r = load_tzinfo_from_dir_or_zip(zi, name)
     if data = r.ok {
@@ -655,6 +685,24 @@ def load_location_from(name: Str, sources: [Str]) -> ~Location<LocationError> {
       err = z.err
     } else {
       err = r.err
+    }
+    if e = err {
+      first_err = e if first_err == none && !enoent?(e)
+    }
+  }
+  if EMBEDDED_SET.load {
+    f = EMBEDDED_TZDATA.load
+    r = f.call(name)
+    err: LocationError? = none
+    if data = r.ok {
+      z = load_location_from_tzdata(name, data)
+      return z.unwrap if z.ok?
+      err = z.err
+    } else if e = r.err {
+      err = case e {
+        LocationError.Errno(c) => LocationError.Errno(c)
+        _ => LocationError.BadZip(e.message)
+      }
     }
     if e = err {
       first_err = e if first_err == none && !enoent?(e)

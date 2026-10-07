@@ -647,6 +647,7 @@ fn check_program_impl(l: &Loaded, externs: Vec<DefInfo>, mut collect: Option<(&d
                 Err(e) => w.record(e),
             }
             let _ = w.message_instances();
+            let _ = w.iface_stringers();
             let _ = w.iface_eq_instances();
             if let Some(f) = seen {
                 f(&w);
@@ -673,8 +674,10 @@ fn check_program_impl(l: &Loaded, externs: Vec<DefInfo>, mut collect: Option<(&d
             mf.body.splice(0..0, pre);
         }
         let messages = w.message_instances()?;
+        w.iface_stringers()?;
         let iface_eqs = w.iface_eq_instances()?;
         let ifaces = std::mem::take(&mut w.impls);
+        let shareable = std::mem::take(&mut w.shareable);
         let stringers = std::mem::take(&mut w.stringers);
         let errors = std::mem::take(&mut w.errors);
         let mut warnings = std::mem::take(&mut w.warnings);
@@ -690,7 +693,7 @@ fn check_program_impl(l: &Loaded, externs: Vec<DefInfo>, mut collect: Option<(&d
         for f in &funcs {
             prove::prove(f, &l.sm)?;
         }
-        let mut p = TProgram { funcs, main, ifaces, stringers, errors, messages, warnings, globals, vars, iface_eqs };
+        let mut p = TProgram { funcs, main, ifaces, shareable, stringers, errors, messages, warnings, globals, vars, iface_eqs };
         // R5: lambdas see the variables they capture, not copies.
         crate::capture::convert(&mut p);
         // R6: what goes to another task isn't used here afterwards.
@@ -707,6 +710,10 @@ fn check_program_impl(l: &Loaded, externs: Vec<DefInfo>, mut collect: Option<(&d
     warnings.sort_by_key(|d| (d.span.file, d.span.lo));
     if !failed && !w.decl_failed {
         // Every instance succeeded: the build's later passes (the prover, then the sharing check).
+        // The sharing check reads the implementors (which interfaces carry storage) and
+        // the `#[shareable]` conversions.
+        let ifaces = std::mem::take(&mut w.impls);
+        let shareable = std::mem::take(&mut w.shareable);
         let funcs: Vec<_> = w.funcs.into_iter().map(|f| f.expect("every instance checked")).collect();
         let mut funcs = funcs;
         for f in funcs.iter_mut() {
@@ -724,7 +731,7 @@ fn check_program_impl(l: &Loaded, externs: Vec<DefInfo>, mut collect: Option<(&d
             }
         }
         if proved {
-            let mut p = TProgram { funcs, main, ifaces: Default::default(), stringers: Default::default(), errors: Default::default(), messages: Default::default(), warnings: vec![], globals: vec![], vars: vec![], iface_eqs: Default::default() };
+            let mut p = TProgram { funcs, main, ifaces, shareable, stringers: Default::default(), errors: Default::default(), messages: Default::default(), warnings: vec![], globals: vec![], vars: vec![], iface_eqs: Default::default() };
             crate::capture::convert(&mut p);
             if let Err(d) = crate::sharing::check(&p, &l.sm) {
                 out.push(Item { diag: d, phase: Phase::Check, error: true });
@@ -750,7 +757,8 @@ fn unused_imports(l: &Loaded, ext: &HashSet<String>, warnings: &mut Vec<Diag>) {
             // An import a derive added for its own code (`alxjson`, `alxjson2`, ...):
             // the derived methods the program doesn't call aren't checked. Or one
             // `alx test` added (no span: the runner's, an external test's testing).
-            if i.alias.as_deref().is_some_and(|a| matches!(a, "alxjson" | "alxjson2" | "alxjsontext" | "alxdyn") || a.starts_with("__alx")) || i.span.hi == 0 {
+            // `import _ "pkg"` (Go's blank import) is for its initializers alone.
+            if i.alias.as_deref().is_some_and(|a| matches!(a, "_" | "alxjson" | "alxjson2" | "alxjsontext" | "alxdyn") || a.starts_with("__alx")) || i.span.hi == 0 {
                 continue;
             }
             if !crate::check::import_used(&pkg, &alias) && !in_text && !ext.contains(i.path.trim_end_matches('/')) {
@@ -870,6 +878,7 @@ pub fn check_library(l: &Loaded, idx: usize, prefix: &str) -> Result<(TProgram, 
     w.add_iface_sigs(&m.ifaces)?;
     let exports = w.check_exports()?;
     let messages = w.message_instances()?;
+    w.iface_stringers()?;
     let iface_eqs = w.iface_eq_instances()?;
     let ifaces = std::mem::take(&mut w.impls);
     let stringers = std::mem::take(&mut w.stringers);
@@ -884,7 +893,7 @@ pub fn check_library(l: &Loaded, idx: usize, prefix: &str) -> Result<(TProgram, 
     for f in &funcs {
         prove::prove(f, &l.sm)?;
     }
-    Ok((TProgram { funcs, main: usize::MAX, ifaces, stringers, errors, messages, warnings: vec![], globals: vec![], vars: vec![], iface_eqs }, exports))
+    Ok((TProgram { funcs, main: usize::MAX, ifaces, shareable: HashMap::new(), stringers, errors, messages, warnings: vec![], globals: vec![], vars: vec![], iface_eqs }, exports))
 }
 
 /// The generated header: one line per export.

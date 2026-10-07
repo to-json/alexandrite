@@ -218,3 +218,18 @@ Built on branch `lsp-m1` (merge of `lsp-rt`, `lsp-cli`, `lsp-checker`, `lsp-serv
 | 2.x server | done; deviation: overlays go through a temp file (`--overlays FILE`) because `os/exec` pins what a `Cmd` reaches |
 | 2.6 / 3.3 bounded memory | done: 10k edits x 100 KB peak 22 MB (limit 150), ~1 KB/edit residual; server restructured around port-issues #177 (compiler limitation still open) |
 | 3.x | done: `docs/editors/neovim.md`, acceptance group `LSP` |
+
+---
+
+# M2: navigation and completion, alx-first (2026-10-06)
+
+Decision (owner): **feature logic goes in alx.** Rust provides data and test oracles; where alx can't host a feature, fix the language. The Rust `alx symbols` dump proposed earlier is dropped. A review measured the alx route (probes in the session scratchpad: `outline.alx` 170 lines, 262/262 top-level declarations on std/net/http matching Rust, ~1 ms per pass over 840 KB; `memidx*.alx` index-in-a-Map memory).
+
+| # | Step | Size | Gate |
+|---|---|---|---|
+| M2.1 | `tools/alx-lsp/outline/`: outline scanner (byte loop, brace depth; skips strings, `'...'`, command literals, `#{}`, comments, `#[...]` with nested brackets/strings, heredoc bodies). `Sym {kind, name, owner, lo, hi, line}`; methods as `Owner.m`. Works on files that don't parse (the parser's own `resync` idea) | ~250 alx | none |
+| M2.2 | Test oracle: `alx parse --decls FILE` (Rust, wraps `parser::parse_recovering`; prints kind, name, line per top-level decl and method) and an `LSP` acceptance check: the outline equals the oracle on every tracked `.alx` file that parses | ~60 Rust + 40 alx | gates M2.3 |
+| M2.3 | Server: per-URI `index: Map[Str, [Sym]]` rebuilt on didOpen/didChange (same memory discipline as `docs`); `textDocument/documentSymbol`; `textDocument/definition` for top-level names (open buffers + the unit's files on disk + std when resolvable through `import`); `textDocument/completion` = keywords + index names + `pkg.` names of imported packages + import paths (std dirs, alx.mod); JSON built by hand (#176); soak burst of 10k completions | ~400 alx | M2.2 |
+| M2.4 | Compiler, port-issues #177: an index/map-get view aliases the receiver's nodes only (not the key argument); pointer-free locals ignored in `owners`; `for k in m.keys` yields fresh keys. Then the server drops `uris` and the `fresh` copies that only worked around it | 50-100 Rust + mem cases | parallel |
+| M2.5 | `alx check --json` adds `types: [{lo, hi, name, type}]` for the focused file's locals, params and fields (a tast walk; data only), and `methods: {Type: [name...]}` for types reachable from the focused file if cheap | ~150 Rust | none |
+| M2.6 | Member completion after `.` in alx: receiver type from the last successful check's `types` (shifted through edits), members from the outline index / `methods`; fall back to nothing rather than noise | ~200 alx | M2.1, M2.5 |

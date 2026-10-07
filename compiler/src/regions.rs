@@ -170,6 +170,13 @@ struct Graph<'a> {
     /// point, and the innermost one of each site inside one.
     lambdas: Vec<u64>,
     site_lambda: HashMap<usize, u64>,
+    /// The `spawn` bodies (by the spawn's key, innermost last) around the
+    /// walk's current point, each with the lambda and loop depths it was
+    /// entered at; and the innermost one of each site inside one, with its
+    /// loop depth (the loops the task's frame sees start there; port-issues
+    /// #277).
+    tasks: Vec<(usize, usize, usize)>,
+    site_task: HashMap<usize, (usize, usize)>,
 }
 
 impl<'a> Graph<'a> {
@@ -180,6 +187,9 @@ impl<'a> Graph<'a> {
         self.site_loops.insert(k, self.loops.clone());
         if let Some(l) = self.lambdas.last() {
             self.site_lambda.insert(k, *l);
+        }
+        if let Some((t, _, d)) = self.tasks.last() {
+            self.site_task.insert(k, (*t, *d));
         }
     }
     fn edge(&mut self, a: Node, b: Node) {
@@ -418,6 +428,25 @@ impl<'a> Graph<'a> {
                             self.stmt(s);
                         }
                         self.lambdas.pop();
+                    } else if *m == M::Spawn && self.lambdas.is_empty() {
+                        // A task's body runs in a frame of its own (port-issues
+                        // #277), entered when the task starts and freed when it
+                        // ends: what the body makes is placed as a def's is,
+                        // with its loops' iterations getting regions. What
+                        // outlives the task goes to the program region: its
+                        // captures (sent there above), its result (copied out
+                        // shallowly, for `wait`) and what it returns. The
+                        // enclosing function's loops are not the body's (its
+                        // sites see only the loops inside it).
+                        self.tasks.push((e as *const TExpr as usize, self.lambdas.len(), self.loops.len()));
+                        let n = b.body.len();
+                        for (i, s) in b.body.iter().enumerate() {
+                            let sv = self.stmt(s);
+                            if i + 1 == n {
+                                self.flow(&sv, &[Node::Global]);
+                            }
+                        }
+                        self.tasks.pop();
                     } else if matches!(m, M::Spawn | M::EnumNew) {
                         // Everything the body touches outlives the caller.
                         let mut inner = vec![];
@@ -584,7 +613,9 @@ impl<'a> Graph<'a> {
             }
             TStmt::Return(Some(e), _) => {
                 let v = self.expr(e);
-                self.flow(&v, &[Node::Ret]);
+                // In a task's body (not a lambda's inside it), the task's result.
+                let to = if self.tasks.last().is_some_and(|(_, d, _)| *d == self.lambdas.len()) { Node::Global } else { Node::Ret };
+                self.flow(&v, &[to]);
                 vec![]
             }
             // Errors are copied out when they leave the function, but the
@@ -633,7 +664,7 @@ pub fn has_storage(t: &Ty) -> bool {
 }
 
 fn graph<'a>(f: &'a TFunc, sums: &'a [Summary], ifaces: &'a Ifaces) -> Graph<'a> {
-    let mut g = Graph { f, sums, ifaces, edges: HashMap::new(), sites: vec![], site_exprs: HashMap::new(), loops: vec![], site_loops: HashMap::new(), loop_bodies: HashMap::new(), mutations: vec![], defs: vec![], at: f.span, why_global: HashMap::new(), loop_at: HashMap::new(), lambdas: vec![], site_lambda: HashMap::new() };
+    let mut g = Graph { f, sums, ifaces, edges: HashMap::new(), sites: vec![], site_exprs: HashMap::new(), loops: vec![], site_loops: HashMap::new(), loop_bodies: HashMap::new(), mutations: vec![], defs: vec![], at: f.span, why_global: HashMap::new(), loop_at: HashMap::new(), lambdas: vec![], site_lambda: HashMap::new(), tasks: vec![], site_task: HashMap::new() };
     // Writing into a parameter's storage writes into the caller's objects
     // (a lambda's parameters too: its caller's).
     for p in f.params.iter().chain(f.lambda_info.iter().flat_map(|(_, ps, _)| ps)) {
@@ -909,7 +940,11 @@ fn analyze_with(p: &TProgram, sums: &[Summary]) -> Vec<FnPlacement> {
                 } else {
                     // The innermost loop whose iteration nothing it reaches outlives.
                     let locals: Vec<LocalId> = reach.iter().filter_map(|n| if let Node::Local(l) = n { Some(*l) } else { None }).collect();
-                    let loops = g.site_loops.get(s).cloned().unwrap_or_default();
+                    let mut loops = g.site_loops.get(s).cloned().unwrap_or_default();
+                    // In a task's body: the loops inside it (its frame is the task's).
+                    if let Some((_, d)) = g.site_task.get(s) {
+                        loops.drain(..(*d).min(loops.len()));
+                    }
                     loops.iter().rev().find(|l| fresh.get(l).is_some_and(|ok| locals.iter().all(|x| ok.contains(x)))).map_or(Place::Frame, |l| Place::Iter(*l))
                 };
                 if let Place::Iter(l) = place {
@@ -1397,8 +1432,17 @@ pub fn explain(p: &TProgram, sm: &crate::diag::SourceMap, files: &[u32]) -> Stri
             }
             let why = match place {
                 Place::Frame => {
-                    let when = if f.is_main { "the program ends".to_string() } else { format!("`{}` returns", f.src_name) };
-                    if in_loop {
+                    let when = match g.site_task.get(&s).map(|(t, _)| t) {
+                        Some(t) => format!("the task of the `spawn` at {} ends", line_col(g.site_exprs.get(t).map_or(e.span, |x| x.span))),
+                        None if f.is_main => "the program ends".to_string(),
+                        None => format!("`{}` returns", f.src_name),
+                    };
+                    // A task's frame piles up over the loops inside the task.
+                    let frame_loop = match g.site_task.get(&s) {
+                        Some((_, d)) => g.site_loops.get(&s).is_some_and(|l| l.len() > *d),
+                        None => in_loop,
+                    };
+                    if frame_loop {
                         hot += 1;
                         format!("frame: freed when {when}  << every iteration: piles up until then")
                     } else {

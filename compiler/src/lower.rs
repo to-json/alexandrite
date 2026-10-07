@@ -190,7 +190,8 @@ fn drop_idle_regions(prog: &mut LProgram) {
     // Callees taking something with storage could store into it (in its
     // region, which may be the one an iteration's mark is on).
     let storage_params: std::collections::HashSet<String> = prog.funcs.iter().filter(|f| f.params.iter().any(|p| lty_has_storage(&f.vars[*p].ty))).map(|f| f.name.clone()).collect();
-    for f in prog.funcs.iter_mut().filter(|f| !f.external) {
+    // Task bodies (workers) have frames too (port-issues #277).
+    for f in prog.funcs.iter_mut().filter(|f| !f.external).chain(prog.workers.iter_mut().map(|w| &mut w.func)) {
         let mut regions = vec![];
         collect_enters(&f.body, &mut regions);
         for (region, saved) in regions {
@@ -1052,8 +1053,16 @@ impl<'a> Lw<'a> {
         }
         let depth = self.defers.len() - 1;
         if self.has_defers(depth) {
-            let t = self.lty(ty);
-            val = self.bind(val, t);
+            if matches!(ty, Ty::Unit | Ty::Never) {
+                // No value to keep (a call returning nothing has none to bind).
+                if !matches!(val, LE::Unit | LE::Var(_) | LE::I(_) | LE::B(_)) {
+                    self.emit(LS::Eval(val));
+                }
+                val = LE::Unit;
+            } else {
+                let t = self.lty(ty);
+                val = self.bind(val, t);
+            }
             self.emit_defers(depth);
         }
         self.defers.pop();
@@ -3741,6 +3750,17 @@ impl<'a> Lw<'a> {
                 }
                 let env = w.new_var("env", env_t.clone());
                 let mut body = vec![];
+                // The task's own frame (port-issues #277): its body's sites
+                // are placed in the enclosing function's placement (regions.rs
+                // walks a spawn body outside a lambda as a frame of its own).
+                // Freed when the body is done; what outlives the task was
+                // placed in the program region.
+                if let Some(pl) = self.place.filter(|_| self.lambda_place.is_none()) {
+                    let (frame, dest) = (w.new_var("frame", LTy::Region), w.new_var("dest", LTy::Region));
+                    body.push(LS::RegionEnter { region: frame, saved: dest });
+                    w.frame = Some((frame, dest));
+                    w.place = Some(pl);
+                }
                 for (j, a) in args.iter().enumerate() {
                     let TK::Local(l) = a.kind else { unreachable!() };
                     let v = w.var_of(l);

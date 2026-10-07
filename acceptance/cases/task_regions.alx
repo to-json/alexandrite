@@ -1,0 +1,182 @@
+# Tasks' frames (port-issues #277): a spawn body's values are placed as a
+# def's are (each pass of its loops freed at the end of the pass, the rest
+# when the task ends), while its result, what it returns or fails with, and
+# what it stores into captures, sends, or hands to another task outlive it.
+import "strings"
+
+error Boom {
+  Bad(what: Str)
+  def message -> Str {
+    case self { Bad(w) => "boom: #{w}" }
+  }
+}
+
+def results(n: Int) -> [Str] {
+  t = spawn {
+    out: [Str] = []
+    i = 0
+    while i < n {
+      out << "item #{i}"
+      i += 1
+    }
+    out
+  }
+  t.wait.unwrap
+}
+
+def early(n: Int) -> Str {
+  t = spawn {
+    i = 0
+    loop {
+      s = "v#{i}"
+      return strings.repeat(s, 2) if i == n
+      i += 1
+    }
+    "none"
+  }
+  t.wait.unwrap
+}
+
+def failing(n: Int) -> ~Int {
+  t = spawn {
+    i = 0
+    loop {
+      w = "at #{i}"
+      fail Boom.Bad(what: w) if i == n
+      i += 1
+    }
+    0
+  }
+  ~t.wait
+}
+
+def locked(n: Int) -> [Str] {
+  mu = Mutex[[Str]].new([])
+  t = spawn {
+    for i in 0...n {
+      s = "m#{i}"
+      mu.lock { |v| v << strings.to_upper(s) }
+    }
+    0
+  }
+  t.wait.unwrap
+  mu.lock { |v| v.dup }
+}
+
+def chan(n: Int) -> [Str] {
+  ch = Chan[Str].new(4)
+  t = spawn {
+    for i in 0...n {
+      ch << "c#{i}#{"!" * (i % 3)}"
+    }
+    ch.close
+    0
+  }
+  got: [Str] = []
+  loop {
+    v = ch.recv || break
+    got << v
+  }
+  t.wait.unwrap
+  got
+}
+
+def nested(n: Int) -> Str {
+  t = spawn {
+    base = "base-#{n}"
+    inner = spawn { base + "-inner" }
+    x = inner.wait.unwrap
+    "#{x}/#{base}"
+  }
+  t.wait.unwrap
+}
+
+def with_map(n: Int) -> Int {
+  t = spawn {
+    m: Map[Str, Str] = {}
+    for i in 0...n {
+      k = "k#{i % 10}"
+      m[k] = "v#{i}"
+    }
+    m.size + (m["k3"] || "").size
+  }
+  t.wait.unwrap
+}
+
+def lam(n: Int) -> Str {
+  t = spawn {
+    pre = "p#{n}"
+    f = ->(x: Str) -> Str { pre + x }
+    acc = ""
+    for i in 0...n {
+      acc = f.call("#{i}")
+    }
+    acc
+  }
+  t.wait.unwrap
+}
+
+def deferred(n: Int) -> [Str] {
+  mu = Mutex[[Str]].new([])
+  t = spawn {
+    msg = "done #{n}"
+    defer { mu.lock { |v| v << msg } }
+    for i in 0...n {
+      s = "x#{i}"
+      mu.lock { |v| v << s } if i == n - 1
+    }
+    0
+  }
+  t.wait.unwrap
+  mu.lock { |v| v.dup }
+}
+
+def in_loop(n: Int) -> [Str] {
+  ts: [Task[Str]] = []
+  for i in 0...n {
+    word = "w#{i}"
+    ts << spawn { word + "!" * i }
+  }
+  ts.map { it.wait.unwrap }
+}
+
+def structs(n: Int) -> Int {
+  t = spawn {
+    total = 0
+    for i in 0...n {
+      parts = "a,b,#{i}".split(",")
+      total += parts.size
+    }
+    total
+  }
+  t.wait.unwrap
+}
+
+# A body that ends in a call returning nothing (its frame is freed after it).
+def note(mu: Mutex[[Str]], s: Str) {
+  mu.lock { |v| v << s }
+}
+
+def unit_body(n: Int) -> [Str] {
+  mu = Mutex[[Str]].new([])
+  t = spawn {
+    w = "u#{n}"
+    note(mu, w)
+  }
+  t.wait.unwrap
+  mu.lock { |v| v.dup }
+}
+
+puts results(5).join(" ")
+puts early(3)
+r = failing(4)
+if e = r.err { puts e.message }
+puts locked(3).join(" ")
+puts chan(5).join(" ")
+puts nested(7)
+puts with_map(1000)
+puts lam(5)
+puts deferred(3).join(" ")
+puts in_loop(4).join(" ")
+puts structs(100000)
+puts unit_body(9).join(" ")
